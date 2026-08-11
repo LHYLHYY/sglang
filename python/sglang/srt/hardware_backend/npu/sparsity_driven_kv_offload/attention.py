@@ -2,19 +2,39 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
 
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
 if TYPE_CHECKING:
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+        SparseKVPartition,
+        SparseKVPrefetchTicket,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _SfaPartitionState:
+    output: torch.Tensor
+    softmax_max: torch.Tensor
+    softmax_sum: torch.Tensor
+    nonempty: torch.Tensor
 
 
 def _get_sparse_kv_manager(backend: AscendAttnBackend):
@@ -30,6 +50,205 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 2:
         return topk_indices.unsqueeze(-2)
     return topk_indices
+
+
+def _record_stream_event(stream, event) -> None:
+    if hasattr(stream, "record_event"):
+        stream.record_event(event)
+    else:
+        event.record(stream)
+
+
+def _wait_stream_event(stream, event) -> None:
+    if hasattr(stream, "wait_event"):
+        stream.wait_event(event)
+    else:
+        event.wait(stream)
+
+
+def _run_decode_sfa_partition(
+    partition: SparseKVPartition,
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    scale_value: float,
+) -> _SfaPartitionState:
+    for tensor in (
+        partition.kv,
+        partition.sparse_indices,
+        partition.actual_seq_lengths_kv,
+        partition.true_counts,
+        query,
+        query_rope,
+    ):
+        tensor.record_stream(partition.stream)
+    key, key_rope = partition.kv.split([nope_head_dim, rope_head_dim], dim=-1)
+    key = key.contiguous()
+    key_rope = key_rope.contiguous()
+    batch_size, query_length, padded_heads, value_dim = query.shape
+    actual_query_lengths = torch.ones(
+        batch_size, dtype=torch.int32, device=query.device
+    ).contiguous()
+
+    output, softmax_max, softmax_sum = torch_npu.npu_sparse_flash_attention(
+        query=query,
+        key=key,
+        value=key,
+        sparse_indices=partition.sparse_indices,
+        scale_value=scale_value,
+        actual_seq_lengths_query=actual_query_lengths,
+        actual_seq_lengths_kv=partition.actual_seq_lengths_kv,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        sparse_block_size=1,
+        layout_query="BSND",
+        layout_kv="BSND",
+        sparse_mode=0,
+        attention_mode=2,
+        return_softmax_lse=True,
+    )
+
+    expected_output_shape = (
+        batch_size,
+        query_length,
+        padded_heads,
+        value_dim,
+    )
+    expected_stats_shape = (batch_size, 1, query_length, padded_heads)
+    if tuple(output.shape) != expected_output_shape or output.dtype != query.dtype:
+        raise RuntimeError(
+            "Unexpected split SFA output contract: "
+            f"got shape={tuple(output.shape)}, dtype={output.dtype}; "
+            f"expected shape={expected_output_shape}, dtype={query.dtype}."
+        )
+    for name, value in (("softmax_max", softmax_max), ("softmax_sum", softmax_sum)):
+        if tuple(value.shape) != expected_stats_shape or value.dtype != torch.float32:
+            raise RuntimeError(
+                f"Unexpected split SFA {name} contract: "
+                f"got shape={tuple(value.shape)}, dtype={value.dtype}; "
+                f"expected shape={expected_stats_shape}, dtype=torch.float32."
+            )
+
+    return _SfaPartitionState(
+        output=output,
+        softmax_max=softmax_max,
+        softmax_sum=softmax_sum,
+        nonempty=partition.true_counts > 0,
+    )
+
+
+def _merge_decode_sfa_partitions(
+    hit: _SfaPartitionState, miss: _SfaPartitionState
+) -> torch.Tensor:
+    if hit.output.shape != miss.output.shape:
+        raise RuntimeError(
+            "Split SFA output shape mismatch: "
+            f"hit={tuple(hit.output.shape)}, miss={tuple(miss.output.shape)}."
+        )
+    if hit.softmax_max.shape != miss.softmax_max.shape:
+        raise RuntimeError(
+            "Split SFA statistics shape mismatch: "
+            f"hit={tuple(hit.softmax_max.shape)}, "
+            f"miss={tuple(miss.softmax_max.shape)}."
+        )
+
+    batch_size = hit.output.shape[0]
+    stats_mask_shape = (batch_size, 1, 1, 1)
+    hit_nonempty = hit.nonempty.view(stats_mask_shape)
+    miss_nonempty = miss.nonempty.view(stats_mask_shape)
+    any_nonempty = hit_nonempty | miss_nonempty
+
+    neg_inf = torch.full_like(hit.softmax_max, float("-inf"))
+    hit_max = torch.where(hit_nonempty, hit.softmax_max.float(), neg_inf)
+    miss_max = torch.where(miss_nonempty, miss.softmax_max.float(), neg_inf)
+    global_max = torch.maximum(hit_max, miss_max)
+    safe_global_max = torch.where(
+        any_nonempty, global_max, torch.zeros_like(global_max)
+    )
+
+    hit_delta = torch.where(
+        hit_nonempty, hit.softmax_max.float() - safe_global_max, 0.0
+    )
+    miss_delta = torch.where(
+        miss_nonempty, miss.softmax_max.float() - safe_global_max, 0.0
+    )
+    hit_mass = torch.where(
+        hit_nonempty,
+        hit.softmax_sum.float() * torch.exp(hit_delta),
+        torch.zeros_like(hit.softmax_sum),
+    )
+    miss_mass = torch.where(
+        miss_nonempty,
+        miss.softmax_sum.float() * torch.exp(miss_delta),
+        torch.zeros_like(miss.softmax_sum),
+    )
+    denominator = hit_mass + miss_mass
+    safe_denominator = denominator.clamp_min(torch.finfo(torch.float32).tiny)
+    hit_weight = (hit_mass / safe_denominator).permute(0, 2, 3, 1)
+    miss_weight = (miss_mass / safe_denominator).permute(0, 2, 3, 1)
+
+    merged = hit.output.float() * hit_weight + miss.output.float() * miss_weight
+    output_mask = any_nonempty.permute(0, 2, 3, 1)
+    merged = torch.where(output_mask, merged, torch.zeros_like(merged))
+    return merged.to(hit.output.dtype)
+
+
+def _run_split_decode_attention(
+    ticket: SparseKVPrefetchTicket,
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    scale_value: float,
+    stream,
+) -> torch.Tensor:
+    hit_attention_done = torch.npu.Event()
+    miss_attention_done = torch.npu.Event()
+
+    with torch.profiler.record_function("sparse_kv_split.hit_attention"):
+        with torch.npu.stream(ticket.hit.stream):
+            hit_state = _run_decode_sfa_partition(
+                ticket.hit,
+                query=query,
+                query_rope=query_rope,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                scale_value=scale_value,
+            )
+            _record_stream_event(ticket.hit.stream, hit_attention_done)
+
+    with torch.profiler.record_function("sparse_kv_split.miss_attention"):
+        with torch.npu.stream(ticket.miss.stream):
+            miss_state = _run_decode_sfa_partition(
+                ticket.miss,
+                query=query,
+                query_rope=query_rope,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                scale_value=scale_value,
+            )
+            _record_stream_event(ticket.miss.stream, miss_attention_done)
+
+    with torch.npu.stream(stream):
+        _wait_stream_event(stream, hit_attention_done)
+        _wait_stream_event(stream, miss_attention_done)
+        _wait_stream_event(stream, ticket.refill_done)
+        # These tensors were allocated on the two producer streams but are
+        # consumed by the merge stream.  Record that ownership transfer so the
+        # caching allocator cannot recycle them before the merge completes.
+        for state in (hit_state, miss_state):
+            for tensor in (
+                state.output,
+                state.softmax_max,
+                state.softmax_sum,
+                state.nonempty,
+            ):
+                tensor.record_stream(stream)
+        with torch.profiler.record_function("sparse_kv_split.merge"):
+            return _merge_decode_sfa_partitions(hit_state, miss_state)
 
 
 def forward_sparsity_driven_kv_offload(
@@ -130,6 +349,48 @@ def forward_sparsity_driven_kv_offload(
             f"padded_query_heads={padded_query_heads}, "
             f"num_query_heads={num_query_heads}"
         )
+
+        use_split_attention = (
+            sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_EAGER
+            and not backend.graph_mode
+        )
+        if (
+            sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_EAGER
+            and backend.graph_mode
+            and not sparse_kv_manager._split_graph_fallback_logged
+        ):
+            logger.warning(
+                "Sparse KV split attention is eager-only; using combined "
+                "attention for NPU graph capture and replay."
+            )
+            sparse_kv_manager._split_graph_fallback_logged = True
+
+        if use_split_attention:
+            q_nope_sfa = q_nope.view(
+                batch_size, 1, padded_query_heads, nope_head_dim
+            ).contiguous()
+            q_rope_sfa = q_pe.view(
+                batch_size, 1, padded_query_heads, rope_head_dim
+            ).contiguous()
+            ticket = sparse_kv_manager.prefetch_partitions(
+                layer,
+                forward_batch,
+                topk_indices,
+                stream,
+                dtype=k.dtype,
+            )
+            decode_output = _run_split_decode_attention(
+                ticket,
+                query=q_nope_sfa,
+                query_rope=q_rope_sfa,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                scale_value=layer.scaling,
+                stream=stream,
+            )
+            return decode_output[:, :, :num_query_heads, :].reshape(
+                batch_size, num_query_heads * nope_head_dim
+            )
 
         selected_kv = torch.zeros(
             (

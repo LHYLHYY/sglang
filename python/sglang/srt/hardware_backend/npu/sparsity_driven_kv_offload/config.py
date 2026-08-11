@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.configs.model_config import is_deepseek_dsa
@@ -14,9 +15,32 @@ if TYPE_CHECKING:
 
 _ENABLE_ENV_VAR = "SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD"
 
+SPARSE_KV_ATTN_IMPL_ENV_VAR = "SGLANG_NPU_SPARSE_KV_ATTN_IMPL"
+SPARSE_KV_ATTN_IMPL_COMBINED = "combined"
+SPARSE_KV_ATTN_IMPL_SPLIT_EAGER = "split_eager"
+SPARSE_KV_ATTN_IMPL_CHOICES = (
+    SPARSE_KV_ATTN_IMPL_COMBINED,
+    SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+)
+
 
 def is_sparsity_driven_kv_offload_requested() -> bool:
     return get_bool_env_var(_ENABLE_ENV_VAR)
+
+
+def get_sparse_kv_attn_impl() -> str:
+    value = (
+        os.getenv(SPARSE_KV_ATTN_IMPL_ENV_VAR, SPARSE_KV_ATTN_IMPL_COMBINED)
+        .strip()
+        .lower()
+    )
+    if value not in SPARSE_KV_ATTN_IMPL_CHOICES:
+        allowed_values = ", ".join(SPARSE_KV_ATTN_IMPL_CHOICES)
+        raise ValueError(
+            f"{SPARSE_KV_ATTN_IMPL_ENV_VAR} must be one of: {allowed_values}; "
+            f"got {value!r}."
+        )
+    return value
 
 
 def is_sparsity_driven_kv_offload_enabled(
