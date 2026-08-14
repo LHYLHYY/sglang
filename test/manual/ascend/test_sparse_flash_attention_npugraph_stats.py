@@ -3,10 +3,11 @@
 This file contains isolated Ascend hardware capability tests. The first test
 captures one ``npu_sparse_flash_attention`` call with
 ``return_softmax_lse=True``. The second captures two fixed-capacity hit/miss SFA
-calls followed by a numerically stable FP32 merge on the same stream. Both tests
-replay with different fixed-shape inputs and compare graph results with eager
-references, including ``attention_out``, ``softmax_max``, ``softmax_sum``, and
-the reconstructed LSE.
+calls followed by a numerically stable FP32 merge on the same stream. The third
+adds the real sparse-KV lookup and compact-copy kernels in front of the same two
+SFA calls and merge. All tests replay with different fixed-shape inputs and
+compare graph results with eager references, including ``attention_out``,
+``softmax_max``, ``softmax_sum``, and the reconstructed LSE.
 
 The test deliberately fails (rather than xfails) when an installed
 torch_npu/CANN combination cannot capture or replay the statistics outputs. A
@@ -21,8 +22,11 @@ Example (run on the target Ascend host):
 
 from __future__ import annotations
 
+import gc
 import math
+import os
 import sys
+import uuid
 from dataclasses import dataclass
 
 import pytest
@@ -32,6 +36,14 @@ try:
     import torch_npu
 except ImportError:
     torch_npu = None
+
+try:
+    import sgl_kernel_npu.sparsity_driven_kv_offload as sparse_kv_ops
+except (ImportError, OSError) as error:
+    sparse_kv_ops = None
+    _SPARSE_KV_OPS_IMPORT_ERROR = error
+else:
+    _SPARSE_KV_OPS_IMPORT_ERROR = None
 
 
 @dataclass
@@ -103,6 +115,84 @@ class SplitSFAInputs:
 class SplitSFACase:
     union: SFAInputs
     split: SplitSFAInputs
+
+
+@dataclass
+class PrefetchCompactCase:
+    union: SFAInputs
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    topk_indices: torch.Tensor
+    slot_map: torch.Tensor
+    device_kv: torch.Tensor
+    host_kv: torch.Tensor
+    expected_token_on_device: torch.Tensor
+    expected_device_token_pos: torch.Tensor
+    expected_hit_kv: torch.Tensor
+    expected_miss_kv: torch.Tensor
+    hit_counts: tuple[int, ...]
+    miss_counts: tuple[int, ...]
+
+
+@dataclass
+class StaticPrefetchInputs:
+    query: torch.Tensor
+    query_rope: torch.Tensor
+    actual_query_lengths: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    topk_indices: torch.Tensor
+    slot_map: torch.Tensor
+    device_kv: torch.Tensor
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.query,
+            self.query_rope,
+            self.actual_query_lengths,
+            self.req_pool_indices,
+            self.seq_lens,
+            self.topk_indices,
+            self.slot_map,
+            self.device_kv,
+        )
+
+
+@dataclass
+class PrefetchGraphBuffers:
+    hit_kv: torch.Tensor
+    miss_kv: torch.Tensor
+    token_on_device: torch.Tensor
+    device_token_pos: torch.Tensor
+    hit_counts: torch.Tensor
+    miss_counts: torch.Tensor
+    output: torch.Tensor
+    softmax_max: torch.Tensor
+    softmax_sum: torch.Tensor
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.hit_kv,
+            self.miss_kv,
+            self.token_on_device,
+            self.device_token_pos,
+            self.hit_counts,
+            self.miss_counts,
+            self.output,
+            self.softmax_max,
+            self.softmax_sum,
+        )
+
+
+@dataclass
+class PrefetchSnapshot:
+    state: AttentionState
+    hit_kv: torch.Tensor
+    miss_kv: torch.Tensor
+    token_on_device: torch.Tensor
+    device_token_pos: torch.Tensor
+    hit_counts: torch.Tensor
+    miss_counts: torch.Tensor
 
 
 def _make_case(
@@ -268,6 +358,410 @@ def _make_split_case(
         ),
     )
     return SplitSFACase(union=union, split=split)
+
+
+def _make_prefetch_compact_case(
+    *,
+    hit_counts: tuple[int, ...],
+    req_pool_indices: tuple[int, ...],
+    capacity: int,
+    max_context_len: int,
+    request_pool_size: int,
+    num_heads: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+) -> PrefetchCompactCase:
+    if not hit_counts:
+        raise ValueError("hit_counts must contain at least one request")
+    if len(req_pool_indices) != len(hit_counts):
+        raise ValueError(
+            "req_pool_indices and hit_counts must have the same length, got "
+            f"{len(req_pool_indices)} and {len(hit_counts)}"
+        )
+    if len(hit_counts) > request_pool_size:
+        raise ValueError(
+            f"batch size {len(hit_counts)} exceeds request pool size "
+            f"{request_pool_size}"
+        )
+    if max_context_len < capacity:
+        raise ValueError(
+            f"max_context_len={max_context_len} must be >= capacity={capacity}"
+        )
+    if any(count < 0 or count > capacity for count in hit_counts):
+        raise ValueError(f"hit counts must be in [0, {capacity}], got {hit_counts}")
+    if any(req < 0 or req >= request_pool_size for req in req_pool_indices):
+        raise ValueError(
+            f"request IDs must be in [0, {request_pool_size}), got "
+            f"{req_pool_indices}"
+        )
+    if len(set(req_pool_indices)) != len(req_pool_indices):
+        raise ValueError(f"request IDs must be unique, got {req_pool_indices}")
+
+    batch_size = len(hit_counts)
+    miss_counts = tuple(capacity - count for count in hit_counts)
+    head_dim = 512 + 64
+    slot_map_width = (max_context_len // 8 + 1) * 8
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+
+    def make_cpu_random(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.randn(shape, generator=generator, dtype=torch.float32).to(dtype)
+
+    query = make_cpu_random((batch_size, 1, num_heads, 512)).to(device)
+    query_rope = make_cpu_random((batch_size, 1, num_heads, 64)).to(device)
+    union_kv = torch.empty(
+        (batch_size, capacity, 1, head_dim), dtype=dtype, device="cpu"
+    )
+    host_kv = torch.zeros(
+        (request_pool_size, max_context_len, 1, head_dim), dtype=dtype, device="cpu",
+    )
+    device_kv = torch.zeros(
+        (request_pool_size, capacity, 1, head_dim), dtype=dtype, device="cpu"
+    )
+    slot_map = torch.full(
+        (request_pool_size + 1, slot_map_width), -1, dtype=torch.int32, device="cpu",
+    )
+    topk_indices = torch.empty((batch_size, capacity), dtype=torch.int32, device="cpu")
+    expected_token_on_device = torch.zeros_like(topk_indices)
+    expected_device_token_pos = torch.full_like(topk_indices, -1)
+    expected_hit_kv = torch.zeros_like(union_kv)
+    expected_miss_kv = torch.zeros_like(union_kv)
+
+    for batch_index, hit_count in enumerate(hit_counts):
+        request_id = req_pool_indices[batch_index]
+        logical_tokens = torch.randperm(
+            max_context_len, generator=generator, dtype=torch.int64
+        )[:capacity]
+        selected_kv = make_cpu_random((capacity, 1, head_dim))
+        union_kv[batch_index].copy_(selected_kv)
+        topk_indices[batch_index].copy_(logical_tokens.to(torch.int32))
+        host_kv[request_id].index_copy_(0, logical_tokens, selected_kv)
+
+        partition_order = torch.randperm(capacity, generator=generator)
+        hit_positions = partition_order[:hit_count]
+        hit_mask = torch.zeros(capacity, dtype=torch.bool)
+        hit_mask[hit_positions] = True
+        stable_hit_positions = torch.nonzero(hit_mask, as_tuple=False).squeeze(1)
+        stable_miss_positions = torch.nonzero(~hit_mask, as_tuple=False).squeeze(1)
+
+        if hit_count > 0:
+            hot_slots = torch.randperm(capacity, generator=generator)[:hit_count]
+            logical_hit_tokens = logical_tokens.index_select(0, hit_positions)
+            selected_hit_kv = selected_kv.index_select(0, hit_positions)
+            slot_map[request_id].index_copy_(
+                0, logical_hit_tokens, hot_slots.to(torch.int32)
+            )
+            device_kv[request_id].index_copy_(0, hot_slots, selected_hit_kv)
+            expected_token_on_device[batch_index, hit_positions] = 1
+            expected_device_token_pos[batch_index, hit_positions] = hot_slots.to(
+                torch.int32
+            )
+            expected_hit_kv[batch_index, :hit_count].copy_(
+                selected_kv.index_select(0, stable_hit_positions)
+            )
+
+        miss_count = capacity - hit_count
+        if miss_count > 0:
+            expected_miss_kv[batch_index, :miss_count].copy_(
+                selected_kv.index_select(0, stable_miss_positions)
+            )
+
+    positions = torch.arange(capacity, dtype=torch.int32, device=device)
+    sparse_indices = positions.view(1, 1, 1, capacity).expand(
+        batch_size, 1, 1, capacity
+    )
+    union = SFAInputs(
+        query=query,
+        key=union_kv[..., :512].contiguous().to(device),
+        query_rope=query_rope,
+        key_rope=union_kv[..., 512:].contiguous().to(device),
+        sparse_indices=sparse_indices.contiguous(),
+        actual_query_lengths=torch.ones(batch_size, dtype=torch.int32, device=device),
+        actual_kv_lengths=torch.full(
+            (batch_size,), capacity, dtype=torch.int32, device=device
+        ),
+    )
+    return PrefetchCompactCase(
+        union=union,
+        req_pool_indices=torch.tensor(req_pool_indices, dtype=torch.int64),
+        seq_lens=torch.full(
+            (batch_size,), max_context_len, dtype=torch.int32, device="cpu"
+        ),
+        topk_indices=topk_indices,
+        slot_map=slot_map,
+        device_kv=device_kv,
+        host_kv=host_kv,
+        expected_token_on_device=expected_token_on_device,
+        expected_device_token_pos=expected_device_token_pos,
+        expected_hit_kv=expected_hit_kv,
+        expected_miss_kv=expected_miss_kv,
+        hit_counts=hit_counts,
+        miss_counts=miss_counts,
+    )
+
+
+def _copy_prefetch_case(
+    static_inputs: StaticPrefetchInputs,
+    host_kv: torch.Tensor,
+    case: PrefetchCompactCase,
+) -> None:
+    static_inputs.query.copy_(case.union.query)
+    static_inputs.query_rope.copy_(case.union.query_rope)
+    static_inputs.actual_query_lengths.copy_(case.union.actual_query_lengths)
+    static_inputs.req_pool_indices.copy_(case.req_pool_indices)
+    static_inputs.seq_lens.copy_(case.seq_lens)
+    static_inputs.topk_indices.copy_(case.topk_indices)
+    static_inputs.slot_map.copy_(case.slot_map)
+    static_inputs.device_kv.copy_(case.device_kv)
+    # This is the same registered host allocation for warmup, capture, and
+    # every replay. The raw device-visible address is intentionally immutable.
+    host_kv.copy_(case.host_kv)
+
+
+def _build_dynamic_partition_metadata(
+    counts: torch.Tensor, capacity: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = counts.shape[0]
+    positions = torch.arange(capacity, dtype=torch.int32, device=counts.device).view(
+        1, capacity
+    )
+    valid = positions < counts.view(batch_size, 1)
+    indices = torch.where(
+        valid,
+        positions.expand(batch_size, capacity),
+        torch.full((batch_size, capacity), -1, dtype=torch.int32, device=counts.device),
+    )
+    indices[:, 0] = torch.where(
+        counts > 0,
+        indices[:, 0],
+        torch.zeros(batch_size, dtype=torch.int32, device=counts.device),
+    )
+    actual_lengths = counts.clamp(min=1, max=capacity).to(torch.int32).contiguous()
+    return (
+        indices.view(batch_size, 1, 1, capacity).contiguous(),
+        actual_lengths,
+    )
+
+
+def _run_prefetch_compact_split(
+    static_inputs: StaticPrefetchInputs,
+    buffers: PrefetchGraphBuffers,
+    host_kv: torch.Tensor,
+    host_kv_dev_ptr: int,
+    *,
+    request_pool_size: int,
+    max_context_len: int,
+    capacity: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if sparse_kv_ops is None:
+        raise RuntimeError("sgl_kernel_npu sparse-KV operators are required")
+
+    req_pool_indices = static_inputs.req_pool_indices.to(torch.long).contiguous()
+    valid_req_mask = (req_pool_indices >= 0) & (req_pool_indices < request_pool_size)
+    slot_map_row_indices = torch.where(
+        valid_req_mask,
+        req_pool_indices,
+        torch.full_like(req_pool_indices, request_pool_size),
+    )
+    device_cache_row_indices = torch.where(
+        valid_req_mask, req_pool_indices, torch.zeros_like(req_pool_indices),
+    )
+    topk_indices = static_inputs.topk_indices
+    batch_size, topk_len = topk_indices.shape
+    if topk_len != capacity:
+        raise RuntimeError(f"expected fixed top-k={capacity}, got {topk_len}")
+
+    valid_topk_mask = (
+        (topk_indices >= 0)
+        & (topk_indices < max_context_len)
+        & valid_req_mask.unsqueeze(1)
+        & (static_inputs.seq_lens[:batch_size] > 0).view(batch_size, 1)
+    )
+    token_on_device, device_token_pos = sparse_kv_ops.slot_map_lookup(
+        static_inputs.slot_map,
+        slot_map_row_indices.to(torch.int32).contiguous(),
+        topk_indices.to(torch.int32).contiguous(),
+    )
+    hit_valid = token_on_device.to(torch.bool) & valid_topk_mask
+    miss_valid = (~hit_valid) & valid_topk_mask
+    hit_counts = hit_valid.sum(dim=1).to(torch.int32).contiguous()
+    miss_counts = miss_valid.sum(dim=1).to(torch.int32).contiguous()
+    hit_ranks = torch.cumsum(hit_valid.to(torch.int32), dim=1).to(torch.int64) - 1
+    miss_ranks = torch.cumsum(miss_valid.to(torch.int32), dim=1).to(torch.int64) - 1
+
+    batch_offsets = (
+        torch.arange(batch_size, dtype=torch.int64, device=topk_indices.device)
+        .unsqueeze(1)
+        .mul(capacity)
+    )
+    hit_compact_indices = (
+        (batch_offsets + hit_ranks.clamp(min=0, max=capacity - 1))
+        .reshape(-1)
+        .contiguous()
+    )
+    miss_compact_indices = (
+        (batch_offsets + miss_ranks.clamp(min=0, max=capacity - 1))
+        .reshape(-1)
+        .contiguous()
+    )
+
+    request_device_offsets = device_cache_row_indices.unsqueeze(1) * capacity
+    hit_src_indices = (
+        (
+            request_device_offsets
+            + device_token_pos.to(torch.int64).clamp(min=0, max=capacity - 1)
+        )
+        .reshape(-1)
+        .contiguous()
+    )
+    request_host_offsets = device_cache_row_indices.unsqueeze(1) * max_context_len
+    miss_src_indices = (
+        (
+            request_host_offsets
+            + topk_indices.to(torch.int64).clamp(min=0, max=max_context_len - 1)
+        )
+        .reshape(-1)
+        .contiguous()
+    )
+    hit_valid_flat = hit_valid.reshape(-1).contiguous()
+    miss_valid_flat = miss_valid.reshape(-1).contiguous()
+
+    # Empty partitions use a zero-valued dummy token. All other valid compact
+    # rows overwrite slot zero through the copies below.
+    buffers.hit_kv[:, :1].zero_()
+    buffers.miss_kv[:, :1].zero_()
+    sparse_kv_ops.unidex_copy_inplace(
+        static_inputs.device_kv,
+        buffers.hit_kv,
+        hit_src_indices,
+        hit_compact_indices,
+        hit_valid_flat,
+        2,
+        2,
+        block_dim=24,
+    )
+    sparse_kv_ops.unidex_copy_inplace(
+        host_kv,
+        buffers.miss_kv,
+        miss_src_indices,
+        miss_compact_indices,
+        miss_valid_flat,
+        2,
+        2,
+        block_dim=24,
+        src_ptr=host_kv_dev_ptr,
+    )
+
+    hit_sparse_indices, hit_actual_lengths = _build_dynamic_partition_metadata(
+        hit_counts, capacity
+    )
+    miss_sparse_indices, miss_actual_lengths = _build_dynamic_partition_metadata(
+        miss_counts, capacity
+    )
+    hit_key, hit_key_rope = torch.split(buffers.hit_kv, (512, 64), dim=-1)
+    miss_key, miss_key_rope = torch.split(buffers.miss_kv, (512, 64), dim=-1)
+    split_inputs = SplitSFAInputs(
+        query=static_inputs.query,
+        query_rope=static_inputs.query_rope,
+        actual_query_lengths=static_inputs.actual_query_lengths,
+        hit=SFAPartitionInputs(
+            key=hit_key.contiguous(),
+            key_rope=hit_key_rope.contiguous(),
+            sparse_indices=hit_sparse_indices,
+            actual_kv_lengths=hit_actual_lengths,
+            true_counts=hit_counts,
+        ),
+        miss=SFAPartitionInputs(
+            key=miss_key.contiguous(),
+            key_rope=miss_key_rope.contiguous(),
+            sparse_indices=miss_sparse_indices,
+            actual_kv_lengths=miss_actual_lengths,
+            true_counts=miss_counts,
+        ),
+    )
+    merged_state = _run_split_sfa(split_inputs, scale)
+
+    buffers.token_on_device.copy_(token_on_device)
+    buffers.device_token_pos.copy_(device_token_pos)
+    buffers.hit_counts.copy_(hit_counts)
+    buffers.miss_counts.copy_(miss_counts)
+    buffers.output.copy_(merged_state.output)
+    buffers.softmax_max.copy_(merged_state.softmax_max)
+    buffers.softmax_sum.copy_(merged_state.softmax_sum)
+    return token_on_device, device_token_pos
+
+
+def _snapshot_prefetch_buffers(buffers: PrefetchGraphBuffers) -> PrefetchSnapshot:
+    return PrefetchSnapshot(
+        state=_clone_state(
+            AttentionState(buffers.output, buffers.softmax_max, buffers.softmax_sum)
+        ),
+        hit_kv=buffers.hit_kv.detach().clone(),
+        miss_kv=buffers.miss_kv.detach().clone(),
+        token_on_device=buffers.token_on_device.detach().clone(),
+        device_token_pos=buffers.device_token_pos.detach().clone(),
+        hit_counts=buffers.hit_counts.detach().clone(),
+        miss_counts=buffers.miss_counts.detach().clone(),
+    )
+
+
+def _assert_prefetch_compaction(
+    snapshot: PrefetchSnapshot, case: PrefetchCompactCase, *, stage: str
+) -> None:
+    torch.testing.assert_close(
+        snapshot.token_on_device.cpu(),
+        case.expected_token_on_device,
+        atol=0,
+        rtol=0,
+        msg=f"{stage}: slot-map hit flags differ from the CPU oracle",
+    )
+    torch.testing.assert_close(
+        snapshot.device_token_pos.cpu(),
+        case.expected_device_token_pos,
+        atol=0,
+        rtol=0,
+        msg=f"{stage}: slot-map device positions differ from the CPU oracle",
+    )
+    expected_hit_counts = torch.tensor(case.hit_counts, dtype=torch.int32)
+    expected_miss_counts = torch.tensor(case.miss_counts, dtype=torch.int32)
+    torch.testing.assert_close(
+        snapshot.hit_counts.cpu(), expected_hit_counts, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        snapshot.miss_counts.cpu(), expected_miss_counts, atol=0, rtol=0
+    )
+
+    for batch_index, (hit_count, miss_count) in enumerate(
+        zip(case.hit_counts, case.miss_counts, strict=True)
+    ):
+        if hit_count > 0:
+            torch.testing.assert_close(
+                snapshot.hit_kv[batch_index, :hit_count].cpu(),
+                case.expected_hit_kv[batch_index, :hit_count],
+                atol=0,
+                rtol=0,
+                msg=f"{stage}: row {batch_index} hit compact prefix is incorrect",
+            )
+        else:
+            assert torch.count_nonzero(snapshot.hit_kv[batch_index, 0]).item() == 0, (
+                f"{stage}: row {batch_index} empty hit partition did not get a "
+                "zero dummy"
+            )
+        if miss_count > 0:
+            torch.testing.assert_close(
+                snapshot.miss_kv[batch_index, :miss_count].cpu(),
+                case.expected_miss_kv[batch_index, :miss_count],
+                atol=0,
+                rtol=0,
+                msg=f"{stage}: row {batch_index} miss compact prefix is incorrect",
+            )
+        else:
+            assert torch.count_nonzero(snapshot.miss_kv[batch_index, 0]).item() == 0, (
+                f"{stage}: row {batch_index} empty miss partition did not get a "
+                "zero dummy"
+            )
 
 
 def _clone_inputs(inputs: SFAInputs) -> SFAInputs:
@@ -1068,6 +1562,459 @@ def test_two_sfa_fp32_merge_survives_npugraph_dynamic_replay() -> None:
         f"lse={_max_abs_error(_state_lse(graph_b), _state_lse(union_b)):.4e}"
     )
     print("PASSED: single-stream hit/miss SFA and FP32 merge survive NPUGraph replay")
+
+
+@pytest.mark.skipif(
+    torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="torch_npu and an Ascend NPU are required",
+)
+def test_real_prefetch_compact_two_sfa_merge_survives_npugraph() -> None:
+    """Capture lookup, D2D/H2D compact, two SFA calls, and merge on one stream.
+
+    The test intentionally excludes refill, slot-map mutation, auxiliary
+    streams, and Events. ``free_shm`` frees every SHM allocation registered by
+    this process, so run this manual capability test in an isolated pytest
+    process rather than inside a live SGLang server. Requests and top-k entries
+    remain valid here; padded/sentinel rows are a separate follow-up boundary.
+    """
+
+    if sparse_kv_ops is None:
+        pytest.fail(
+            "the matching sgl_kernel_npu sparse-KV package is required for the "
+            "real prefetch NPUGraph test; import failed with "
+            f"{type(_SPARSE_KV_OPS_IMPORT_ERROR).__name__}: "
+            f"{_SPARSE_KV_OPS_IMPORT_ERROR}",
+            pytrace=False,
+        )
+
+    device_index = 0
+    torch.npu.set_device(device_index)
+    device = torch.device(f"npu:{device_index}")
+    dtype = torch.bfloat16
+    batch_size = 2
+    # Request IDs deliberately differ from batch rows so the test catches an
+    # incorrect b*K/b*C source offset in place of req_id*K/req_id*C.
+    request_pool_size = 4
+    num_heads = 16
+    capacity = 2048
+    max_context_len = 4096
+    head_dim = 512 + 64
+    slot_map_width = (max_context_len // 8 + 1) * 8
+    scale = 1.0 / math.sqrt(128 + 64)
+    output_atol = 2e-2
+    output_rtol = 2e-2
+    runtime = _runtime_description(device_index)
+
+    print(runtime)
+    print(
+        "single-stream real prefetch graph: "
+        f"dtype={dtype} batch={batch_size} heads={num_heads} "
+        f"capacity={capacity} context={max_context_len} scale={scale:.8f}"
+    )
+
+    capture_case = _make_prefetch_compact_case(
+        hit_counts=(1024, 1536),
+        req_pool_indices=(2, 0),
+        capacity=capacity,
+        max_context_len=max_context_len,
+        request_pool_size=request_pool_size,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026081420,
+    )
+    replay_case_a = _make_prefetch_compact_case(
+        hit_counts=(2048, 0),
+        req_pool_indices=(3, 1),
+        capacity=capacity,
+        max_context_len=max_context_len,
+        request_pool_size=request_pool_size,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026081421,
+    )
+    replay_case_b = _make_prefetch_compact_case(
+        hit_counts=(256, 1792),
+        req_pool_indices=(1, 3),
+        capacity=capacity,
+        max_context_len=max_context_len,
+        request_pool_size=request_pool_size,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026081422,
+    )
+
+    shm_name = f"sglang_prefetch_graph_{os.getpid()}_{device_index}_{uuid.uuid4().hex}"
+    host_kv = None
+    host_kv_host_ptr = None
+    host_kv_dev_ptr = None
+    graph = None
+    shm_created = False
+    lookup_refs: list[torch.Tensor] = []
+
+    try:
+        try:
+            (
+                host_kv,
+                host_kv_host_ptr,
+                host_kv_dev_ptr,
+            ) = sparse_kv_ops.create_shm_tensor(
+                (request_pool_size, max_context_len, 1, head_dim),
+                dtype,
+                device_index,
+                shm_name,
+            )
+            shm_created = True
+        except Exception as error:
+            raise AssertionError(
+                "could not allocate/register the host KV SHM used by the "
+                f"prefetch graph; {runtime}; original error: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+
+        assert host_kv is not None
+        assert host_kv_host_ptr is not None
+        assert host_kv_dev_ptr is not None
+        assert host_kv.data_ptr() == host_kv_host_ptr
+
+        static_inputs = StaticPrefetchInputs(
+            query=torch.empty_like(capture_case.union.query),
+            query_rope=torch.empty_like(capture_case.union.query_rope),
+            actual_query_lengths=torch.empty_like(
+                capture_case.union.actual_query_lengths
+            ),
+            req_pool_indices=torch.empty(batch_size, dtype=torch.int64, device=device),
+            seq_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            topk_indices=torch.empty(
+                (batch_size, capacity), dtype=torch.int32, device=device
+            ),
+            slot_map=torch.empty(
+                (request_pool_size + 1, slot_map_width),
+                dtype=torch.int32,
+                device=device,
+            ),
+            device_kv=torch.empty(
+                (request_pool_size, capacity, 1, head_dim), dtype=dtype, device=device,
+            ),
+        )
+        stats_shape = _expected_stats_shape(capture_case.union)
+        buffers = PrefetchGraphBuffers(
+            hit_kv=torch.empty(
+                (batch_size, capacity, 1, head_dim), dtype=dtype, device=device
+            ),
+            miss_kv=torch.empty(
+                (batch_size, capacity, 1, head_dim), dtype=dtype, device=device
+            ),
+            token_on_device=torch.empty(
+                (batch_size, capacity), dtype=torch.int32, device=device
+            ),
+            device_token_pos=torch.empty(
+                (batch_size, capacity), dtype=torch.int32, device=device
+            ),
+            hit_counts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            miss_counts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            output=torch.empty_like(capture_case.union.query),
+            softmax_max=torch.empty(stats_shape, dtype=torch.float32, device=device),
+            softmax_sum=torch.empty(stats_shape, dtype=torch.float32, device=device),
+        )
+
+        def load_case(case: PrefetchCompactCase) -> None:
+            # The mapped host cache may still be read by the previous replay.
+            # Synchronize before overwriting it, then stage every fixed-address
+            # input in place.
+            torch.npu.synchronize()
+            _copy_prefetch_case(static_inputs, host_kv, case)
+            buffers.hit_kv.fill_(float("nan"))
+            buffers.miss_kv.fill_(float("nan"))
+            buffers.token_on_device.fill_(-777)
+            buffers.device_token_pos.fill_(-777)
+            buffers.hit_counts.fill_(-777)
+            buffers.miss_counts.fill_(-777)
+            buffers.output.fill_(float("nan"))
+            buffers.softmax_max.fill_(float("nan"))
+            buffers.softmax_sum.fill_(float("nan"))
+            torch.npu.synchronize()
+
+        def run_once() -> None:
+            # This is deliberately a single-stream sequence. Do not add an
+            # auxiliary stream or Event here; those are tested in a later step.
+            token_on_device, device_token_pos = _run_prefetch_compact_split(
+                static_inputs,
+                buffers,
+                host_kv,
+                host_kv_dev_ptr,
+                request_pool_size=request_pool_size,
+                max_context_len=max_context_len,
+                capacity=capacity,
+                scale=scale,
+            )
+            lookup_refs[:] = [token_on_device, device_token_pos]
+
+        def validate_snapshot(
+            snapshot: PrefetchSnapshot,
+            case: PrefetchCompactCase,
+            union_state: AttentionState,
+            *,
+            stage: str,
+        ) -> None:
+            _assert_prefetch_compaction(snapshot, case, stage=stage)
+            _validate_contract(snapshot.state, case.union, stage=stage)
+            _assert_matches(
+                snapshot.state,
+                union_state,
+                output_atol=output_atol,
+                output_rtol=output_rtol,
+                stage=f"{stage} vs union SFA",
+            )
+
+        def eager_reference(
+            case: PrefetchCompactCase, stage: str
+        ) -> tuple[AttentionState, PrefetchSnapshot]:
+            load_case(case)
+            try:
+                run_once()
+                union_state = _run_sfa(case.union, scale)
+                torch.npu.synchronize()
+            except Exception as error:
+                raise AssertionError(
+                    f"{stage}: eager prefetch/compact + two SFA + merge failed; "
+                    f"{runtime}; original error: {type(error).__name__}: {error}"
+                ) from error
+
+            union_state = _clone_state(union_state)
+            snapshot = _snapshot_prefetch_buffers(buffers)
+            _validate_contract(union_state, case.union, stage=f"{stage} union")
+            validate_snapshot(snapshot, case, union_state, stage=stage)
+            return union_state, snapshot
+
+        capture_union, _ = eager_reference(capture_case, "capture eager")
+        union_a, eager_a = eager_reference(replay_case_a, "replay A eager")
+        union_b, eager_b = eager_reference(replay_case_b, "replay B eager")
+
+        minimum_case_deltas = {
+            "output": 1e-2,
+            "softmax_max": 1e-2,
+            "softmax_sum": 1e-1,
+            "lse": 1e-2,
+        }
+        eager_case_deltas = {
+            "output": _max_abs_error(eager_a.state.output, eager_b.state.output),
+            "softmax_max": _max_abs_error(
+                eager_a.state.softmax_max, eager_b.state.softmax_max
+            ),
+            "softmax_sum": _max_abs_error(
+                eager_a.state.softmax_sum, eager_b.state.softmax_sum
+            ),
+            "lse": _max_abs_error(_state_lse(eager_a.state), _state_lse(eager_b.state)),
+        }
+        for name, minimum_delta in minimum_case_deltas.items():
+            assert eager_case_deltas[name] > minimum_delta, (
+                f"the eager real-prefetch {name} values differ by only "
+                f"{eager_case_deltas[name]:.4e}; replay cases cannot detect a "
+                "frozen graph output"
+            )
+
+        input_pointers = tuple(tensor.data_ptr() for tensor in static_inputs.tensors())
+        buffer_pointers = tuple(tensor.data_ptr() for tensor in buffers.tensors())
+        fixed_host_ptrs = (host_kv.data_ptr(), host_kv_host_ptr, host_kv_dev_ptr)
+        try:
+            capture_stream = torch.npu.Stream()
+            graph_pool = torch.npu.graph_pool_handle()
+        except Exception as error:
+            raise AssertionError(
+                "NPUGraph runtime setup failed before real-prefetch capture; "
+                f"{runtime}; original error: {type(error).__name__}: {error}"
+            ) from error
+
+        load_case(capture_case)
+        try:
+            capture_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(capture_stream):
+                for _ in range(2):
+                    run_once()
+            torch.npu.synchronize()
+            warmup_snapshot = _snapshot_prefetch_buffers(buffers)
+            validate_snapshot(
+                warmup_snapshot,
+                capture_case,
+                capture_union,
+                stage="real-prefetch graph warmup",
+            )
+        except Exception as error:
+            raise AssertionError(
+                "real prefetch/compact + two SFA + merge failed during graph "
+                f"stream warmup; {runtime}; original error: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+
+        try:
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(
+                graph,
+                pool=graph_pool,
+                stream=capture_stream,
+                auto_dispatch_capture=True,
+            ):
+                run_once()
+            torch.npu.synchronize()
+        except Exception as error:
+            raise AssertionError(
+                "NPUGraph could not capture the single-stream slot lookup, "
+                "device/host compact copies, two SFA calls, and FP32 merge; "
+                "keep graph mode on the combined fallback; "
+                f"{runtime}; original error: {type(error).__name__}: {error}"
+            ) from error
+
+        assert len(lookup_refs) == 2, "capture did not retain slot-lookup outputs"
+        lookup_pointers = tuple(tensor.data_ptr() for tensor in lookup_refs)
+        assert (
+            tuple(tensor.data_ptr() for tensor in static_inputs.tensors())
+            == input_pointers
+        ), "capture changed a real-prefetch static input address"
+        assert (
+            tuple(tensor.data_ptr() for tensor in buffers.tensors()) == buffer_pointers
+        ), "capture changed a real-prefetch output/scratch address"
+        assert (
+            host_kv.data_ptr(),
+            host_kv_host_ptr,
+            host_kv_dev_ptr,
+        ) == fixed_host_ptrs, "capture changed the registered host KV address"
+        capture_snapshot = _snapshot_prefetch_buffers(buffers)
+        validate_snapshot(
+            capture_snapshot,
+            capture_case,
+            capture_union,
+            stage="real-prefetch graph capture",
+        )
+
+        def replay(case: PrefetchCompactCase, stage: str) -> PrefetchSnapshot:
+            load_case(case)
+            try:
+                graph.replay()
+                torch.npu.synchronize()
+            except Exception as error:
+                raise AssertionError(
+                    f"{stage}: real-prefetch NPUGraph replay failed; {runtime}; "
+                    f"original error: {type(error).__name__}: {error}"
+                ) from error
+
+            assert (
+                tuple(tensor.data_ptr() for tensor in static_inputs.tensors())
+                == input_pointers
+            ), f"{stage}: a static input address changed"
+            assert (
+                tuple(tensor.data_ptr() for tensor in buffers.tensors())
+                == buffer_pointers
+            ), f"{stage}: an output/scratch address changed"
+            assert tuple(tensor.data_ptr() for tensor in lookup_refs) == (
+                lookup_pointers
+            ), f"{stage}: a captured slot-lookup output address changed"
+            assert (
+                host_kv.data_ptr(),
+                host_kv_host_ptr,
+                host_kv_dev_ptr,
+            ) == fixed_host_ptrs, f"{stage}: the registered host KV address changed"
+            return _snapshot_prefetch_buffers(buffers)
+
+        graph_a = replay(replay_case_a, "real-prefetch graph replay A")
+        graph_b = replay(replay_case_b, "real-prefetch graph replay B")
+
+        for graph_snapshot, eager_snapshot, union_state, case, stage in (
+            (graph_a, eager_a, union_a, replay_case_a, "real-prefetch graph replay A",),
+            (graph_b, eager_b, union_b, replay_case_b, "real-prefetch graph replay B",),
+        ):
+            validate_snapshot(graph_snapshot, case, union_state, stage=stage)
+            _assert_matches(
+                graph_snapshot.state,
+                eager_snapshot.state,
+                output_atol=output_atol,
+                output_rtol=output_rtol,
+                stage=f"{stage} vs eager real-prefetch",
+            )
+
+        graph_case_deltas = {
+            "output": _max_abs_error(graph_a.state.output, graph_b.state.output),
+            "softmax_max": _max_abs_error(
+                graph_a.state.softmax_max, graph_b.state.softmax_max
+            ),
+            "softmax_sum": _max_abs_error(
+                graph_a.state.softmax_sum, graph_b.state.softmax_sum
+            ),
+            "lse": _max_abs_error(_state_lse(graph_a.state), _state_lse(graph_b.state)),
+        }
+        for name, minimum_delta in minimum_case_deltas.items():
+            assert graph_case_deltas[name] > minimum_delta, (
+                f"real-prefetch graph replay did not refresh {name}: replay "
+                f"A/B delta={graph_case_deltas[name]:.4e}"
+            )
+
+        print(
+            "replay A graph-vs-union errors: "
+            f"out={_max_abs_error(graph_a.state.output, union_a.output):.4e} "
+            f"max={_max_abs_error(graph_a.state.softmax_max, union_a.softmax_max):.4e} "
+            f"sum={_max_abs_error(graph_a.state.softmax_sum, union_a.softmax_sum):.4e} "
+            f"lse={_max_abs_error(_state_lse(graph_a.state), _state_lse(union_a)):.4e}"
+        )
+        print(
+            "replay B graph-vs-union errors: "
+            f"out={_max_abs_error(graph_b.state.output, union_b.output):.4e} "
+            f"max={_max_abs_error(graph_b.state.softmax_max, union_b.softmax_max):.4e} "
+            f"sum={_max_abs_error(graph_b.state.softmax_sum, union_b.softmax_sum):.4e} "
+            f"lse={_max_abs_error(_state_lse(graph_b.state), _state_lse(union_b)):.4e}"
+        )
+        print(
+            "PASSED: real slot lookup + device/host compact + two SFA + FP32 "
+            "merge survive single-stream NPUGraph replay"
+        )
+    finally:
+        if shm_created:
+            active_error = sys.exc_info()[1]
+            try:
+                torch.npu.synchronize()
+            except Exception as cleanup_error:
+                # A failed synchronization means a graph/kernel may still be
+                # reading the raw SHM address. Do not unregister that memory;
+                # let the isolated test process reclaim it on exit instead.
+                if active_error is None:
+                    raise
+                print(
+                    "WARNING: leaving sparse-KV SHM registered because final "
+                    f"NPU synchronization failed: {type(cleanup_error).__name__}: "
+                    f"{cleanup_error}",
+                    file=sys.stderr,
+                )
+            else:
+                lookup_refs.clear()
+                graph_released = True
+                if graph is not None and hasattr(graph, "reset"):
+                    try:
+                        graph.reset()
+                    except Exception as cleanup_error:
+                        graph_released = False
+                        if active_error is None:
+                            raise
+                        print(
+                            "WARNING: leaving sparse-KV SHM registered because "
+                            "NPUGraph reset failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}",
+                            file=sys.stderr,
+                        )
+                if graph_released:
+                    graph = None
+                    gc.collect()
+                    try:
+                        sparse_kv_ops.free_shm(device_index)
+                    except Exception as cleanup_error:
+                        if active_error is None:
+                            raise
+                        print(
+                            "WARNING: sparse-KV SHM cleanup failed while "
+                            "propagating the test error: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}",
+                            file=sys.stderr,
+                        )
 
 
 if __name__ == "__main__":
