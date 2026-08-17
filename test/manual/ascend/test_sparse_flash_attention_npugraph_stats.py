@@ -693,6 +693,247 @@ def _run_prefetch_compact_split(
     return token_on_device, device_token_pos
 
 
+def _run_prefetch_compact_split_dual_stream_refill(
+    static_inputs: StaticPrefetchInputs,
+    buffers: PrefetchGraphBuffers,
+    host_kv: torch.Tensor,
+    host_kv_dev_ptr: int,
+    miss_stream,
+    inputs_ready,
+    hit_copy_done,
+    miss_attention_done,
+    refill_done,
+    *,
+    request_pool_size: int,
+    max_context_len: int,
+    capacity: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a two-stream compact/SFA path and publish the refill in-graph.
+
+    The caller's current stream is the graph's main/hit stream.  All lookup and
+    compact-index tensors are produced there, then ``inputs_ready`` releases the
+    registered-host-memory copy and miss SFA on ``miss_stream``.  That worker
+    refills the fixed hot-cache slots after ``hit_copy_done`` and publishes the
+    corresponding slot-map entries.  The main stream joins miss attention for
+    merge, then joins ``refill_done`` before returning.  Streams and Events are
+    supplied by the caller so capture never creates runtime objects whose
+    lifetime would end before replay.
+    """
+
+    if sparse_kv_ops is None:
+        raise RuntimeError("sgl_kernel_npu sparse-KV operators are required")
+
+    main_stream = torch.npu.current_stream()
+    req_pool_indices = static_inputs.req_pool_indices.to(torch.long).contiguous()
+    valid_req_mask = (req_pool_indices >= 0) & (req_pool_indices < request_pool_size)
+    slot_map_row_indices = torch.where(
+        valid_req_mask,
+        req_pool_indices,
+        torch.full_like(req_pool_indices, request_pool_size),
+    )
+    device_cache_row_indices = torch.where(
+        valid_req_mask, req_pool_indices, torch.zeros_like(req_pool_indices)
+    )
+    topk_indices = static_inputs.topk_indices
+    batch_size, topk_len = topk_indices.shape
+    if topk_len != capacity:
+        raise RuntimeError(f"expected fixed top-k={capacity}, got {topk_len}")
+
+    valid_topk_mask = (
+        (topk_indices >= 0)
+        & (topk_indices < max_context_len)
+        & valid_req_mask.unsqueeze(1)
+        & (static_inputs.seq_lens[:batch_size] > 0).view(batch_size, 1)
+    )
+    token_on_device, device_token_pos = sparse_kv_ops.slot_map_lookup(
+        static_inputs.slot_map,
+        slot_map_row_indices.to(torch.int32).contiguous(),
+        topk_indices.to(torch.int32).contiguous(),
+    )
+    hit_valid = token_on_device.to(torch.bool) & valid_topk_mask
+    miss_valid = (~hit_valid) & valid_topk_mask
+    hit_counts = hit_valid.sum(dim=1).to(torch.int32).contiguous()
+    miss_counts = miss_valid.sum(dim=1).to(torch.int32).contiguous()
+    hit_ranks = torch.cumsum(hit_valid.to(torch.int32), dim=1).to(torch.int64) - 1
+    miss_ranks = torch.cumsum(miss_valid.to(torch.int32), dim=1).to(torch.int64) - 1
+
+    batch_offsets = (
+        torch.arange(batch_size, dtype=torch.int64, device=topk_indices.device)
+        .unsqueeze(1)
+        .mul(capacity)
+    )
+    hit_compact_indices = (
+        (batch_offsets + hit_ranks.clamp(min=0, max=capacity - 1))
+        .reshape(-1)
+        .contiguous()
+    )
+    miss_compact_indices = (
+        (batch_offsets + miss_ranks.clamp(min=0, max=capacity - 1))
+        .reshape(-1)
+        .contiguous()
+    )
+    request_device_offsets = device_cache_row_indices.unsqueeze(1) * capacity
+    hit_src_indices = (
+        (
+            request_device_offsets
+            + device_token_pos.to(torch.int64).clamp(min=0, max=capacity - 1)
+        )
+        .reshape(-1)
+        .contiguous()
+    )
+    request_host_offsets = device_cache_row_indices.unsqueeze(1) * max_context_len
+    miss_src_indices = (
+        (
+            request_host_offsets
+            + topk_indices.to(torch.int64).clamp(min=0, max=max_context_len - 1)
+        )
+        .reshape(-1)
+        .contiguous()
+    )
+    hit_valid_flat = hit_valid.reshape(-1).contiguous()
+    miss_valid_flat = miss_valid.reshape(-1).contiguous()
+
+    # Both SFA calls retain their fixed capacity.  Empty partitions consume the
+    # zero dummy at slot zero and are neutralized by true_counts during merge.
+    buffers.hit_kv[:, :1].zero_()
+    buffers.miss_kv[:, :1].zero_()
+    hit_sparse_indices, hit_actual_lengths = _build_dynamic_partition_metadata(
+        hit_counts, capacity
+    )
+    miss_sparse_indices, miss_actual_lengths = _build_dynamic_partition_metadata(
+        miss_counts, capacity
+    )
+    inputs_ready.record(main_stream)
+
+    # Main/hit path. Record copy completion separately so refill may overlap the
+    # hit SFA without reading hit_kv before its compact copy has completed.
+    sparse_kv_ops.unidex_copy_inplace(
+        static_inputs.device_kv,
+        buffers.hit_kv,
+        hit_src_indices,
+        hit_compact_indices,
+        hit_valid_flat,
+        2,
+        2,
+        block_dim=24,
+    )
+    hit_copy_done.record(main_stream)
+    hit_key, hit_key_rope = torch.split(buffers.hit_kv, (512, 64), dim=-1)
+    hit_partition = SFAPartitionInputs(
+        key=hit_key.contiguous(),
+        key_rope=hit_key_rope.contiguous(),
+        sparse_indices=hit_sparse_indices,
+        actual_kv_lengths=hit_actual_lengths,
+        true_counts=hit_counts,
+    )
+    hit_inputs = SplitSFAInputs(
+        query=static_inputs.query,
+        query_rope=static_inputs.query_rope,
+        actual_query_lengths=static_inputs.actual_query_lengths,
+        hit=hit_partition,
+        miss=hit_partition,
+    )
+    hit_state = _run_partition_sfa(hit_inputs, hit_partition, scale)
+
+    # Worker/miss path, followed by stateful refill. The miss-attention Event is
+    # deliberately recorded before refill so main-stream merge can overlap the
+    # cache update, matching the production graph-dual ordering.
+    with torch.npu.stream(miss_stream):
+        miss_stream.wait_event(inputs_ready)
+        sparse_kv_ops.unidex_copy_inplace(
+            host_kv,
+            buffers.miss_kv,
+            miss_src_indices,
+            miss_compact_indices,
+            miss_valid_flat,
+            2,
+            2,
+            block_dim=24,
+            src_ptr=host_kv_dev_ptr,
+        )
+        miss_key, miss_key_rope = torch.split(buffers.miss_kv, (512, 64), dim=-1)
+        miss_partition = SFAPartitionInputs(
+            key=miss_key.contiguous(),
+            key_rope=miss_key_rope.contiguous(),
+            sparse_indices=miss_sparse_indices,
+            actual_kv_lengths=miss_actual_lengths,
+            true_counts=miss_counts,
+        )
+        miss_inputs = SplitSFAInputs(
+            query=static_inputs.query,
+            query_rope=static_inputs.query_rope,
+            actual_query_lengths=static_inputs.actual_query_lengths,
+            hit=miss_partition,
+            miss=miss_partition,
+        )
+        miss_state = _run_partition_sfa(miss_inputs, miss_partition, scale)
+        miss_attention_done.record(miss_stream)
+
+        miss_stream.wait_event(hit_copy_done)
+        topk_positions = torch.arange(
+            capacity, dtype=torch.int64, device=topk_indices.device
+        ).unsqueeze(0)
+        refill_dst_indices = (
+            (request_device_offsets + topk_positions).reshape(-1).contiguous()
+        )
+        sparse_kv_ops.unidex_copy_inplace(
+            buffers.hit_kv,
+            static_inputs.device_kv,
+            hit_compact_indices,
+            refill_dst_indices,
+            hit_valid_flat,
+            2,
+            2,
+            block_dim=24,
+        )
+        sparse_kv_ops.unidex_copy_inplace(
+            buffers.miss_kv,
+            static_inputs.device_kv,
+            miss_compact_indices,
+            refill_dst_indices,
+            miss_valid_flat,
+            2,
+            2,
+            block_dim=24,
+        )
+        static_inputs.slot_map.index_fill_(0, slot_map_row_indices, -1)
+        cache_slot_ids = torch.arange(
+            capacity, dtype=torch.int32, device=topk_indices.device
+        ).unsqueeze(0)
+        slot_map_token_indices = torch.where(
+            valid_topk_mask,
+            topk_indices.to(torch.long),
+            torch.full_like(topk_indices, max_context_len, dtype=torch.long),
+        )
+        slot_map_slot_values = torch.where(
+            valid_topk_mask, cache_slot_ids, torch.full_like(cache_slot_ids, -1),
+        )
+        slot_map_flat_indices = (
+            slot_map_row_indices.unsqueeze(1) * static_inputs.slot_map.shape[1]
+            + slot_map_token_indices
+        ).reshape(-1)
+        static_inputs.slot_map.view(-1).scatter_(
+            0, slot_map_flat_indices, slot_map_slot_values.reshape(-1)
+        )
+        refill_done.record(miss_stream)
+
+    main_stream.wait_event(miss_attention_done)
+    merged_state = _merge_partition_states(
+        hit_state, miss_state, hit_counts, miss_counts
+    )
+    main_stream.wait_event(refill_done)
+
+    buffers.token_on_device.copy_(token_on_device)
+    buffers.device_token_pos.copy_(device_token_pos)
+    buffers.hit_counts.copy_(hit_counts)
+    buffers.miss_counts.copy_(miss_counts)
+    buffers.output.copy_(merged_state.output)
+    buffers.softmax_max.copy_(merged_state.softmax_max)
+    buffers.softmax_sum.copy_(merged_state.softmax_sum)
+    return token_on_device, device_token_pos
+
+
 def _snapshot_prefetch_buffers(buffers: PrefetchGraphBuffers) -> PrefetchSnapshot:
     return PrefetchSnapshot(
         state=_clone_state(
@@ -762,6 +1003,36 @@ def _assert_prefetch_compaction(
                 f"{stage}: row {batch_index} empty miss partition did not get a "
                 "zero dummy"
             )
+
+
+def _assert_refill_and_slot_map_published(
+    static_inputs: StaticPrefetchInputs,
+    case: PrefetchCompactCase,
+    *,
+    capacity: int,
+    stage: str,
+) -> None:
+    expected_kv = torch.cat((case.union.key, case.union.key_rope), dim=-1)
+    expected_slots = torch.arange(capacity, dtype=torch.int32)
+    for batch_index, request_id_tensor in enumerate(case.req_pool_indices):
+        request_id = int(request_id_tensor.item())
+        torch.testing.assert_close(
+            static_inputs.device_kv[request_id, :capacity].cpu(),
+            expected_kv[batch_index].cpu(),
+            atol=0,
+            rtol=0,
+            msg=f"{stage}: request {request_id} hot-cache refill is incorrect",
+        )
+        logical_tokens = case.topk_indices[batch_index].to(torch.long)
+        torch.testing.assert_close(
+            static_inputs.slot_map[request_id]
+            .index_select(0, logical_tokens.to(static_inputs.slot_map.device))
+            .cpu(),
+            expected_slots,
+            atol=0,
+            rtol=0,
+            msg=f"{stage}: request {request_id} slot-map publish is incorrect",
+        )
 
 
 def _clone_inputs(inputs: SFAInputs) -> SFAInputs:
@@ -2012,6 +2283,405 @@ def test_real_prefetch_compact_two_sfa_merge_survives_npugraph() -> None:
                         print(
                             "WARNING: sparse-KV SHM cleanup failed while "
                             "propagating the test error: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}",
+                            file=sys.stderr,
+                        )
+
+
+@pytest.mark.skipif(
+    torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="torch_npu and an Ascend NPU are required",
+)
+def test_real_prefetch_dual_stream_refill_slot_map_survives_npugraph() -> None:
+    """Capture two streams and prove refill affects the following replay.
+
+    Capture starts from a mixed hit/miss cache.  Replay 1 resets that same mixed
+    state, refills every selected token into deterministic hot-cache slots, and
+    publishes the new slot map.  Replay 2 changes only query data, so observing
+    larger (all-hit) counts proves graph state written by replay 1 is visible to
+    replay 2. Run the test in an isolated process because ``free_shm`` releases
+    all sparse-KV SHM allocations registered by this process.
+    """
+
+    if sparse_kv_ops is None:
+        pytest.fail(
+            "the matching sgl_kernel_npu sparse-KV package is required for the "
+            "dual-stream refill NPUGraph test; import failed with "
+            f"{type(_SPARSE_KV_OPS_IMPORT_ERROR).__name__}: "
+            f"{_SPARSE_KV_OPS_IMPORT_ERROR}",
+            pytrace=False,
+        )
+
+    device_index = 0
+    torch.npu.set_device(device_index)
+    device = torch.device(f"npu:{device_index}")
+    dtype = torch.bfloat16
+    batch_size = 2
+    request_pool_size = 4
+    num_heads = 16
+    capacity = 2048
+    max_context_len = 4096
+    head_dim = 512 + 64
+    slot_map_width = (max_context_len // 8 + 1) * 8
+    scale = 1.0 / math.sqrt(128 + 64)
+    runtime = _runtime_description(device_index)
+
+    print(runtime)
+    print(
+        "dual-stream stateful prefetch graph: "
+        f"dtype={dtype} batch={batch_size} heads={num_heads} "
+        f"capacity={capacity} context={max_context_len} scale={scale:.8f}"
+    )
+
+    capture_case = _make_prefetch_compact_case(
+        hit_counts=(1024, 1536),
+        req_pool_indices=(2, 1),
+        capacity=capacity,
+        max_context_len=max_context_len,
+        request_pool_size=request_pool_size,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026081701,
+    )
+    query_variant = _make_case(
+        valid_lengths=(capacity, capacity),
+        capacity=capacity,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026081702,
+    )
+    replay_union_inputs = SFAInputs(
+        query=query_variant.query,
+        key=capture_case.union.key,
+        query_rope=query_variant.query_rope,
+        key_rope=capture_case.union.key_rope,
+        sparse_indices=capture_case.union.sparse_indices,
+        actual_query_lengths=capture_case.union.actual_query_lengths,
+        actual_kv_lengths=capture_case.union.actual_kv_lengths,
+    )
+    capture_union = _clone_state(_run_sfa(capture_case.union, scale))
+    replay_union = _clone_state(_run_sfa(replay_union_inputs, scale))
+    torch.npu.synchronize()
+
+    shm_name = (
+        f"sglang_prefetch_dual_graph_{os.getpid()}_{device_index}_{uuid.uuid4().hex}"
+    )
+    host_kv = None
+    host_kv_host_ptr = None
+    host_kv_dev_ptr = None
+    graph = None
+    shm_created = False
+    lookup_refs: list[torch.Tensor] = []
+    miss_stream = None
+    inputs_ready = None
+    hit_copy_done = None
+    miss_attention_done = None
+    refill_done = None
+
+    try:
+        (host_kv, host_kv_host_ptr, host_kv_dev_ptr,) = sparse_kv_ops.create_shm_tensor(
+            (request_pool_size, max_context_len, 1, head_dim),
+            dtype,
+            device_index,
+            shm_name,
+        )
+        shm_created = True
+        assert host_kv.data_ptr() == host_kv_host_ptr
+
+        static_inputs = StaticPrefetchInputs(
+            query=torch.empty_like(capture_case.union.query),
+            query_rope=torch.empty_like(capture_case.union.query_rope),
+            actual_query_lengths=torch.empty_like(
+                capture_case.union.actual_query_lengths
+            ),
+            req_pool_indices=torch.empty(batch_size, dtype=torch.int64, device=device),
+            seq_lens=torch.empty(batch_size, dtype=torch.int32, device=device),
+            topk_indices=torch.empty(
+                (batch_size, capacity), dtype=torch.int32, device=device
+            ),
+            slot_map=torch.empty(
+                (request_pool_size + 1, slot_map_width),
+                dtype=torch.int32,
+                device=device,
+            ),
+            device_kv=torch.empty(
+                (request_pool_size, capacity, 1, head_dim), dtype=dtype, device=device,
+            ),
+        )
+        stats_shape = _expected_stats_shape(capture_case.union)
+        buffers = PrefetchGraphBuffers(
+            hit_kv=torch.empty(
+                (batch_size, capacity, 1, head_dim), dtype=dtype, device=device
+            ),
+            miss_kv=torch.empty(
+                (batch_size, capacity, 1, head_dim), dtype=dtype, device=device
+            ),
+            token_on_device=torch.empty(
+                (batch_size, capacity), dtype=torch.int32, device=device
+            ),
+            device_token_pos=torch.empty(
+                (batch_size, capacity), dtype=torch.int32, device=device
+            ),
+            hit_counts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            miss_counts=torch.empty(batch_size, dtype=torch.int32, device=device),
+            output=torch.empty_like(capture_case.union.query),
+            softmax_max=torch.empty(stats_shape, dtype=torch.float32, device=device),
+            softmax_sum=torch.empty(stats_shape, dtype=torch.float32, device=device),
+        )
+
+        def poison_outputs() -> None:
+            buffers.hit_kv.fill_(float("nan"))
+            buffers.miss_kv.fill_(float("nan"))
+            buffers.token_on_device.fill_(-777)
+            buffers.device_token_pos.fill_(-777)
+            buffers.hit_counts.fill_(-777)
+            buffers.miss_counts.fill_(-777)
+            buffers.output.fill_(float("nan"))
+            buffers.softmax_max.fill_(float("nan"))
+            buffers.softmax_sum.fill_(float("nan"))
+
+        def reset_initial_state() -> None:
+            torch.npu.synchronize()
+            _copy_prefetch_case(static_inputs, host_kv, capture_case)
+            poison_outputs()
+            torch.npu.synchronize()
+
+        def load_replay_query_only() -> None:
+            # Preserve device_kv and slot_map: those are the state produced by
+            # capture whose visibility to replay this test is designed to prove.
+            torch.npu.synchronize()
+            static_inputs.query.copy_(query_variant.query)
+            static_inputs.query_rope.copy_(query_variant.query_rope)
+            poison_outputs()
+            torch.npu.synchronize()
+
+        capture_stream = torch.npu.Stream()
+        miss_stream = torch.npu.Stream()
+        inputs_ready = torch.npu.Event()
+        hit_copy_done = torch.npu.Event()
+        miss_attention_done = torch.npu.Event()
+        refill_done = torch.npu.Event()
+        graph_pool = torch.npu.graph_pool_handle()
+
+        def run_once() -> None:
+            (
+                token_on_device,
+                device_token_pos,
+            ) = _run_prefetch_compact_split_dual_stream_refill(
+                static_inputs,
+                buffers,
+                host_kv,
+                host_kv_dev_ptr,
+                miss_stream,
+                inputs_ready,
+                hit_copy_done,
+                miss_attention_done,
+                refill_done,
+                request_pool_size=request_pool_size,
+                max_context_len=max_context_len,
+                capacity=capacity,
+                scale=scale,
+            )
+            lookup_refs[:] = [token_on_device, device_token_pos]
+
+        reset_initial_state()
+        capture_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(capture_stream):
+            # First warmup starts mixed; the second observes the first refill.
+            run_once()
+            run_once()
+        torch.npu.synchronize()
+        _assert_refill_and_slot_map_published(
+            static_inputs,
+            capture_case,
+            capacity=capacity,
+            stage="dual-stream graph warmup",
+        )
+
+        reset_initial_state()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(
+            graph, pool=graph_pool, stream=capture_stream, auto_dispatch_capture=True,
+        ):
+            run_once()
+        torch.npu.synchronize()
+
+        input_pointers = tuple(tensor.data_ptr() for tensor in static_inputs.tensors())
+        buffer_pointers = tuple(tensor.data_ptr() for tensor in buffers.tensors())
+        lookup_pointers = tuple(tensor.data_ptr() for tensor in lookup_refs)
+        fixed_host_ptrs = (host_kv.data_ptr(), host_kv_host_ptr, host_kv_dev_ptr)
+
+        capture_snapshot = _snapshot_prefetch_buffers(buffers)
+        _assert_prefetch_compaction(
+            capture_snapshot, capture_case, stage="dual-stream graph capture"
+        )
+        _assert_matches(
+            capture_snapshot.state,
+            capture_union,
+            output_atol=2e-2,
+            output_rtol=2e-2,
+            stage="dual-stream graph capture vs union SFA",
+        )
+        _assert_refill_and_slot_map_published(
+            static_inputs,
+            capture_case,
+            capacity=capacity,
+            stage="dual-stream graph capture",
+        )
+
+        # Replay 1 starts from the original mixed state and must publish the
+        # refill again. Replay 2 deliberately preserves that state and must see
+        # a larger hit count (all selected tokens are now resident).
+        reset_initial_state()
+        graph.replay()
+        torch.npu.synchronize()
+
+        replay_one = _snapshot_prefetch_buffers(buffers)
+        _assert_prefetch_compaction(
+            replay_one, capture_case, stage="dual-stream graph replay 1"
+        )
+        _assert_matches(
+            replay_one.state,
+            capture_union,
+            output_atol=2e-2,
+            output_rtol=2e-2,
+            stage="dual-stream graph replay 1 vs union SFA",
+        )
+        _assert_refill_and_slot_map_published(
+            static_inputs,
+            capture_case,
+            capacity=capacity,
+            stage="dual-stream graph replay 1",
+        )
+
+        load_replay_query_only()
+        graph.replay()
+        torch.npu.synchronize()
+
+        assert tuple(tensor.data_ptr() for tensor in static_inputs.tensors()) == (
+            input_pointers
+        ), "dual-stream replay changed a static input address"
+        assert tuple(tensor.data_ptr() for tensor in buffers.tensors()) == (
+            buffer_pointers
+        ), "dual-stream replay changed an output/scratch address"
+        assert tuple(tensor.data_ptr() for tensor in lookup_refs) == lookup_pointers
+        assert (
+            host_kv.data_ptr(),
+            host_kv_host_ptr,
+            host_kv_dev_ptr,
+        ) == fixed_host_ptrs
+
+        replay_snapshot = _snapshot_prefetch_buffers(buffers)
+        torch.testing.assert_close(
+            replay_snapshot.token_on_device.cpu(),
+            torch.ones((batch_size, capacity), dtype=torch.int32),
+            atol=0,
+            rtol=0,
+            msg="replay 2 did not observe the slot map published by replay 1",
+        )
+        expected_positions = torch.arange(capacity, dtype=torch.int32).expand(
+            batch_size, capacity
+        )
+        torch.testing.assert_close(
+            replay_snapshot.device_token_pos.cpu(),
+            expected_positions,
+            atol=0,
+            rtol=0,
+            msg="replay did not resolve refilled tokens to deterministic slots",
+        )
+        torch.testing.assert_close(
+            replay_snapshot.hit_counts.cpu(),
+            torch.full((batch_size,), capacity, dtype=torch.int32),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            replay_snapshot.miss_counts.cpu(),
+            torch.zeros(batch_size, dtype=torch.int32),
+            atol=0,
+            rtol=0,
+        )
+        assert torch.all(replay_snapshot.hit_counts > replay_one.hit_counts).item(), (
+            "replay 2 hit_counts did not increase after replay 1 refill: "
+            f"before={replay_one.hit_counts.cpu().tolist()}, "
+            f"after={replay_snapshot.hit_counts.cpu().tolist()}"
+        )
+        expected_kv = torch.cat(
+            (capture_case.union.key, capture_case.union.key_rope), dim=-1
+        )
+        torch.testing.assert_close(
+            replay_snapshot.hit_kv.cpu(), expected_kv.cpu(), atol=0, rtol=0
+        )
+        assert torch.count_nonzero(replay_snapshot.miss_kv[:, 0]).item() == 0
+        _assert_matches(
+            replay_snapshot.state,
+            replay_union,
+            output_atol=2e-2,
+            output_rtol=2e-2,
+            stage="dual-stream stateful replay vs union SFA",
+        )
+        _assert_refill_and_slot_map_published(
+            static_inputs,
+            capture_case,
+            capacity=capacity,
+            stage="dual-stream stateful replay",
+        )
+        assert (
+            _max_abs_error(replay_one.state.output, replay_snapshot.state.output) > 1e-2
+        ), "changed replay-2 query did not refresh the graph output"
+
+        print(
+            "PASSED: dual-stream D2D/H2D + two SFA + merge + refill + slot-map "
+            "publication survive stateful NPUGraph replay"
+        )
+    finally:
+        if shm_created:
+            active_error = sys.exc_info()[1]
+            try:
+                torch.npu.synchronize()
+            except Exception as cleanup_error:
+                if active_error is None:
+                    raise
+                print(
+                    "WARNING: leaving dual-stream sparse-KV SHM registered "
+                    "because final NPU synchronization failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                    file=sys.stderr,
+                )
+            else:
+                lookup_refs.clear()
+                graph_released = True
+                if graph is not None and hasattr(graph, "reset"):
+                    try:
+                        graph.reset()
+                    except Exception as cleanup_error:
+                        graph_released = False
+                        if active_error is None:
+                            raise
+                        print(
+                            "WARNING: leaving dual-stream sparse-KV SHM "
+                            "registered because NPUGraph reset failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}",
+                            file=sys.stderr,
+                        )
+                if graph_released:
+                    graph = None
+                    miss_stream = None
+                    inputs_ready = None
+                    hit_copy_done = None
+                    miss_attention_done = None
+                    refill_done = None
+                    gc.collect()
+                    try:
+                        sparse_kv_ops.free_shm(device_index)
+                    except Exception as cleanup_error:
+                        if active_error is None:
+                            raise
+                        print(
+                            "WARNING: dual-stream sparse-KV SHM cleanup failed "
+                            "while propagating the test error: "
                             f"{type(cleanup_error).__name__}: {cleanup_error}",
                             file=sys.stderr,
                         )

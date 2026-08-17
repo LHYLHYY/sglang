@@ -7,7 +7,7 @@ import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -45,6 +45,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_ENV_VAR,
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
     get_sparse_kv_attn_impl,
 )
 
@@ -59,6 +60,7 @@ class TestSparseKVAttentionImplementation(unittest.TestCase):
         cases = (
             ("  SPLIT_EAGER  ", SPARSE_KV_ATTN_IMPL_SPLIT_EAGER),
             ("  SPLIT_GRAPH  ", SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH),
+            ("  SPLIT_GRAPH_DUAL  ", SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL),
         )
         for value, expected in cases:
             with self.subTest(value=value), patch.dict(
@@ -79,12 +81,115 @@ class TestSparseKVAttentionImplementation(unittest.TestCase):
             (SPARSE_KV_ATTN_IMPL_SPLIT_EAGER, True, None),
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH, False, "parallel"),
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH, True, "single_stream"),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL, False, "parallel"),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL, True, "dual_stream"),
         )
         for attn_impl, graph_mode, expected in cases:
             with self.subTest(attn_impl=attn_impl, graph_mode=graph_mode):
                 self.assertEqual(
                     _select_split_decode_mode(attn_impl, graph_mode), expected
                 )
+
+
+class TestSparseKVDualGraphIntegration(unittest.TestCase):
+    def test_pdmux_rejected_before_sparse_manager_construction(self):
+        backend_module = sys.modules[AscendAttnBackend.__module__]
+        manager_constructor = MagicMock(name="SparseKVCacheManager")
+        manager_module_name = (
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager"
+        )
+        fake_manager_module = SimpleNamespace(
+            SparseKVCacheManager=manager_constructor,
+            register_sparse_kv_manager=MagicMock(),
+        )
+        model_config = SimpleNamespace(
+            dtype=torch.bfloat16,
+            attention_arch=object(),
+            use_alibi=False,
+            hf_config=SimpleNamespace(architectures=[]),
+            context_len=4096,
+        )
+        model_runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            page_size=1,
+            model_config=model_config,
+            req_to_token_pool=SimpleNamespace(req_to_token=MagicMock()),
+            token_to_kv_pool=MagicMock(),
+            server_args=SimpleNamespace(enable_pdmux=True),
+            use_mla_backend=True,
+        )
+
+        with (
+            patch.dict(sys.modules, {manager_module_name: fake_manager_module}),
+            patch.object(backend_module.torch, "tensor", return_value=MagicMock()),
+            patch.object(
+                backend_module, "AscendTorchNativeAttnBackend", return_value=MagicMock()
+            ),
+            patch.object(
+                backend_module,
+                "is_sparsity_driven_kv_offload_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                backend_module,
+                "get_sparse_kv_attn_impl",
+                return_value=SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "does not support PDMux"):
+                AscendAttnBackend(model_runner)
+
+        manager_constructor.assert_not_called()
+
+    def test_dual_graph_metadata_registers_main_and_miss_streams(self):
+        backend_module = sys.modules[AscendAttnBackend.__module__]
+        register_stream = MagicMock(name="register_npu_host_callback_stream")
+        host_callback_module_name = (
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
+            "host_callback"
+        )
+        fake_host_callback_module = SimpleNamespace(
+            register_npu_host_callback_stream=register_stream
+        )
+        main_stream = object()
+        miss_stream = object()
+        device = torch.device("cpu")
+
+        backend = object.__new__(AscendAttnBackend)
+        backend.enable_sparsity_driven_kv_offload = True
+        backend.device = device
+        backend.sparse_kv_manager = SimpleNamespace(
+            attn_impl=SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+            _graph_dual_state=SimpleNamespace(miss_stream=miss_stream),
+        )
+        backend.graph_metadata = {"block_tables": torch.empty((2, 4))}
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.speculative_num_draft_tokens = None
+        backend.q_head_num_padding = None
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = False
+        forward_mode.is_draft_extend_v2.return_value = False
+        forward_mode.is_dllm_extend.return_value = False
+        fake_npu = SimpleNamespace(current_stream=MagicMock(return_value=main_stream))
+
+        with (
+            patch.dict(
+                sys.modules,
+                {host_callback_module_name: fake_host_callback_module},
+            ),
+            patch.object(backend_module.torch, "npu", fake_npu, create=True),
+        ):
+            backend._init_cuda_graph_metadata(
+                bs=2,
+                forward_mode=forward_mode,
+                seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+            )
+
+        self.assertEqual(
+            register_stream.call_args_list,
+            [call(main_stream, device), call(miss_stream, device)],
+        )
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):

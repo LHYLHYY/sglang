@@ -20,6 +20,8 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    get_sparse_kv_attn_impl,
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -336,12 +338,22 @@ class AscendAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
+        self.enable_pdmux = bool(model_runner.server_args.enable_pdmux)
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
             model_config=model_runner.model_config,
             server_args=model_runner.server_args,
             use_mla_backend=model_runner.use_mla_backend,
         )
+        if (
+            self.enable_sparsity_driven_kv_offload
+            and self.enable_pdmux
+            and get_sparse_kv_attn_impl() == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL
+        ):
+            raise RuntimeError(
+                "Sparse KV split_graph_dual does not support PDMux: its fixed "
+                "workspace and Events require serialized graph replay."
+            )
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
@@ -574,6 +586,17 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if (
+            self.enable_sparsity_driven_kv_offload
+            and self.sparse_kv_manager is not None
+            and self.sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL
+        ):
+            if self.enable_pdmux:
+                raise RuntimeError(
+                    "Sparse KV split_graph_dual does not support PDMux: its "
+                    "fixed workspace and Events require serialized graph replay."
+                )
+            self.sparse_kv_manager.prepare_graph_dual_state(max_bs)
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -638,6 +661,16 @@ class AscendAttnBackend(AttentionBackend):
             register_npu_host_callback_stream(
                 torch.npu.current_stream(self.device), self.device
             )
+            if (
+                self.sparse_kv_manager is not None
+                and self.sparse_kv_manager.attn_impl
+                == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL
+                and self.sparse_kv_manager._graph_dual_state is not None
+            ):
+                register_npu_host_callback_stream(
+                    self.sparse_kv_manager._graph_dual_state.miss_stream,
+                    self.device,
+                )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]

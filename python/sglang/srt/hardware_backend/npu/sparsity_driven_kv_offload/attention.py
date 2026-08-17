@@ -12,6 +12,7 @@ import torch_npu
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
@@ -22,6 +23,8 @@ if TYPE_CHECKING:
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
         SparseKVPartition,
         SparseKVPrefetchTicket,
+        SparseKVGraphDualPrefetch,
+        SparseKVCacheManager,
         SparseKVSingleStreamPrefetch,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -32,16 +35,20 @@ logger = logging.getLogger(__name__)
 
 _SPLIT_MODE_PARALLEL = "parallel"
 _SPLIT_MODE_SINGLE_STREAM = "single_stream"
+_SPLIT_MODE_DUAL_STREAM = "dual_stream"
 
 
 def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> Optional[str]:
     if graph_mode:
         if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH:
             return _SPLIT_MODE_SINGLE_STREAM
+        if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL:
+            return _SPLIT_MODE_DUAL_STREAM
         return None
     if attn_impl in (
         SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
         SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
+        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
     ):
         return _SPLIT_MODE_PARALLEL
     return None
@@ -306,6 +313,63 @@ def _run_split_decode_attention_single_stream(
         return _merge_decode_sfa_partitions(hit_state, miss_state)
 
 
+def _run_split_decode_attention_graph_dual(
+    ticket: SparseKVGraphDualPrefetch,
+    manager: SparseKVCacheManager,
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    scale_value: float,
+    stream,
+) -> torch.Tensor:
+    """Run hit attention on the graph stream and miss attention/refill in parallel."""
+
+    with torch.profiler.record_function("sparse_kv_split_graph_dual.hit_attention"):
+        with torch.npu.stream(stream):
+            hit_state = _run_decode_sfa_partition(
+                ticket.hit,
+                query=query,
+                query_rope=query_rope,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                scale_value=scale_value,
+                record_stream=False,
+            )
+
+    with torch.profiler.record_function("sparse_kv_split_graph_dual.miss_attention"):
+        with torch.npu.stream(ticket.miss.stream):
+            miss_state = _run_decode_sfa_partition(
+                ticket.miss,
+                query=query,
+                query_rope=query_rope,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                scale_value=scale_value,
+                record_stream=False,
+            )
+            _record_stream_event(ticket.miss.stream, ticket.events.miss_attention_done)
+            # Refill runs after miss attention on the same worker stream.  The
+            # main stream may merge concurrently, but joins refill before the
+            # shared graph workspace can be reused by the next layer.
+            manager.commit_graph_dual_refill(ticket)
+
+    with torch.npu.stream(stream):
+        _wait_stream_event(stream, ticket.events.miss_attention_done)
+        for tensor in (
+            miss_state.output,
+            miss_state.softmax_max,
+            miss_state.softmax_sum,
+            miss_state.nonempty,
+        ):
+            tensor.record_stream(stream)
+        with torch.profiler.record_function("sparse_kv_split_graph_dual.merge"):
+            merged = _merge_decode_sfa_partitions(hit_state, miss_state)
+        _wait_stream_event(stream, ticket.events.refill_done)
+        return merged
+
+
 def forward_sparsity_driven_kv_offload(
     backend: AscendAttnBackend,
     q: torch.Tensor,
@@ -428,6 +492,16 @@ def forward_sparsity_driven_kv_offload(
                 "the authoritative host cache, but graph-mode hit rate may be low."
             )
             sparse_kv_manager._split_graph_phase_one_logged = True
+        if (
+            split_mode == _SPLIT_MODE_DUAL_STREAM
+            and not sparse_kv_manager._split_graph_dual_logged
+        ):
+            logger.warning(
+                "Sparse KV split_graph_dual is experimental: hit attention runs "
+                "on the graph stream while host misses, miss attention, and "
+                "hot-cache refill run on a persistent worker stream."
+            )
+            sparse_kv_manager._split_graph_dual_logged = True
 
         if split_mode is not None:
             q_nope_sfa = q_nope.view(
@@ -451,6 +525,24 @@ def forward_sparsity_driven_kv_offload(
                     nope_head_dim=nope_head_dim,
                     rope_head_dim=rope_head_dim,
                     scale_value=layer.scaling,
+                )
+            elif split_mode == _SPLIT_MODE_DUAL_STREAM:
+                ticket = sparse_kv_manager.prefetch_partitions_graph_dual(
+                    layer,
+                    forward_batch,
+                    topk_indices,
+                    stream,
+                    dtype=k.dtype,
+                )
+                decode_output = _run_split_decode_attention_graph_dual(
+                    ticket,
+                    sparse_kv_manager,
+                    query=q_nope_sfa,
+                    query_rope=q_rope_sfa,
+                    nope_head_dim=nope_head_dim,
+                    rope_head_dim=rope_head_dim,
+                    scale_value=layer.scaling,
+                    stream=stream,
                 )
             else:
                 ticket = sparse_kv_manager.prefetch_partitions(

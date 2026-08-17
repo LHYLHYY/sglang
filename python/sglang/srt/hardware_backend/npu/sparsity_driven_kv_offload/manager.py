@@ -91,6 +91,39 @@ class SparseKVSingleStreamPrefetch:
     miss: SparseKVPartition
 
 
+@dataclass
+class SparseKVGraphDualLayerEvents:
+    inputs_ready: torch.npu.Event
+    hit_copy_done: torch.npu.Event
+    miss_attention_done: torch.npu.Event
+    refill_done: torch.npu.Event
+
+
+@dataclass
+class SparseKVGraphDualState:
+    max_batch_size: int
+    hit_kv: torch.Tensor
+    miss_kv: torch.Tensor
+    miss_stream: torch.npu.Stream
+    layer_events: list[SparseKVGraphDualLayerEvents]
+
+
+@dataclass
+class SparseKVGraphDualPrefetch:
+    hit: SparseKVPartition
+    miss: SparseKVPartition
+    layer_idx: int
+    hit_compact_indices: torch.Tensor
+    miss_compact_indices: torch.Tensor
+    refill_dst_indices: torch.Tensor
+    hit_valid_flat: torch.Tensor
+    miss_valid_flat: torch.Tensor
+    slot_map_row_indices: torch.Tensor
+    slot_map_flat_indices: torch.Tensor
+    slot_map_slot_values: torch.Tensor
+    events: SparseKVGraphDualLayerEvents
+
+
 class SparseKVCacheManager:
     copy_stream = None
     miss_shm_cpu_tensor: list = []
@@ -138,6 +171,8 @@ class SparseKVCacheManager:
         self.attn_impl = get_sparse_kv_attn_impl()
         self._split_graph_fallback_logged = False
         self._split_graph_phase_one_logged = False
+        self._split_graph_dual_logged = False
+        self._graph_dual_state: Optional[SparseKVGraphDualState] = None
         self._prefetch_d2d_hit_stream = torch.npu.Stream()
         self._prefetch_h2d_miss_stream = torch.npu.Stream()
         self._prefetch_refill_stream = torch.npu.Stream()
@@ -255,6 +290,75 @@ class SparseKVCacheManager:
             "The sparse KV request capacity may be too large; set a smaller "
             "--max-running-requests for sparse KV offload."
         ) from exc
+
+    def prepare_graph_dual_state(self, max_batch_size: int) -> None:
+        """Allocate fixed-address workspace and synchronization for graph dual-stream.
+
+        A single hit/miss workspace pair is reused across layers.  The graph path
+        joins ``refill_done`` before returning from each layer, so the next layer
+        cannot overwrite a partition while the miss stream is still consuming it.
+        Graph replays are expected to be serialized by the scheduler.
+        """
+
+        max_batch_size = int(max_batch_size)
+        if max_batch_size <= 0:
+            raise ValueError(
+                "Sparse KV graph-dual workspace requires max_batch_size > 0, "
+                f"got {max_batch_size}."
+            )
+
+        state = self._graph_dual_state
+        if state is not None:
+            if max_batch_size > state.max_batch_size:
+                raise RuntimeError(
+                    "Sparse KV graph-dual workspace cannot grow after it has been "
+                    f"initialized: requested={max_batch_size}, "
+                    f"allocated={state.max_batch_size}."
+                )
+            return
+
+        partition_shape = (
+            max_batch_size,
+            self.sparse_context_len,
+            self.head_num,
+            self.head_dim,
+        )
+        try:
+            hit_kv = torch.empty(
+                partition_shape, dtype=self.store_dtype, device=self.device
+            )
+            miss_kv = torch.empty_like(hit_kv)
+            miss_stream = torch.npu.Stream()
+            layer_events = [
+                SparseKVGraphDualLayerEvents(
+                    inputs_ready=torch.npu.Event(),
+                    hit_copy_done=torch.npu.Event(),
+                    miss_attention_done=torch.npu.Event(),
+                    refill_done=torch.npu.Event(),
+                )
+                for _ in range(self.layer_num)
+            ]
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to allocate sparse KV graph-dual workspace: "
+                f"max_batch_size={max_batch_size}, shape={partition_shape}."
+            ) from exc
+
+        self._graph_dual_state = SparseKVGraphDualState(
+            max_batch_size=max_batch_size,
+            hit_kv=hit_kv,
+            miss_kv=miss_kv,
+            miss_stream=miss_stream,
+            layer_events=layer_events,
+        )
+        workspace_gib = (
+            (hit_kv.numel() + miss_kv.numel()) * hit_kv.element_size() / GB
+        )
+        logger.info(
+            "Prepared sparse KV graph-dual workspace with shape %s (%.3f GiB).",
+            partition_shape,
+            workspace_gib,
+        )
 
     def init_req(self, req: Req) -> None:
         if req.is_chunked > 0:
@@ -922,6 +1026,302 @@ class SparseKVCacheManager:
                 stream=stream,
             ),
         )
+
+    def prefetch_partitions_graph_dual(
+        self,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        topk_indices: torch.Tensor,
+        stream: torch.npu.Stream,
+        dtype: torch.dtype,
+    ) -> SparseKVGraphDualPrefetch:
+        """Fork graph-safe hit and miss partitions onto two persistent streams.
+
+        The caller/main graph stream owns lookup, metadata, the device-cache hit
+        copy, and hit attention.  ``miss_stream`` waits for ``inputs_ready`` and
+        performs the registered-host miss copy followed by miss attention.  A
+        fixed workspace is shared across layers and therefore must be committed
+        before this layer returns.
+        """
+
+        state = self._graph_dual_state
+        if state is None:
+            raise RuntimeError(
+                "Sparse KV graph-dual state is not initialized. Call "
+                "prepare_graph_dual_state() before graph capture."
+            )
+
+        layer_idx = layer.layer_id - self.start_layer
+        if layer_idx < 0 or layer_idx >= self.layer_num:
+            raise RuntimeError(
+                f"Invalid sparse KV layer id {layer.layer_id}; start_layer="
+                f"{self.start_layer}, layer_num={self.layer_num}."
+            )
+        if dtype != self.store_dtype:
+            raise RuntimeError(
+                "Sparse KV graph-dual prefetch requires the query KV dtype to "
+                f"match the cache dtype, got dtype={dtype}, "
+                f"cache_dtype={self.store_dtype}."
+            )
+
+        stream = stream if stream is not None else torch.npu.current_stream()
+        events = state.layer_events[layer_idx]
+        profile_range = _profile_push("sparse_kv_prefetch_partitions_graph_dual")
+
+        with torch.npu.stream(stream):
+            req_pool_indices = forward_batch.req_pool_indices.to(
+                torch.long
+            ).contiguous()
+            if req_pool_indices.dim() != 1:
+                raise RuntimeError(
+                    "Sparse KV graph-dual prefetch expects 1-D request indices, "
+                    f"got shape={tuple(req_pool_indices.shape)}."
+                )
+
+            valid_req_mask = (req_pool_indices > 0) & (req_pool_indices < self.size)
+            if forward_batch.seq_lens is not None:
+                active_req_mask = valid_req_mask & (
+                    forward_batch.seq_lens[: req_pool_indices.shape[0]] > 0
+                )
+            else:
+                active_req_mask = valid_req_mask
+
+            slot_map_row_indices = torch.where(
+                active_req_mask,
+                req_pool_indices,
+                torch.full_like(req_pool_indices, self.size),
+            ).contiguous()
+            device_cache_row_indices = torch.where(
+                active_req_mask, req_pool_indices, torch.zeros_like(req_pool_indices),
+            ).contiguous()
+
+            topk_indices = _normalize_topk_indices_2d(topk_indices)
+            batch_size, topk_len = topk_indices.shape
+            if batch_size != req_pool_indices.shape[0]:
+                raise RuntimeError(
+                    "Sparse KV graph-dual batch mismatch: "
+                    f"topk batch={batch_size}, request batch="
+                    f"{req_pool_indices.shape[0]}."
+                )
+            if batch_size > state.max_batch_size:
+                raise RuntimeError(
+                    "Sparse KV graph-dual batch exceeds its fixed workspace: "
+                    f"batch={batch_size}, max_batch={state.max_batch_size}."
+                )
+            if topk_len != self.sparse_context_len:
+                raise RuntimeError(
+                    "Sparse KV graph-dual prefetch requires the fixed slot-lookup "
+                    f"top-k length {self.sparse_context_len}, got {topk_len}."
+                )
+
+            valid_topk_mask = (
+                (topk_indices >= 0)
+                & (topk_indices < self.max_context_len)
+                & active_req_mask.unsqueeze(1)
+            )
+
+            lookup_range = _profile_push(
+                "sparse_kv_prefetch_partitions_graph_dual.slot_lookup"
+            )
+            token_on_device, device_token_pos = slot_map_lookup(
+                self.device_slot_map[layer_idx],
+                slot_map_row_indices.to(dtype=torch.int32).contiguous(),
+                topk_indices.to(dtype=torch.int32).contiguous(),
+            )
+            hit_valid = token_on_device.to(torch.bool) & valid_topk_mask
+            miss_valid = (~hit_valid) & valid_topk_mask
+            _profile_pop(lookup_range)
+
+            hit_counts = hit_valid.sum(dim=1).to(torch.int32).contiguous()
+            miss_counts = miss_valid.sum(dim=1).to(torch.int32).contiguous()
+            hit_ranks = (
+                torch.cumsum(hit_valid.to(torch.int32), dim=1).to(torch.int64) - 1
+            )
+            miss_ranks = (
+                torch.cumsum(miss_valid.to(torch.int32), dim=1).to(torch.int64) - 1
+            )
+
+            batch_offsets = (
+                torch.arange(batch_size, dtype=torch.int64, device=topk_indices.device)
+                .unsqueeze(1)
+                .mul(topk_len)
+            )
+            hit_compact_indices = (
+                (batch_offsets + hit_ranks.clamp(min=0, max=topk_len - 1))
+                .reshape(-1)
+                .contiguous()
+            )
+            miss_compact_indices = (
+                (batch_offsets + miss_ranks.clamp(min=0, max=topk_len - 1))
+                .reshape(-1)
+                .contiguous()
+            )
+
+            request_device_offsets = (
+                device_cache_row_indices.unsqueeze(1) * self.sparse_context_len
+            )
+            hit_src_indices = (
+                (
+                    request_device_offsets
+                    + device_token_pos.to(torch.int64).clamp(
+                        min=0, max=self.sparse_context_len - 1
+                    )
+                )
+                .reshape(-1)
+                .contiguous()
+            )
+            request_host_offsets = (
+                device_cache_row_indices.unsqueeze(1) * self.max_context_len
+            )
+            miss_src_indices = (
+                (
+                    request_host_offsets
+                    + topk_indices.to(torch.int64).clamp(
+                        min=0, max=self.max_context_len - 1
+                    )
+                )
+                .reshape(-1)
+                .contiguous()
+            )
+
+            hit_valid_flat = hit_valid.reshape(-1).contiguous()
+            miss_valid_flat = miss_valid.reshape(-1).contiguous()
+            hit_kv = state.hit_kv[:batch_size]
+            miss_kv = state.miss_kv[:batch_size]
+            hit_kv[:, :1].zero_()
+            miss_kv[:, :1].zero_()
+            hit_sparse_indices, hit_actual_lengths = _build_partition_sparse_indices(
+                hit_counts, topk_len
+            )
+            miss_sparse_indices, miss_actual_lengths = _build_partition_sparse_indices(
+                miss_counts, topk_len
+            )
+
+            cache_slot_ids = self._device_cache_slot_ids[:topk_len].view(1, -1)
+            refill_dst_indices = (
+                (request_device_offsets + cache_slot_ids).reshape(-1).contiguous()
+            )
+            slot_map_token_indices = torch.where(
+                valid_topk_mask,
+                topk_indices.to(torch.long),
+                torch.full_like(topk_indices, self.max_context_len).to(torch.long),
+            )
+            slot_map_flat_indices = (
+                (
+                    slot_map_row_indices.unsqueeze(1) * self._slot_map_width
+                    + slot_map_token_indices
+                )
+                .reshape(-1)
+                .contiguous()
+            )
+            slot_map_slot_values = torch.where(
+                valid_topk_mask,
+                cache_slot_ids.to(torch.int32).expand(batch_size, -1),
+                torch.full_like(topk_indices, -1, dtype=torch.int32),
+            ).contiguous()
+
+            _record_stream_event(stream, events.inputs_ready)
+
+        miss_copy_range = _profile_push(
+            "sparse_kv_prefetch_partitions_graph_dual.h2d_miss_copy"
+        )
+        with torch.npu.stream(state.miss_stream):
+            _wait_stream_event(state.miss_stream, events.inputs_ready)
+            unidex_copy_inplace(
+                self.host_kv_buffer[layer_idx],
+                miss_kv,
+                miss_src_indices,
+                miss_compact_indices,
+                miss_valid_flat,
+                2,
+                2,
+                block_dim=24,
+                src_ptr=self.dev_ptr_list[layer_idx],
+            )
+        _profile_pop(miss_copy_range)
+
+        hit_copy_range = _profile_push(
+            "sparse_kv_prefetch_partitions_graph_dual.d2d_hit_copy"
+        )
+        with torch.npu.stream(stream):
+            unidex_copy_inplace(
+                self.device_kv_buffer[layer_idx],
+                hit_kv,
+                hit_src_indices,
+                hit_compact_indices,
+                hit_valid_flat,
+                2,
+                2,
+                block_dim=24,
+            )
+            _record_stream_event(stream, events.hit_copy_done)
+        _profile_pop(hit_copy_range)
+        _profile_pop(profile_range)
+
+        return SparseKVGraphDualPrefetch(
+            hit=SparseKVPartition(
+                kv=hit_kv,
+                sparse_indices=hit_sparse_indices,
+                actual_seq_lengths_kv=hit_actual_lengths,
+                true_counts=hit_counts,
+                stream=stream,
+            ),
+            miss=SparseKVPartition(
+                kv=miss_kv,
+                sparse_indices=miss_sparse_indices,
+                actual_seq_lengths_kv=miss_actual_lengths,
+                true_counts=miss_counts,
+                stream=state.miss_stream,
+            ),
+            layer_idx=layer_idx,
+            hit_compact_indices=hit_compact_indices,
+            miss_compact_indices=miss_compact_indices,
+            refill_dst_indices=refill_dst_indices,
+            hit_valid_flat=hit_valid_flat,
+            miss_valid_flat=miss_valid_flat,
+            slot_map_row_indices=slot_map_row_indices,
+            slot_map_flat_indices=slot_map_flat_indices,
+            slot_map_slot_values=slot_map_slot_values,
+            events=events,
+        )
+
+    def commit_graph_dual_refill(self, ticket: SparseKVGraphDualPrefetch) -> None:
+        """Refill the hot cache and publish its slot map on the miss stream."""
+
+        miss_stream = ticket.miss.stream
+        profile_range = _profile_push("sparse_kv_graph_dual.device_refill")
+        with torch.npu.stream(miss_stream):
+            _wait_stream_event(miss_stream, ticket.events.hit_copy_done)
+            unidex_copy_inplace(
+                ticket.hit.kv,
+                self.device_kv_buffer[ticket.layer_idx],
+                ticket.hit_compact_indices,
+                ticket.refill_dst_indices,
+                ticket.hit_valid_flat,
+                2,
+                2,
+                block_dim=24,
+            )
+            unidex_copy_inplace(
+                ticket.miss.kv,
+                self.device_kv_buffer[ticket.layer_idx],
+                ticket.miss_compact_indices,
+                ticket.refill_dst_indices,
+                ticket.miss_valid_flat,
+                2,
+                2,
+                block_dim=24,
+            )
+
+            slot_map = self.device_slot_map[ticket.layer_idx]
+            slot_map.index_fill_(0, ticket.slot_map_row_indices, -1)
+            slot_map.view(-1).scatter_(
+                0,
+                ticket.slot_map_flat_indices,
+                ticket.slot_map_slot_values.reshape(-1),
+            )
+            _record_stream_event(miss_stream, ticket.events.refill_done)
+        _profile_pop(profile_range)
 
     def prefetch_partitions(
         self,
