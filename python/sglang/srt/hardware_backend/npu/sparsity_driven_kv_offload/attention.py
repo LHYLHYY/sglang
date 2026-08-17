@@ -11,6 +11,7 @@ import torch_npu
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
@@ -21,12 +22,29 @@ if TYPE_CHECKING:
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
         SparseKVPartition,
         SparseKVPrefetchTicket,
+        SparseKVSingleStreamPrefetch,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 logger = logging.getLogger(__name__)
+
+_SPLIT_MODE_PARALLEL = "parallel"
+_SPLIT_MODE_SINGLE_STREAM = "single_stream"
+
+
+def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> Optional[str]:
+    if graph_mode:
+        if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH:
+            return _SPLIT_MODE_SINGLE_STREAM
+        return None
+    if attn_impl in (
+        SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
+    ):
+        return _SPLIT_MODE_PARALLEL
+    return None
 
 
 @dataclass
@@ -74,16 +92,18 @@ def _run_decode_sfa_partition(
     nope_head_dim: int,
     rope_head_dim: int,
     scale_value: float,
+    record_stream: bool = True,
 ) -> _SfaPartitionState:
-    for tensor in (
-        partition.kv,
-        partition.sparse_indices,
-        partition.actual_seq_lengths_kv,
-        partition.true_counts,
-        query,
-        query_rope,
-    ):
-        tensor.record_stream(partition.stream)
+    if record_stream:
+        for tensor in (
+            partition.kv,
+            partition.sparse_indices,
+            partition.actual_seq_lengths_kv,
+            partition.true_counts,
+            query,
+            query_rope,
+        ):
+            tensor.record_stream(partition.stream)
     key, key_rope = partition.kv.split([nope_head_dim, rope_head_dim], dim=-1)
     key = key.contiguous()
     key_rope = key_rope.contiguous()
@@ -251,6 +271,41 @@ def _run_split_decode_attention(
             return _merge_decode_sfa_partitions(hit_state, miss_state)
 
 
+def _run_split_decode_attention_single_stream(
+    partitions: SparseKVSingleStreamPrefetch,
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    scale_value: float,
+) -> torch.Tensor:
+    """Run both partition attentions and merge on the current graph stream."""
+
+    with torch.profiler.record_function("sparse_kv_split_graph.hit_attention"):
+        hit_state = _run_decode_sfa_partition(
+            partitions.hit,
+            query=query,
+            query_rope=query_rope,
+            nope_head_dim=nope_head_dim,
+            rope_head_dim=rope_head_dim,
+            scale_value=scale_value,
+            record_stream=False,
+        )
+    with torch.profiler.record_function("sparse_kv_split_graph.miss_attention"):
+        miss_state = _run_decode_sfa_partition(
+            partitions.miss,
+            query=query,
+            query_rope=query_rope,
+            nope_head_dim=nope_head_dim,
+            rope_head_dim=rope_head_dim,
+            scale_value=scale_value,
+            record_stream=False,
+        )
+    with torch.profiler.record_function("sparse_kv_split_graph.merge"):
+        return _merge_decode_sfa_partitions(hit_state, miss_state)
+
+
 def forward_sparsity_driven_kv_offload(
     backend: AscendAttnBackend,
     q: torch.Tensor,
@@ -350,9 +405,8 @@ def forward_sparsity_driven_kv_offload(
             f"num_query_heads={num_query_heads}"
         )
 
-        use_split_attention = (
-            sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_EAGER
-            and not backend.graph_mode
+        split_mode = _select_split_decode_mode(
+            sparse_kv_manager.attn_impl, backend.graph_mode
         )
         if (
             sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_EAGER
@@ -364,30 +418,57 @@ def forward_sparsity_driven_kv_offload(
                 "attention for NPU graph capture and replay."
             )
             sparse_kv_manager._split_graph_fallback_logged = True
+        if (
+            split_mode == _SPLIT_MODE_SINGLE_STREAM
+            and not sparse_kv_manager._split_graph_phase_one_logged
+        ):
+            logger.warning(
+                "Sparse KV split_graph phase 1 uses the graph-safe single-stream "
+                "read path without hot-cache refill; outputs remain correct from "
+                "the authoritative host cache, but graph-mode hit rate may be low."
+            )
+            sparse_kv_manager._split_graph_phase_one_logged = True
 
-        if use_split_attention:
+        if split_mode is not None:
             q_nope_sfa = q_nope.view(
                 batch_size, 1, padded_query_heads, nope_head_dim
             ).contiguous()
             q_rope_sfa = q_pe.view(
                 batch_size, 1, padded_query_heads, rope_head_dim
             ).contiguous()
-            ticket = sparse_kv_manager.prefetch_partitions(
-                layer,
-                forward_batch,
-                topk_indices,
-                stream,
-                dtype=k.dtype,
-            )
-            decode_output = _run_split_decode_attention(
-                ticket,
-                query=q_nope_sfa,
-                query_rope=q_rope_sfa,
-                nope_head_dim=nope_head_dim,
-                rope_head_dim=rope_head_dim,
-                scale_value=layer.scaling,
-                stream=stream,
-            )
+            if split_mode == _SPLIT_MODE_SINGLE_STREAM:
+                partitions = sparse_kv_manager.prefetch_partitions_single_stream(
+                    layer,
+                    forward_batch,
+                    topk_indices,
+                    stream,
+                    dtype=k.dtype,
+                )
+                decode_output = _run_split_decode_attention_single_stream(
+                    partitions,
+                    query=q_nope_sfa,
+                    query_rope=q_rope_sfa,
+                    nope_head_dim=nope_head_dim,
+                    rope_head_dim=rope_head_dim,
+                    scale_value=layer.scaling,
+                )
+            else:
+                ticket = sparse_kv_manager.prefetch_partitions(
+                    layer,
+                    forward_batch,
+                    topk_indices,
+                    stream,
+                    dtype=k.dtype,
+                )
+                decode_output = _run_split_decode_attention(
+                    ticket,
+                    query=q_nope_sfa,
+                    query_rope=q_rope_sfa,
+                    nope_head_dim=nope_head_dim,
+                    rope_head_dim=rope_head_dim,
+                    scale_value=layer.scaling,
+                    stream=stream,
+                )
             return decode_output[:, :, :num_query_heads, :].reshape(
                 batch_size, num_query_heads * nope_head_dim
             )

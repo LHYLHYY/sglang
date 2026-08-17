@@ -2,11 +2,12 @@
 Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 """
 
+import os
 import sys
 import unittest
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -36,6 +37,54 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+    _select_split_decode_mode,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_ATTN_IMPL_COMBINED,
+    SPARSE_KV_ATTN_IMPL_ENV_VAR,
+    SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
+    get_sparse_kv_attn_impl,
+)
+
+
+class TestSparseKVAttentionImplementation(unittest.TestCase):
+    def test_default_is_combined(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(SPARSE_KV_ATTN_IMPL_ENV_VAR, None)
+            self.assertEqual(get_sparse_kv_attn_impl(), SPARSE_KV_ATTN_IMPL_COMBINED)
+
+    def test_split_implementations_are_normalized(self):
+        cases = (
+            ("  SPLIT_EAGER  ", SPARSE_KV_ATTN_IMPL_SPLIT_EAGER),
+            ("  SPLIT_GRAPH  ", SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value), patch.dict(
+                os.environ, {SPARSE_KV_ATTN_IMPL_ENV_VAR: value}
+            ):
+                self.assertEqual(get_sparse_kv_attn_impl(), expected)
+
+    def test_invalid_implementation_is_rejected(self):
+        with patch.dict(os.environ, {SPARSE_KV_ATTN_IMPL_ENV_VAR: "invalid"}):
+            with self.assertRaisesRegex(ValueError, SPARSE_KV_ATTN_IMPL_ENV_VAR):
+                get_sparse_kv_attn_impl()
+
+    def test_split_decode_mode_matrix(self):
+        cases = (
+            (SPARSE_KV_ATTN_IMPL_COMBINED, False, None),
+            (SPARSE_KV_ATTN_IMPL_COMBINED, True, None),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_EAGER, False, "parallel"),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_EAGER, True, None),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH, False, "parallel"),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH, True, "single_stream"),
+        )
+        for attn_impl, graph_mode, expected in cases:
+            with self.subTest(attn_impl=attn_impl, graph_mode=graph_mode):
+                self.assertEqual(
+                    _select_split_decode_mode(attn_impl, graph_mode), expected
+                )
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
