@@ -2513,27 +2513,11 @@ def test_real_prefetch_dual_stream_refill_slot_map_survives_npugraph() -> None:
         lookup_pointers = tuple(tensor.data_ptr() for tensor in lookup_refs)
         fixed_host_ptrs = (host_kv.data_ptr(), host_kv_host_ptr, host_kv_dev_ptr)
 
-        capture_snapshot = _snapshot_prefetch_buffers(buffers)
-        _assert_prefetch_compaction(
-            capture_snapshot, capture_case, stage="dual-stream graph capture"
-        )
-        _assert_matches(
-            capture_snapshot.state,
-            capture_union,
-            output_atol=2e-2,
-            output_rtol=2e-2,
-            stage="dual-stream graph capture vs union SFA",
-        )
-        _assert_refill_and_slot_map_published(
-            static_inputs,
-            capture_case,
-            capacity=capacity,
-            stage="dual-stream graph capture",
-        )
-
-        # Replay 1 starts from the original mixed state and must publish the
-        # refill again. Replay 2 deliberately preserves that state and must see
-        # a larger hit count (all selected tokens are now resident).
+        # NPUGraph capture is record-only on some torch_npu/CANN versions, so
+        # captured output buffers are not a valid correctness oracle. Replay 1
+        # starts from a freshly restored mixed state and must publish the
+        # refill. Replay 2 deliberately preserves that state and must see a
+        # larger hit count (all selected tokens are now resident).
         reset_initial_state()
         graph.replay()
         torch.npu.synchronize()
