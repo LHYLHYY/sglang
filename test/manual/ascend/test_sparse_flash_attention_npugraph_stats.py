@@ -3,11 +3,12 @@
 This file contains isolated Ascend hardware capability tests. The first test
 captures one ``npu_sparse_flash_attention`` call with
 ``return_softmax_lse=True``. The second captures two fixed-capacity hit/miss SFA
-calls followed by a numerically stable FP32 merge on the same stream. The third
-adds the real sparse-KV lookup and compact-copy kernels in front of the same two
-SFA calls and merge. All tests replay with different fixed-shape inputs and
-compare graph results with eager references, including ``attention_out``,
-``softmax_max``, ``softmax_sum``, and the reconstructed LSE.
+calls followed by a numerically stable FP32 merge on the same stream. A separate
+test captures the fused state-merge kernel by itself, including empty-partition
+and extreme-statistics cases. The remaining tests add the real sparse-KV lookup,
+compact-copy, and refill kernels around the two SFA calls and merge. All tests
+replay with different fixed-shape inputs and compare graph results with eager
+references.
 
 The test deliberately fails (rather than xfails) when an installed
 torch_npu/CANN combination cannot capture or replay the statistics outputs. A
@@ -73,6 +74,26 @@ class AttentionState:
     output: torch.Tensor
     softmax_max: torch.Tensor
     softmax_sum: torch.Tensor
+
+
+@dataclass
+class SFAMergeInputs:
+    hit: AttentionState
+    miss: AttentionState
+    hit_counts: torch.Tensor
+    miss_counts: torch.Tensor
+
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.hit.output,
+            self.hit.softmax_max,
+            self.hit.softmax_sum,
+            self.miss.output,
+            self.miss.softmax_max,
+            self.miss.softmax_sum,
+            self.hit_counts,
+            self.miss_counts,
+        )
 
 
 @dataclass
@@ -1173,6 +1194,82 @@ def _merge_partition_states(
     return AttentionState(merged_output, merged_max, merged_sum)
 
 
+def _make_synthetic_merge_inputs(
+    *,
+    hit_counts: tuple[int, ...],
+    miss_counts: tuple[int, ...],
+    extreme_batch_index: int,
+    extreme_side: str,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+) -> SFAMergeInputs:
+    if len(hit_counts) != len(miss_counts) or not hit_counts:
+        raise ValueError("hit_counts and miss_counts must have the same nonzero size")
+    if any(count < 0 for count in (*hit_counts, *miss_counts)):
+        raise ValueError("partition counts must be nonnegative")
+    if extreme_side not in ("hit", "miss"):
+        raise ValueError(f"extreme_side must be hit or miss, got {extreme_side!r}")
+    if not 0 <= extreme_batch_index < len(hit_counts):
+        raise ValueError(f"invalid extreme batch index {extreme_batch_index}")
+    if hit_counts[extreme_batch_index] == 0 or miss_counts[extreme_batch_index] == 0:
+        raise ValueError("the extreme-statistics row must have two nonempty partitions")
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    batch_size = len(hit_counts)
+    output_shape = (batch_size, 1, num_heads, head_dim)
+    stats_shape = (batch_size, 1, 1, num_heads)
+    npu_nd_format = 2
+
+    def to_npu_nd(tensor: torch.Tensor) -> torch.Tensor:
+        return torch_npu.npu_format_cast(tensor.to(device=device), npu_nd_format)
+
+    def make_output() -> torch.Tensor:
+        return to_npu_nd(
+            torch.randn(output_shape, generator=generator, dtype=torch.float32).to(
+                dtype=dtype
+            )
+        )
+
+    def make_max() -> torch.Tensor:
+        return to_npu_nd(
+            torch.randn(stats_shape, generator=generator, dtype=torch.float32) * 2.0
+        )
+
+    def make_sum() -> torch.Tensor:
+        return to_npu_nd(
+            torch.rand(stats_shape, generator=generator, dtype=torch.float32) + 0.5
+        )
+
+    hit_max = make_max()
+    miss_max = make_max()
+    dominant_max = 80.0
+    suppressed_max = -80.0
+    if extreme_side == "hit":
+        hit_max[extreme_batch_index].fill_(dominant_max)
+        miss_max[extreme_batch_index].fill_(suppressed_max)
+    else:
+        hit_max[extreme_batch_index].fill_(suppressed_max)
+        miss_max[extreme_batch_index].fill_(dominant_max)
+
+    return SFAMergeInputs(
+        hit=AttentionState(make_output(), hit_max, make_sum()),
+        miss=AttentionState(make_output(), miss_max, make_sum()),
+        hit_counts=torch.tensor(hit_counts, dtype=torch.int32, device=device),
+        miss_counts=torch.tensor(miss_counts, dtype=torch.int32, device=device),
+    )
+
+
+def _copy_merge_inputs(destination: SFAMergeInputs, source: SFAMergeInputs) -> None:
+    for destination_tensor, source_tensor in zip(
+        destination.tensors(), source.tensors(), strict=True
+    ):
+        destination_tensor.copy_(source_tensor)
+
+
 def _run_split_sfa(inputs: SplitSFAInputs, scale: float) -> AttentionState:
     # Deliberately run both calls sequentially on the caller's current stream.
     hit_state = _run_partition_sfa(inputs, inputs.hit, scale)
@@ -1833,6 +1930,330 @@ def test_two_sfa_fp32_merge_survives_npugraph_dynamic_replay() -> None:
         f"lse={_max_abs_error(_state_lse(graph_b), _state_lse(union_b)):.4e}"
     )
     print("PASSED: single-stream hit/miss SFA and FP32 merge survive NPUGraph replay")
+
+
+@pytest.mark.skipif(
+    torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="torch_npu and an Ascend NPU are required",
+)
+def test_fused_sfa_state_merge_survives_npugraph_dynamic_replay() -> None:
+    """Validate the preallocated fused merge in eager mode and NPUGraph replay."""
+
+    if sparse_kv_ops is None:
+        pytest.fail(
+            "the matching sgl_kernel_npu sparse-KV package is required for the "
+            "fused merge NPUGraph test; import failed with "
+            f"{type(_SPARSE_KV_OPS_IMPORT_ERROR).__name__}: "
+            f"{_SPARSE_KV_OPS_IMPORT_ERROR}",
+            pytrace=False,
+        )
+    fused_merge = getattr(sparse_kv_ops, "sfa_state_merge_inplace", None)
+    if fused_merge is None:
+        pytest.fail(
+            "the installed sgl_kernel_npu package does not export "
+            "sfa_state_merge_inplace; rebuild and install the matching kernel wheel",
+            pytrace=False,
+        )
+
+    device_index = 0
+    torch.npu.set_device(device_index)
+    device = torch.device(f"npu:{device_index}")
+    dtype = torch.bfloat16
+    num_heads = 16
+    head_dim = 512
+    capacity = 2048
+    scale = 1.0 / math.sqrt(128 + 64)
+    output_atol = 2e-2
+    output_rtol = 2e-2
+    runtime = _runtime_description(device_index)
+
+    # Keep the real SFA return tensors themselves (rather than clones) as graph
+    # staging buffers. This exercises the storage format/contiguity contract
+    # seen by the production two-SFA path. Its rows cover ordinary hit+miss and
+    # hit-only; the synthetic replays add miss-only, both-empty, and extreme
+    # max-gap cases while retaining the same fixed shapes and addresses.
+    real_case = _make_split_case(
+        hit_counts=(1024, 2048),
+        capacity=capacity,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026081439,
+    )
+    try:
+        real_hit = _run_partition_sfa(real_case.split, real_case.split.hit, scale)
+        real_miss = _run_partition_sfa(real_case.split, real_case.split.miss, scale)
+        torch.npu.synchronize()
+    except Exception as error:
+        raise AssertionError(
+            "real SFA outputs could not be prepared for fused merge interop; "
+            f"{runtime}; original error: {type(error).__name__}: {error}"
+        ) from error
+    _validate_contract(real_hit, real_case.union, stage="real SFA hit state")
+    _validate_contract(real_miss, real_case.union, stage="real SFA miss state")
+    for name, tensor in (
+        ("hit output", real_hit.output),
+        ("hit max", real_hit.softmax_max),
+        ("hit sum", real_hit.softmax_sum),
+        ("miss output", real_miss.output),
+        ("miss max", real_miss.softmax_max),
+        ("miss sum", real_miss.softmax_sum),
+    ):
+        assert tensor.is_contiguous(), f"real SFA {name} is not contiguous"
+    real_inputs = SFAMergeInputs(
+        hit=real_hit,
+        miss=real_miss,
+        hit_counts=real_case.split.hit.true_counts.clone(),
+        miss_counts=real_case.split.miss.true_counts.clone(),
+    )
+    del real_case
+
+    replay_case_a = _make_synthetic_merge_inputs(
+        hit_counts=(11, 0),
+        miss_counts=(7, 19),
+        extreme_batch_index=0,
+        extreme_side="hit",
+        num_heads=num_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+        seed=2026081440,
+    )
+    replay_case_b = _make_synthetic_merge_inputs(
+        hit_counts=(0, 23),
+        miss_counts=(0, 29),
+        extreme_batch_index=1,
+        extreme_side="miss",
+        num_heads=num_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+        seed=2026081441,
+    )
+
+    print(runtime)
+    print(
+        "fused SFA state merge graph: "
+        f"dtype={dtype} batch={real_inputs.hit.output.shape[0]} "
+        f"heads={num_heads} head_dim={head_dim}"
+    )
+
+    def invoke(inputs: SFAMergeInputs, output: torch.Tensor) -> torch.Tensor:
+        returned = fused_merge(
+            inputs.hit.output,
+            inputs.hit.softmax_max,
+            inputs.hit.softmax_sum,
+            inputs.miss.output,
+            inputs.miss.softmax_max,
+            inputs.miss.softmax_sum,
+            inputs.hit_counts,
+            inputs.miss_counts,
+            output,
+        )
+        assert isinstance(returned, torch.Tensor), "fused merge did not return output"
+        assert (
+            returned.data_ptr() == output.data_ptr()
+        ), "fused merge did not return the caller-provided output buffer"
+        return returned
+
+    def reference(inputs: SFAMergeInputs) -> AttentionState:
+        return _merge_partition_states(
+            inputs.hit, inputs.miss, inputs.hit_counts, inputs.miss_counts,
+        )
+
+    def assert_output(
+        actual: torch.Tensor,
+        expected: AttentionState,
+        inputs: SFAMergeInputs,
+        *,
+        stage: str,
+    ) -> None:
+        assert actual.shape == inputs.hit.output.shape
+        assert actual.dtype == dtype
+        assert torch.isfinite(actual).all().item(), f"{stage}: output contains NaN/Inf"
+        torch.testing.assert_close(
+            actual.float(),
+            expected.output.float(),
+            atol=output_atol,
+            rtol=output_rtol,
+            msg=f"{stage}: fused output differs from the FP32 Python reference",
+        )
+
+        hit_counts = tuple(inputs.hit_counts.cpu().tolist())
+        miss_counts = tuple(inputs.miss_counts.cpu().tolist())
+        for batch_index, (hit_count, miss_count) in enumerate(
+            zip(hit_counts, miss_counts, strict=True)
+        ):
+            if hit_count == 0 and miss_count == 0:
+                torch.testing.assert_close(
+                    actual[batch_index],
+                    torch.zeros_like(actual[batch_index]),
+                    atol=0,
+                    rtol=0,
+                    msg=f"{stage}: both-empty row {batch_index} was not zeroed",
+                )
+            elif miss_count == 0:
+                torch.testing.assert_close(
+                    actual[batch_index],
+                    inputs.hit.output[batch_index],
+                    atol=0,
+                    rtol=0,
+                    msg=f"{stage}: hit-only row {batch_index} was not copied exactly",
+                )
+            elif hit_count == 0:
+                torch.testing.assert_close(
+                    actual[batch_index],
+                    inputs.miss.output[batch_index],
+                    atol=0,
+                    rtol=0,
+                    msg=f"{stage}: miss-only row {batch_index} was not copied exactly",
+                )
+
+    def run_eager(
+        inputs: SFAMergeInputs, stage: str
+    ) -> tuple[torch.Tensor, AttentionState]:
+        expected = reference(inputs)
+        output = torch.empty_like(inputs.hit.output)
+        output.fill_(float("nan"))
+        output_pointer = output.data_ptr()
+        try:
+            invoke(inputs, output)
+            torch.npu.synchronize()
+        except Exception as error:
+            raise AssertionError(
+                f"{stage}: fused merge failed in eager mode; {runtime}; "
+                f"original error: {type(error).__name__}: {error}"
+            ) from error
+        assert output.data_ptr() == output_pointer
+        actual = output.detach().clone()
+        expected = _clone_state(expected)
+        assert_output(actual, expected, inputs, stage=stage)
+        return actual, expected
+
+    _, reference_real = run_eager(real_inputs, "real-SFA fused eager interop")
+    eager_a, reference_a = run_eager(replay_case_a, "fused eager A")
+    eager_b, reference_b = run_eager(replay_case_b, "fused eager B")
+    torch.testing.assert_close(
+        eager_a[0],
+        replay_case_a.hit.output[0],
+        atol=0,
+        rtol=0,
+        msg="extreme hit-dominant row did not reduce to the hit output",
+    )
+    torch.testing.assert_close(
+        eager_b[1],
+        replay_case_b.miss.output[1],
+        atol=0,
+        rtol=0,
+        msg="extreme miss-dominant row did not reduce to the miss output",
+    )
+
+    static_inputs = real_inputs
+    graph_output = torch.empty_like(static_inputs.hit.output)
+
+    def run_once() -> None:
+        fused_merge(
+            static_inputs.hit.output,
+            static_inputs.hit.softmax_max,
+            static_inputs.hit.softmax_sum,
+            static_inputs.miss.output,
+            static_inputs.miss.softmax_max,
+            static_inputs.miss.softmax_sum,
+            static_inputs.hit_counts,
+            static_inputs.miss_counts,
+            graph_output,
+        )
+
+    input_pointers = tuple(tensor.data_ptr() for tensor in static_inputs.tensors())
+    output_pointer = graph_output.data_ptr()
+    try:
+        capture_stream = torch.npu.Stream()
+        graph_pool = torch.npu.graph_pool_handle()
+    except Exception as error:
+        raise AssertionError(
+            "NPUGraph runtime setup failed before fused merge capture; "
+            f"{runtime}; original error: {type(error).__name__}: {error}"
+        ) from error
+
+    try:
+        capture_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(capture_stream):
+            for _ in range(2):
+                graph_output.fill_(float("nan"))
+                run_once()
+        torch.npu.synchronize()
+        assert_output(
+            graph_output,
+            reference_real,
+            static_inputs,
+            stage="real-SFA fused merge graph warmup",
+        )
+    except Exception as error:
+        raise AssertionError(
+            "fused merge failed during graph-stream warmup; "
+            f"{runtime}; original error: {type(error).__name__}: {error}"
+        ) from error
+
+    try:
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(
+            graph, pool=graph_pool, stream=capture_stream, auto_dispatch_capture=True,
+        ):
+            run_once()
+        torch.npu.synchronize()
+    except Exception as error:
+        raise AssertionError(
+            "NPUGraph could not capture the preallocated fused SFA state merge; "
+            f"{runtime}; original error: {type(error).__name__}: {error}"
+        ) from error
+
+    # Capture is record-only on some torch_npu/CANN versions. Do not consume
+    # graph_output here; poison it immediately before each real replay instead.
+    assert tuple(tensor.data_ptr() for tensor in static_inputs.tensors()) == (
+        input_pointers
+    ), "fused merge capture changed a static input buffer address"
+    assert (
+        graph_output.data_ptr() == output_pointer
+    ), "fused merge capture changed the preallocated output address"
+
+    def replay(
+        inputs: SFAMergeInputs, expected: AttentionState, stage: str
+    ) -> torch.Tensor:
+        _copy_merge_inputs(static_inputs, inputs)
+        graph_output.fill_(float("nan"))
+        torch.npu.synchronize()
+        try:
+            graph.replay()
+            torch.npu.synchronize()
+        except Exception as error:
+            raise AssertionError(
+                f"{stage}: fused merge NPUGraph replay failed; {runtime}; "
+                f"original error: {type(error).__name__}: {error}"
+            ) from error
+
+        assert tuple(tensor.data_ptr() for tensor in static_inputs.tensors()) == (
+            input_pointers
+        ), f"{stage}: a static fused merge input address changed"
+        assert (
+            graph_output.data_ptr() == output_pointer
+        ), f"{stage}: the preallocated fused merge output address changed"
+        actual = graph_output.detach().clone()
+        assert_output(actual, expected, inputs, stage=stage)
+        return actual
+
+    graph_a = replay(replay_case_a, reference_a, "fused merge graph replay A")
+    graph_b = replay(replay_case_b, reference_b, "fused merge graph replay B")
+    assert _max_abs_error(graph_a, graph_b) > 1e-2, (
+        "fused merge graph replay did not refresh the output: A/B delta="
+        f"{_max_abs_error(graph_a, graph_b):.4e}"
+    )
+
+    print(
+        "fused replay errors: "
+        f"A={_max_abs_error(graph_a, reference_a.output):.4e} "
+        f"B={_max_abs_error(graph_b, reference_b.output):.4e}"
+    )
+    print("PASSED: preallocated fused SFA state merge survives NPUGraph replay")
 
 
 @pytest.mark.skipif(

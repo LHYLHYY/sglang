@@ -27,6 +27,16 @@ SPARSE_KV_ATTN_IMPL_CHOICES = (
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
 )
 
+SPARSE_KV_MERGE_IMPL_ENV_VAR = "SGLANG_NPU_SPARSE_KV_MERGE_IMPL"
+SPARSE_KV_MERGE_IMPL_AUTO = "auto"
+SPARSE_KV_MERGE_IMPL_PYTHON = "python"
+SPARSE_KV_MERGE_IMPL_FUSED = "fused"
+SPARSE_KV_MERGE_IMPL_CHOICES = (
+    SPARSE_KV_MERGE_IMPL_AUTO,
+    SPARSE_KV_MERGE_IMPL_PYTHON,
+    SPARSE_KV_MERGE_IMPL_FUSED,
+)
+
 
 def is_sparsity_driven_kv_offload_requested() -> bool:
     return get_bool_env_var(_ENABLE_ENV_VAR)
@@ -42,6 +52,29 @@ def get_sparse_kv_attn_impl() -> str:
         allowed_values = ", ".join(SPARSE_KV_ATTN_IMPL_CHOICES)
         raise ValueError(
             f"{SPARSE_KV_ATTN_IMPL_ENV_VAR} must be one of: {allowed_values}; "
+            f"got {value!r}."
+        )
+    return value
+
+
+def get_sparse_kv_merge_impl() -> str:
+    """Select the split-attention state merge implementation.
+
+    ``auto`` uses the fused sgl-kernel-npu operator when it is installed and
+    otherwise falls back to the graph-safe PyTorch implementation. ``fused``
+    is a strict opt-in that fails on the first merge call when the matching
+    kernel wheel is unavailable.
+    """
+
+    value = (
+        os.getenv(SPARSE_KV_MERGE_IMPL_ENV_VAR, SPARSE_KV_MERGE_IMPL_AUTO)
+        .strip()
+        .lower()
+    )
+    if value not in SPARSE_KV_MERGE_IMPL_CHOICES:
+        allowed_values = ", ".join(SPARSE_KV_MERGE_IMPL_CHOICES)
+        raise ValueError(
+            f"{SPARSE_KV_MERGE_IMPL_ENV_VAR} must be one of: {allowed_values}; "
             f"got {value!r}."
         )
     return value

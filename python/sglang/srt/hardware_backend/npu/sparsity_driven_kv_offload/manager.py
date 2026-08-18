@@ -16,6 +16,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparse_kv_attn_impl,
+    get_sparse_kv_merge_impl,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
@@ -169,6 +170,12 @@ class SparseKVCacheManager:
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
         self.attn_impl = get_sparse_kv_attn_impl()
+        self.merge_impl = get_sparse_kv_merge_impl()
+        logger.info(
+            "Sparse KV attention implementation: %s; merge implementation: %s.",
+            self.attn_impl,
+            self.merge_impl,
+        )
         self._split_graph_fallback_logged = False
         self._split_graph_phase_one_logged = False
         self._split_graph_dual_logged = False

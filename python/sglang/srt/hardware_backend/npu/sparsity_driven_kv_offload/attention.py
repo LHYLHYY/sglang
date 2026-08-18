@@ -9,10 +9,27 @@ from typing import TYPE_CHECKING, Optional
 import torch
 import torch_npu
 
+try:
+    import sgl_kernel_npu.sparsity_driven_kv_offload as _sparse_kv_ops
+except ModuleNotFoundError as error:
+    if error.name not in (
+        "sgl_kernel_npu",
+        "sgl_kernel_npu.sparsity_driven_kv_offload",
+    ):
+        raise
+    _fused_sfa_state_merge_inplace = None
+else:
+    _fused_sfa_state_merge_inplace = getattr(
+        _sparse_kv_ops, "sfa_state_merge_inplace", None
+    )
+
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_MERGE_IMPL_AUTO,
+    SPARSE_KV_MERGE_IMPL_FUSED,
+    SPARSE_KV_MERGE_IMPL_PYTHON,
 )
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
@@ -36,6 +53,16 @@ logger = logging.getLogger(__name__)
 _SPLIT_MODE_PARALLEL = "parallel"
 _SPLIT_MODE_SINGLE_STREAM = "single_stream"
 _SPLIT_MODE_DUAL_STREAM = "dual_stream"
+_FUSED_MERGE_FALLBACK_LOGGED = False
+_FUSED_MERGE_SELECTION_LOGGED = False
+
+
+def _is_fused_sfa_state_merge_available() -> bool:
+    """Return whether both the Python wrapper and native schema are installed."""
+
+    return _fused_sfa_state_merge_inplace is not None and hasattr(
+        torch.ops.npu, "sfa_state_merge"
+    )
 
 
 def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> Optional[str]:
@@ -59,7 +86,7 @@ class _SfaPartitionState:
     output: torch.Tensor
     softmax_max: torch.Tensor
     softmax_sum: torch.Tensor
-    nonempty: torch.Tensor
+    true_counts: torch.Tensor
 
 
 def _get_sparse_kv_manager(backend: AscendAttnBackend):
@@ -162,11 +189,11 @@ def _run_decode_sfa_partition(
         output=output,
         softmax_max=softmax_max,
         softmax_sum=softmax_sum,
-        nonempty=partition.true_counts > 0,
+        true_counts=partition.true_counts,
     )
 
 
-def _merge_decode_sfa_partitions(
+def _merge_decode_sfa_partitions_python(
     hit: _SfaPartitionState, miss: _SfaPartitionState
 ) -> torch.Tensor:
     if hit.output.shape != miss.output.shape:
@@ -183,8 +210,8 @@ def _merge_decode_sfa_partitions(
 
     batch_size = hit.output.shape[0]
     stats_mask_shape = (batch_size, 1, 1, 1)
-    hit_nonempty = hit.nonempty.view(stats_mask_shape)
-    miss_nonempty = miss.nonempty.view(stats_mask_shape)
+    hit_nonempty = (hit.true_counts > 0).view(stats_mask_shape)
+    miss_nonempty = (miss.true_counts > 0).view(stats_mask_shape)
     any_nonempty = hit_nonempty | miss_nonempty
 
     neg_inf = torch.full_like(hit.softmax_max, float("-inf"))
@@ -222,6 +249,68 @@ def _merge_decode_sfa_partitions(
     return merged.to(hit.output.dtype)
 
 
+def _merge_decode_sfa_partitions(
+    hit: _SfaPartitionState,
+    miss: _SfaPartitionState,
+    merge_impl: str = SPARSE_KV_MERGE_IMPL_PYTHON,
+) -> torch.Tensor:
+    """Merge independently normalized hit/miss attention states.
+
+    The fused path keeps the same device-side empty-partition semantics as the
+    PyTorch reference while collapsing its pointwise graph into one AIV task.
+    """
+
+    global _FUSED_MERGE_FALLBACK_LOGGED, _FUSED_MERGE_SELECTION_LOGGED
+
+    if merge_impl not in (
+        SPARSE_KV_MERGE_IMPL_AUTO,
+        SPARSE_KV_MERGE_IMPL_PYTHON,
+        SPARSE_KV_MERGE_IMPL_FUSED,
+    ):
+        raise ValueError(f"Unsupported sparse KV merge implementation: {merge_impl!r}")
+
+    fused_available = _is_fused_sfa_state_merge_available()
+    use_fused = merge_impl == SPARSE_KV_MERGE_IMPL_FUSED or (
+        merge_impl == SPARSE_KV_MERGE_IMPL_AUTO and fused_available
+    )
+    if not use_fused:
+        if (
+            merge_impl == SPARSE_KV_MERGE_IMPL_AUTO
+            and not fused_available
+            and not _FUSED_MERGE_FALLBACK_LOGGED
+        ):
+            logger.warning(
+                "Fused sparse KV attention merge is unavailable in the installed "
+                "sgl-kernel-npu; using the PyTorch merge implementation."
+            )
+            _FUSED_MERGE_FALLBACK_LOGGED = True
+        return _merge_decode_sfa_partitions_python(hit, miss)
+
+    if not fused_available:
+        raise RuntimeError(
+            "SGLANG_NPU_SPARSE_KV_MERGE_IMPL=fused requires an "
+            "sgl-kernel-npu build that exports sfa_state_merge_inplace and "
+            "registers torch.ops.npu.sfa_state_merge."
+        )
+
+    if not _FUSED_MERGE_SELECTION_LOGGED:
+        logger.info("Using fused sgl-kernel-npu sparse KV attention state merge.")
+        _FUSED_MERGE_SELECTION_LOGGED = True
+
+    output = torch.empty_like(hit.output)
+    return _fused_sfa_state_merge_inplace(
+        hit.output,
+        hit.softmax_max,
+        hit.softmax_sum,
+        miss.output,
+        miss.softmax_max,
+        miss.softmax_sum,
+        hit.true_counts,
+        miss.true_counts,
+        output,
+    )
+
+
 def _run_split_decode_attention(
     ticket: SparseKVPrefetchTicket,
     *,
@@ -230,6 +319,7 @@ def _run_split_decode_attention(
     nope_head_dim: int,
     rope_head_dim: int,
     scale_value: float,
+    merge_impl: str,
     stream,
 ) -> torch.Tensor:
     hit_attention_done = torch.npu.Event()
@@ -271,11 +361,11 @@ def _run_split_decode_attention(
                 state.output,
                 state.softmax_max,
                 state.softmax_sum,
-                state.nonempty,
+                state.true_counts,
             ):
                 tensor.record_stream(stream)
         with torch.profiler.record_function("sparse_kv_split.merge"):
-            return _merge_decode_sfa_partitions(hit_state, miss_state)
+            return _merge_decode_sfa_partitions(hit_state, miss_state, merge_impl)
 
 
 def _run_split_decode_attention_single_stream(
@@ -286,6 +376,7 @@ def _run_split_decode_attention_single_stream(
     nope_head_dim: int,
     rope_head_dim: int,
     scale_value: float,
+    merge_impl: str,
 ) -> torch.Tensor:
     """Run both partition attentions and merge on the current graph stream."""
 
@@ -310,7 +401,7 @@ def _run_split_decode_attention_single_stream(
             record_stream=False,
         )
     with torch.profiler.record_function("sparse_kv_split_graph.merge"):
-        return _merge_decode_sfa_partitions(hit_state, miss_state)
+        return _merge_decode_sfa_partitions(hit_state, miss_state, merge_impl)
 
 
 def _run_split_decode_attention_graph_dual(
@@ -361,11 +452,13 @@ def _run_split_decode_attention_graph_dual(
             miss_state.output,
             miss_state.softmax_max,
             miss_state.softmax_sum,
-            miss_state.nonempty,
+            miss_state.true_counts,
         ):
             tensor.record_stream(stream)
         with torch.profiler.record_function("sparse_kv_split_graph_dual.merge"):
-            merged = _merge_decode_sfa_partitions(hit_state, miss_state)
+            merged = _merge_decode_sfa_partitions(
+                hit_state, miss_state, manager.merge_impl
+            )
         _wait_stream_event(stream, ticket.events.refill_done)
         return merged
 
@@ -525,6 +618,7 @@ def forward_sparsity_driven_kv_offload(
                     nope_head_dim=nope_head_dim,
                     rope_head_dim=rope_head_dim,
                     scale_value=layer.scaling,
+                    merge_impl=sparse_kv_manager.merge_impl,
                 )
             elif split_mode == _SPLIT_MODE_DUAL_STREAM:
                 ticket = sparse_kv_manager.prefetch_partitions_graph_dual(
@@ -559,6 +653,7 @@ def forward_sparsity_driven_kv_offload(
                     nope_head_dim=nope_head_dim,
                     rope_head_dim=rope_head_dim,
                     scale_value=layer.scaling,
+                    merge_impl=sparse_kv_manager.merge_impl,
                     stream=stream,
                 )
             return decode_output[:, :, :num_query_heads, :].reshape(

@@ -37,7 +37,12 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import (
+    attention as sparse_kv_attention,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+    _SfaPartitionState,
+    _merge_decode_sfa_partitions,
     _select_split_decode_mode,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
@@ -46,7 +51,12 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_MERGE_IMPL_AUTO,
+    SPARSE_KV_MERGE_IMPL_ENV_VAR,
+    SPARSE_KV_MERGE_IMPL_FUSED,
+    SPARSE_KV_MERGE_IMPL_PYTHON,
     get_sparse_kv_attn_impl,
+    get_sparse_kv_merge_impl,
 )
 
 
@@ -88,6 +98,145 @@ class TestSparseKVAttentionImplementation(unittest.TestCase):
             with self.subTest(attn_impl=attn_impl, graph_mode=graph_mode):
                 self.assertEqual(
                     _select_split_decode_mode(attn_impl, graph_mode), expected
+                )
+
+
+class TestSparseKVAttentionMergeImplementation(unittest.TestCase):
+    def test_default_is_auto(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(SPARSE_KV_MERGE_IMPL_ENV_VAR, None)
+            self.assertEqual(get_sparse_kv_merge_impl(), SPARSE_KV_MERGE_IMPL_AUTO)
+
+    def test_merge_implementations_are_normalized(self):
+        cases = (
+            ("  AUTO  ", SPARSE_KV_MERGE_IMPL_AUTO),
+            ("  PYTHON  ", SPARSE_KV_MERGE_IMPL_PYTHON),
+            ("  FUSED  ", SPARSE_KV_MERGE_IMPL_FUSED),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value), patch.dict(
+                os.environ, {SPARSE_KV_MERGE_IMPL_ENV_VAR: value}
+            ):
+                self.assertEqual(get_sparse_kv_merge_impl(), expected)
+
+    def test_invalid_merge_implementation_is_rejected(self):
+        with patch.dict(os.environ, {SPARSE_KV_MERGE_IMPL_ENV_VAR: "invalid"}):
+            with self.assertRaisesRegex(ValueError, SPARSE_KV_MERGE_IMPL_ENV_VAR):
+                get_sparse_kv_merge_impl()
+
+    @staticmethod
+    def _make_states():
+        hit = _SfaPartitionState(
+            output=torch.randn(2, 1, 3, 4, dtype=torch.bfloat16),
+            softmax_max=torch.randn(2, 1, 1, 3, dtype=torch.float32),
+            softmax_sum=torch.rand(2, 1, 1, 3, dtype=torch.float32) + 1.0,
+            true_counts=torch.tensor([4, 0], dtype=torch.int32),
+        )
+        miss = _SfaPartitionState(
+            output=torch.randn(2, 1, 3, 4, dtype=torch.bfloat16),
+            softmax_max=torch.randn(2, 1, 1, 3, dtype=torch.float32),
+            softmax_sum=torch.rand(2, 1, 1, 3, dtype=torch.float32) + 1.0,
+            true_counts=torch.tensor([2, 5], dtype=torch.int32),
+        )
+        return hit, miss
+
+    def test_fused_merge_dispatches_to_kernel_wrapper(self):
+        hit, miss = self._make_states()
+        expected = _merge_decode_sfa_partitions(
+            hit, miss, SPARSE_KV_MERGE_IMPL_PYTHON
+        )
+
+        fused = MagicMock(side_effect=lambda *args: args[-1].copy_(expected))
+        with patch.object(
+            sparse_kv_attention, "_fused_sfa_state_merge_inplace", fused
+        ), patch.object(
+            sparse_kv_attention,
+            "_is_fused_sfa_state_merge_available",
+            return_value=True,
+        ):
+            actual = _merge_decode_sfa_partitions(
+                hit, miss, SPARSE_KV_MERGE_IMPL_FUSED
+            )
+
+        torch.testing.assert_close(actual, expected)
+        fused.assert_called_once()
+        fused_args = fused.call_args.args
+        expected_inputs = (
+            hit.output,
+            hit.softmax_max,
+            hit.softmax_sum,
+            miss.output,
+            miss.softmax_max,
+            miss.softmax_sum,
+            hit.true_counts,
+            miss.true_counts,
+        )
+        self.assertEqual(len(fused_args), 9)
+        for actual_arg, expected_arg in zip(fused_args[:8], expected_inputs):
+            self.assertIs(actual_arg, expected_arg)
+        self.assertEqual(fused_args[-1].shape, hit.output.shape)
+        self.assertEqual(fused_args[-1].dtype, hit.output.dtype)
+        self.assertEqual(fused_args[-1].device, hit.output.device)
+
+    def test_auto_uses_fused_merge_when_native_schema_is_available(self):
+        hit, miss = self._make_states()
+        expected = _merge_decode_sfa_partitions(
+            hit, miss, SPARSE_KV_MERGE_IMPL_PYTHON
+        )
+        fused = MagicMock(side_effect=lambda *args: args[-1].copy_(expected))
+        with patch.object(
+            sparse_kv_attention, "_fused_sfa_state_merge_inplace", fused
+        ), patch.object(
+            sparse_kv_attention,
+            "_is_fused_sfa_state_merge_available",
+            return_value=True,
+        ):
+            actual = _merge_decode_sfa_partitions(
+                hit, miss, SPARSE_KV_MERGE_IMPL_AUTO
+            )
+
+        torch.testing.assert_close(actual, expected)
+        fused.assert_called_once()
+
+    def test_auto_falls_back_once_when_native_schema_is_missing(self):
+        hit, miss = self._make_states()
+        expected = _merge_decode_sfa_partitions(
+            hit, miss, SPARSE_KV_MERGE_IMPL_PYTHON
+        )
+        fused = MagicMock()
+        with patch.object(
+            sparse_kv_attention, "_fused_sfa_state_merge_inplace", fused
+        ), patch.object(
+            sparse_kv_attention,
+            "_is_fused_sfa_state_merge_available",
+            return_value=False,
+        ), patch.object(
+            sparse_kv_attention, "_FUSED_MERGE_FALLBACK_LOGGED", False
+        ), patch.object(sparse_kv_attention.logger, "warning") as warning:
+            actual_first = _merge_decode_sfa_partitions(
+                hit, miss, SPARSE_KV_MERGE_IMPL_AUTO
+            )
+            actual_second = _merge_decode_sfa_partitions(
+                hit, miss, SPARSE_KV_MERGE_IMPL_AUTO
+            )
+
+        torch.testing.assert_close(actual_first, expected)
+        torch.testing.assert_close(actual_second, expected)
+        fused.assert_not_called()
+        warning.assert_called_once()
+
+    def test_strict_fused_merge_rejects_missing_kernel(self):
+        hit, miss = self._make_states()
+        with patch.object(
+            sparse_kv_attention, "_fused_sfa_state_merge_inplace", None
+        ), patch.object(
+            sparse_kv_attention,
+            "_is_fused_sfa_state_merge_available",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "sgl-kernel-npu"):
+                _merge_decode_sfa_partitions(
+                    hit, miss, SPARSE_KV_MERGE_IMPL_FUSED
                 )
 
 
