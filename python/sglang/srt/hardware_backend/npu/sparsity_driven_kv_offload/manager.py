@@ -145,6 +145,19 @@ class SparseKVGraphDualV2State:
     max_batch_size: int
     selected_k_nope: torch.Tensor
     selected_k_rope: torch.Tensor
+    attention_dst_indices: torch.Tensor
+    actual_seq_lengths_kv: torch.Tensor
+    hit_sparse_indices: torch.Tensor
+    miss_sparse_indices: torch.Tensor
+    hit_counts: torch.Tensor
+    miss_counts: torch.Tensor
+    hit_src_indices: torch.Tensor
+    miss_src_indices: torch.Tensor
+    miss_hot_dst_indices: torch.Tensor
+    hit_valid_mask: torch.Tensor
+    miss_valid_mask: torch.Tensor
+    slot_map_flat_indices: torch.Tensor
+    slot_map_slot_values: torch.Tensor
     miss_stream: torch.npu.Stream
     layer_events: list[SparseKVGraphDualV2LayerEvents]
 
@@ -410,6 +423,7 @@ class SparseKVCacheManager:
         required_ops = (
             ("unidex_split_copy_inplace", "unidex_split_copy"),
             ("unidex_split_copy_promote_inplace", "unidex_split_copy_promote"),
+            ("sparse_kv_partition_plan_inplace", "sparse_kv_partition_plan"),
         )
         for python_symbol, native_schema in required_ops:
             if not hasattr(sparse_kv_ops, python_symbol) or not hasattr(
@@ -456,6 +470,38 @@ class SparseKVCacheManager:
             selected_k_rope = torch.zeros(
                 rope_shape, dtype=self.store_dtype, device=self.device
             )
+            plan_shape = (max_batch_size, self.sparse_context_len)
+            plan_size = max_batch_size * self.sparse_context_len
+            attention_dst_indices = torch.arange(
+                plan_size, dtype=torch.int64, device=self.device
+            )
+            actual_seq_lengths_kv = torch.full(
+                (max_batch_size,),
+                self.sparse_context_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            hit_sparse_indices = torch.empty(
+                plan_shape, dtype=torch.int32, device=self.device
+            )
+            miss_sparse_indices = torch.empty_like(hit_sparse_indices)
+            hit_counts = torch.empty(
+                (max_batch_size,), dtype=torch.int32, device=self.device
+            )
+            miss_counts = torch.empty_like(hit_counts)
+            hit_src_indices = torch.empty(
+                (plan_size,), dtype=torch.int64, device=self.device
+            )
+            miss_src_indices = torch.empty_like(hit_src_indices)
+            miss_hot_dst_indices = torch.empty_like(hit_src_indices)
+            hit_valid_mask = torch.empty(
+                (plan_size,), dtype=torch.bool, device=self.device
+            )
+            miss_valid_mask = torch.empty_like(hit_valid_mask)
+            slot_map_flat_indices = torch.empty_like(hit_src_indices)
+            slot_map_slot_values = torch.empty(
+                plan_shape, dtype=torch.int32, device=self.device
+            )
             miss_stream = torch.npu.Stream()
             layer_events = [
                 SparseKVGraphDualV2LayerEvents(
@@ -476,14 +522,45 @@ class SparseKVCacheManager:
             max_batch_size=max_batch_size,
             selected_k_nope=selected_k_nope,
             selected_k_rope=selected_k_rope,
+            attention_dst_indices=attention_dst_indices,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            hit_sparse_indices=hit_sparse_indices,
+            miss_sparse_indices=miss_sparse_indices,
+            hit_counts=hit_counts,
+            miss_counts=miss_counts,
+            hit_src_indices=hit_src_indices,
+            miss_src_indices=miss_src_indices,
+            miss_hot_dst_indices=miss_hot_dst_indices,
+            hit_valid_mask=hit_valid_mask,
+            miss_valid_mask=miss_valid_mask,
+            slot_map_flat_indices=slot_map_flat_indices,
+            slot_map_slot_values=slot_map_slot_values,
             miss_stream=miss_stream,
             layer_events=layer_events,
         )
-        workspace_gib = (
+        workspace_bytes = (
             (selected_k_nope.numel() + selected_k_rope.numel())
             * selected_k_nope.element_size()
-            / GB
+            + sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in (
+                    attention_dst_indices,
+                    actual_seq_lengths_kv,
+                    hit_sparse_indices,
+                    miss_sparse_indices,
+                    hit_counts,
+                    miss_counts,
+                    hit_src_indices,
+                    miss_src_indices,
+                    miss_hot_dst_indices,
+                    hit_valid_mask,
+                    miss_valid_mask,
+                    slot_map_flat_indices,
+                    slot_map_slot_values,
+                )
+            )
         )
+        workspace_gib = workspace_bytes / GB
         logger.info(
             "Prepared sparse KV graph-dual-v2 shared workspace: nope=%s, "
             "rope=%s (%.3f GiB).",
@@ -1430,7 +1507,9 @@ class SparseKVCacheManager:
         Hit rows keep their existing hot-cache slots. Miss rows are copied once
         from registered Host memory into both the shared SFA buffers and free
         hot-cache slots. Only the sparse-index lists are compacted; the KV rows
-        remain at their original Top-K positions in the shared buffers.
+        remain at their original Top-K positions in the shared buffers. A fused
+        partition planner replaces the former cumsum/scatter/gather operator
+        chain and writes all fixed-address copy and publication descriptors.
         """
 
         state = self._graph_dual_v2_state
@@ -1515,104 +1594,65 @@ class SparseKVCacheManager:
             lookup_range = _profile_push(
                 "sparse_kv_prefetch_graph_dual_v2.slot_lookup"
             )
+            topk_indices_int32 = topk_indices.to(dtype=torch.int32).contiguous()
             token_on_device, device_token_pos = slot_map_lookup(
                 self.device_slot_map[layer_idx],
                 slot_map_row_indices.to(dtype=torch.int32).contiguous(),
-                topk_indices.to(dtype=torch.int32).contiguous(),
+                topk_indices_int32,
             )
-            hit_valid = token_on_device.to(torch.bool) & valid_topk_mask
-            miss_valid = (~hit_valid) & valid_topk_mask
             _profile_pop(lookup_range)
 
-            (
-                hit_sparse_indices,
-                hit_actual_lengths,
-                hit_counts,
-                _,
-            ) = _build_noncompact_partition_sparse_indices(hit_valid, topk_len)
-            (
-                miss_sparse_indices,
-                miss_actual_lengths,
-                miss_counts,
-                miss_ranks,
-            ) = _build_noncompact_partition_sparse_indices(miss_valid, topk_len)
+            plan_size = batch_size * topk_len
+            hit_sparse_indices_2d = state.hit_sparse_indices[:batch_size]
+            miss_sparse_indices_2d = state.miss_sparse_indices[:batch_size]
+            hit_counts = state.hit_counts[:batch_size]
+            miss_counts = state.miss_counts[:batch_size]
+            hit_src_indices = state.hit_src_indices[:plan_size]
+            miss_src_indices = state.miss_src_indices[:plan_size]
+            miss_hot_dst_indices = state.miss_hot_dst_indices[:plan_size]
+            hit_valid_flat = state.hit_valid_mask[:plan_size]
+            miss_valid_flat = state.miss_valid_mask[:plan_size]
+            slot_map_flat_indices = state.slot_map_flat_indices[:plan_size]
+            slot_map_slot_values = state.slot_map_slot_values[:batch_size]
 
-            positions = self._device_cache_slot_ids[:topk_len].view(1, -1)
-            batch_offsets = (
-                torch.arange(batch_size, dtype=torch.int64, device=topk_indices.device)
-                .unsqueeze(1)
-                .mul(topk_len)
+            plan_range = _profile_push(
+                "sparse_kv_prefetch_graph_dual_v2.partition_plan"
             )
-            attention_dst_indices = (
-                (batch_offsets + positions).reshape(-1).contiguous()
-            )
-
-            request_device_offsets = (
-                device_cache_row_indices.unsqueeze(1) * self.sparse_context_len
-            )
-            hit_src_indices = (
-                (
-                    request_device_offsets
-                    + device_token_pos.to(torch.int64).clamp(
-                        min=0, max=topk_len - 1
-                    )
-                )
-                .reshape(-1)
-                .contiguous()
-            )
-            request_host_offsets = (
-                device_cache_row_indices.unsqueeze(1) * self.max_context_len
-            )
-            miss_src_indices = (
-                (
-                    request_host_offsets
-                    + topk_indices.to(torch.int64).clamp(
-                        min=0, max=self.max_context_len - 1
-                    )
-                )
-                .reshape(-1)
-                .contiguous()
-            )
-
-            assigned_miss_slots = _assign_miss_cache_slots(
-                hit_valid,
+            sparse_kv_ops.sparse_kv_partition_plan_inplace(
+                token_on_device,
                 device_token_pos,
-                miss_ranks,
-                topk_len,
+                topk_indices_int32,
+                device_cache_row_indices,
+                slot_map_row_indices,
+                valid_topk_mask.contiguous(),
+                hit_sparse_indices_2d,
+                miss_sparse_indices_2d,
+                hit_counts,
+                miss_counts,
+                hit_src_indices,
+                miss_src_indices,
+                miss_hot_dst_indices,
+                hit_valid_flat,
+                miss_valid_flat,
+                slot_map_flat_indices,
+                slot_map_slot_values,
+                self.max_context_len,
+                self._slot_map_width,
             )
-            miss_hot_dst_indices = (
-                (request_device_offsets + assigned_miss_slots)
-                .reshape(-1)
-                .contiguous()
-            )
+            _profile_pop(plan_range)
 
-            slot_map_token_indices = torch.where(
-                valid_topk_mask,
-                topk_indices.to(torch.long),
-                torch.full_like(topk_indices, self.max_context_len).to(torch.long),
+            hit_sparse_indices = hit_sparse_indices_2d.view(
+                batch_size, 1, 1, topk_len
             )
-            slot_map_flat_indices = (
-                (
-                    slot_map_row_indices.unsqueeze(1) * self._slot_map_width
-                    + slot_map_token_indices
-                )
-                .reshape(-1)
-                .contiguous()
+            miss_sparse_indices = miss_sparse_indices_2d.view(
+                batch_size, 1, 1, topk_len
             )
-            slot_map_slot_values = torch.where(
-                hit_valid,
-                device_token_pos.to(torch.int32),
-                torch.where(
-                    miss_valid,
-                    assigned_miss_slots.to(torch.int32),
-                    torch.full_like(topk_indices, -1, dtype=torch.int32),
-                ),
-            ).contiguous()
+            hit_actual_lengths = state.actual_seq_lengths_kv[:batch_size]
+            miss_actual_lengths = hit_actual_lengths
+            attention_dst_indices = state.attention_dst_indices[:plan_size]
 
             selected_k_nope = state.selected_k_nope[:batch_size]
             selected_k_rope = state.selected_k_rope[:batch_size]
-            hit_valid_flat = hit_valid.reshape(-1).contiguous()
-            miss_valid_flat = miss_valid.reshape(-1).contiguous()
             _record_stream_event(stream, events.inputs_ready)
 
         miss_copy_range = _profile_push(
