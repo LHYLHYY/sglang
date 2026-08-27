@@ -27,6 +27,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     SPARSE_KV_MERGE_IMPL_AUTO,
     SPARSE_KV_MERGE_IMPL_FUSED,
     SPARSE_KV_MERGE_IMPL_PYTHON,
@@ -38,10 +39,12 @@ if TYPE_CHECKING:
         AscendAttnBackend,
     )
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+        SparseKVCacheManager,
+        SparseKVGraphDualPrefetch,
+        SparseKVGraphDualV2Prefetch,
+        SparseKVIndexedPartition,
         SparseKVPartition,
         SparseKVPrefetchTicket,
-        SparseKVGraphDualPrefetch,
-        SparseKVCacheManager,
         SparseKVSingleStreamPrefetch,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -53,6 +56,7 @@ logger = logging.getLogger(__name__)
 _SPLIT_MODE_PARALLEL = "parallel"
 _SPLIT_MODE_SINGLE_STREAM = "single_stream"
 _SPLIT_MODE_DUAL_STREAM = "dual_stream"
+_SPLIT_MODE_DUAL_STREAM_V2 = "dual_stream_v2"
 _FUSED_MERGE_FALLBACK_LOGGED = False
 _FUSED_MERGE_SELECTION_LOGGED = False
 
@@ -71,11 +75,14 @@ def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> Optional[str]
             return _SPLIT_MODE_SINGLE_STREAM
         if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL:
             return _SPLIT_MODE_DUAL_STREAM
+        if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2:
+            return _SPLIT_MODE_DUAL_STREAM_V2
         return None
     if attn_impl in (
         SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
         SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
         SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     ):
         return _SPLIT_MODE_PARALLEL
     return None
@@ -181,6 +188,61 @@ def _run_decode_sfa_partition(
         if tuple(value.shape) != expected_stats_shape or value.dtype != torch.float32:
             raise RuntimeError(
                 f"Unexpected split SFA {name} contract: "
+                f"got shape={tuple(value.shape)}, dtype={value.dtype}; "
+                f"expected shape={expected_stats_shape}, dtype=torch.float32."
+            )
+
+    return _SfaPartitionState(
+        output=output,
+        softmax_max=softmax_max,
+        softmax_sum=softmax_sum,
+        true_counts=partition.true_counts,
+    )
+
+
+def _run_decode_sfa_indexed_partition(
+    partition: SparseKVIndexedPartition,
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    scale_value: float,
+) -> _SfaPartitionState:
+    """Run SFA over scattered indices in an already split KV workspace."""
+
+    batch_size, query_length, padded_heads, value_dim = query.shape
+    actual_query_lengths = torch.ones(
+        batch_size, dtype=torch.int32, device=query.device
+    ).contiguous()
+    output, softmax_max, softmax_sum = torch_npu.npu_sparse_flash_attention(
+        query=query,
+        key=partition.key,
+        value=partition.key,
+        sparse_indices=partition.sparse_indices,
+        scale_value=scale_value,
+        actual_seq_lengths_query=actual_query_lengths,
+        actual_seq_lengths_kv=partition.actual_seq_lengths_kv,
+        query_rope=query_rope,
+        key_rope=partition.key_rope,
+        sparse_block_size=1,
+        layout_query="BSND",
+        layout_kv="BSND",
+        sparse_mode=0,
+        attention_mode=2,
+        return_softmax_lse=True,
+    )
+
+    expected_output_shape = (batch_size, query_length, padded_heads, value_dim)
+    expected_stats_shape = (batch_size, 1, query_length, padded_heads)
+    if tuple(output.shape) != expected_output_shape or output.dtype != query.dtype:
+        raise RuntimeError(
+            "Unexpected indexed split SFA output contract: "
+            f"got shape={tuple(output.shape)}, dtype={output.dtype}; "
+            f"expected shape={expected_output_shape}, dtype={query.dtype}."
+        )
+    for name, value in (("softmax_max", softmax_max), ("softmax_sum", softmax_sum)):
+        if tuple(value.shape) != expected_stats_shape or value.dtype != torch.float32:
+            raise RuntimeError(
+                f"Unexpected indexed split SFA {name} contract: "
                 f"got shape={tuple(value.shape)}, dtype={value.dtype}; "
                 f"expected shape={expected_stats_shape}, dtype=torch.float32."
             )
@@ -463,6 +525,56 @@ def _run_split_decode_attention_graph_dual(
         return merged
 
 
+def _run_split_decode_attention_graph_dual_v2(
+    ticket: SparseKVGraphDualV2Prefetch,
+    manager: SparseKVCacheManager,
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    scale_value: float,
+    stream,
+) -> torch.Tensor:
+    """Overlap hit SFA with Host miss copy/SFA and avoid a refill copy."""
+
+    with torch.profiler.record_function("sparse_kv_split_graph_dual_v2.hit_attention"):
+        with torch.npu.stream(stream):
+            hit_state = _run_decode_sfa_indexed_partition(
+                ticket.hit,
+                query=query,
+                query_rope=query_rope,
+                scale_value=scale_value,
+            )
+
+    with torch.profiler.record_function(
+        "sparse_kv_split_graph_dual_v2.miss_attention"
+    ):
+        with torch.npu.stream(ticket.miss.stream):
+            miss_state = _run_decode_sfa_indexed_partition(
+                ticket.miss,
+                query=query,
+                query_rope=query_rope,
+                scale_value=scale_value,
+            )
+            _record_stream_event(ticket.miss.stream, ticket.events.miss_attention_done)
+
+    with torch.npu.stream(stream):
+        # The miss copy has already promoted every missing row into a free hot
+        # slot. Publish the new map only after those writes are complete.
+        manager.publish_graph_dual_v2_slot_map(ticket, stream)
+        _wait_stream_event(stream, ticket.events.miss_attention_done)
+        for tensor in (
+            miss_state.output,
+            miss_state.softmax_max,
+            miss_state.softmax_sum,
+            miss_state.true_counts,
+        ):
+            tensor.record_stream(stream)
+        with torch.profiler.record_function("sparse_kv_split_graph_dual_v2.merge"):
+            return _merge_decode_sfa_partitions(
+                hit_state, miss_state, manager.merge_impl
+            )
+
+
 def forward_sparsity_driven_kv_offload(
     backend: AscendAttnBackend,
     q: torch.Tensor,
@@ -595,6 +707,16 @@ def forward_sparsity_driven_kv_offload(
                 "hot-cache refill run on a persistent worker stream."
             )
             sparse_kv_manager._split_graph_dual_logged = True
+        if (
+            split_mode == _SPLIT_MODE_DUAL_STREAM_V2
+            and not sparse_kv_manager._split_graph_dual_v2_logged
+        ):
+            logger.warning(
+                "Sparse KV split_graph_dual_v2 is experimental: KV remains "
+                "noncompact, hit rows keep their HBM slots, and each miss is "
+                "copied once into the SFA workspace and hot cache."
+            )
+            sparse_kv_manager._split_graph_dual_v2_logged = True
 
         if split_mode is not None:
             q_nope_sfa = q_nope.view(
@@ -635,6 +757,22 @@ def forward_sparsity_driven_kv_offload(
                     query_rope=q_rope_sfa,
                     nope_head_dim=nope_head_dim,
                     rope_head_dim=rope_head_dim,
+                    scale_value=layer.scaling,
+                    stream=stream,
+                )
+            elif split_mode == _SPLIT_MODE_DUAL_STREAM_V2:
+                ticket = sparse_kv_manager.prefetch_partitions_graph_dual_v2(
+                    layer,
+                    forward_batch,
+                    topk_indices,
+                    stream,
+                    dtype=k.dtype,
+                )
+                decode_output = _run_split_decode_attention_graph_dual_v2(
+                    ticket,
+                    sparse_kv_manager,
+                    query=q_nope_sfa,
+                    query_rope=q_rope_sfa,
                     scale_value=layer.scaling,
                     stream=stream,
                 )

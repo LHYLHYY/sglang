@@ -381,6 +381,135 @@ def _make_split_case(
     return SplitSFACase(union=union, split=split)
 
 
+def _make_noncompact_split_case(
+    *,
+    hit_counts: tuple[int, ...],
+    capacity: int,
+    num_heads: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    seed: int,
+) -> SplitSFACase:
+    """Build hit/miss SFA inputs that share one uncompressed physical KV."""
+
+    if not hit_counts:
+        raise ValueError("hit_counts must contain at least one request")
+    if any(count < 0 or count > capacity for count in hit_counts):
+        raise ValueError(f"hit counts must be in [0, {capacity}], got {hit_counts}")
+
+    batch_size = len(hit_counts)
+    union = _make_case(
+        valid_lengths=(capacity,) * batch_size,
+        capacity=capacity,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=seed,
+    )
+    hit_indices = torch.full(
+        (batch_size, capacity), -1, dtype=torch.int32, device=device
+    )
+    miss_indices = torch.full_like(hit_indices, -1)
+    hit_true_counts = torch.tensor(hit_counts, dtype=torch.int32, device=device)
+    miss_true_counts = capacity - hit_true_counts
+    partition_generator = torch.Generator(device="cpu")
+    partition_generator.manual_seed(seed + 200_000)
+
+    for batch_index, hit_count in enumerate(hit_counts):
+        permutation = torch.randperm(capacity, generator=partition_generator).to(
+            device=device, dtype=torch.int32
+        )
+        if hit_count > 0:
+            hit_indices[batch_index, :hit_count].copy_(permutation[:hit_count])
+        miss_count = capacity - hit_count
+        if miss_count > 0:
+            miss_indices[batch_index, :miss_count].copy_(permutation[hit_count:])
+
+    # SFA does not accept an empty sparse selection. Empty partitions point at a
+    # finite dummy row and are neutralized by true_counts during state merge.
+    hit_indices[:, 0] = torch.where(
+        hit_true_counts > 0,
+        hit_indices[:, 0],
+        torch.zeros(batch_size, dtype=torch.int32, device=device),
+    )
+    miss_indices[:, 0] = torch.where(
+        miss_true_counts > 0,
+        miss_indices[:, 0],
+        torch.zeros(batch_size, dtype=torch.int32, device=device),
+    )
+    physical_kv_lengths = torch.full(
+        (batch_size,), capacity, dtype=torch.int32, device=device
+    )
+
+    # Both partitions intentionally alias the same physical key buffers. Only
+    # sparse_indices selects which non-contiguous rows each SFA consumes.
+    shared_key = union.key.clone()
+    shared_key_rope = union.key_rope.clone()
+    split = SplitSFAInputs(
+        query=union.query.clone(),
+        query_rope=union.query_rope.clone(),
+        actual_query_lengths=union.actual_query_lengths.clone(),
+        hit=SFAPartitionInputs(
+            key=shared_key,
+            key_rope=shared_key_rope,
+            sparse_indices=hit_indices.view(batch_size, 1, 1, capacity).contiguous(),
+            actual_kv_lengths=physical_kv_lengths,
+            true_counts=hit_true_counts,
+        ),
+        miss=SFAPartitionInputs(
+            key=shared_key,
+            key_rope=shared_key_rope,
+            sparse_indices=miss_indices.view(batch_size, 1, 1, capacity).contiguous(),
+            actual_kv_lengths=physical_kv_lengths,
+            true_counts=miss_true_counts,
+        ),
+    )
+    return SplitSFACase(union=union, split=split)
+
+
+def _clone_noncompact_split_inputs(inputs: SplitSFAInputs) -> SplitSFAInputs:
+    shared_key = inputs.hit.key.clone()
+    shared_key_rope = inputs.hit.key_rope.clone()
+    return SplitSFAInputs(
+        query=inputs.query.clone(),
+        query_rope=inputs.query_rope.clone(),
+        actual_query_lengths=inputs.actual_query_lengths.clone(),
+        hit=SFAPartitionInputs(
+            key=shared_key,
+            key_rope=shared_key_rope,
+            sparse_indices=inputs.hit.sparse_indices.clone(),
+            actual_kv_lengths=inputs.hit.actual_kv_lengths.clone(),
+            true_counts=inputs.hit.true_counts.clone(),
+        ),
+        miss=SFAPartitionInputs(
+            key=shared_key,
+            key_rope=shared_key_rope,
+            sparse_indices=inputs.miss.sparse_indices.clone(),
+            actual_kv_lengths=inputs.miss.actual_kv_lengths.clone(),
+            true_counts=inputs.miss.true_counts.clone(),
+        ),
+    )
+
+
+def _copy_noncompact_split_inputs(
+    destination: SplitSFAInputs, source: SplitSFAInputs
+) -> None:
+    destination.query.copy_(source.query)
+    destination.query_rope.copy_(source.query_rope)
+    destination.actual_query_lengths.copy_(source.actual_query_lengths)
+    destination.hit.key.copy_(source.hit.key)
+    destination.hit.key_rope.copy_(source.hit.key_rope)
+    for destination_partition, source_partition in (
+        (destination.hit, source.hit),
+        (destination.miss, source.miss),
+    ):
+        destination_partition.sparse_indices.copy_(source_partition.sparse_indices)
+        destination_partition.actual_kv_lengths.copy_(
+            source_partition.actual_kv_lengths
+        )
+        destination_partition.true_counts.copy_(source_partition.true_counts)
+
+
 def _make_prefetch_compact_case(
     *,
     hit_counts: tuple[int, ...],
@@ -3090,6 +3219,176 @@ def test_real_prefetch_dual_stream_refill_slot_map_survives_npugraph() -> None:
                             f"{type(cleanup_error).__name__}: {cleanup_error}",
                             file=sys.stderr,
                         )
+
+
+@pytest.mark.skipif(
+    torch_npu is None or not hasattr(torch, "npu") or not torch.npu.is_available(),
+    reason="torch_npu and an Ascend NPU are required",
+)
+def test_noncompact_sparse_indices_survive_npugraph() -> None:
+    """Prove that SFA can select scattered rows without physically compacting KV."""
+
+    device_index = 0
+    torch.npu.set_device(device_index)
+    device = torch.device(f"npu:{device_index}")
+    dtype = torch.bfloat16
+    batch_size = 2
+    num_heads = 16
+    capacity = 2048
+    scale = 1.0 / math.sqrt(128 + 64)
+    output_atol = 2e-2
+    output_rtol = 2e-2
+    runtime = _runtime_description(device_index)
+
+    print(runtime)
+    print(
+        "noncompact split graph: "
+        f"dtype={dtype} batch={batch_size} heads={num_heads} "
+        f"capacity={capacity} scale={scale:.8f}"
+    )
+
+    capture_case = _make_noncompact_split_case(
+        hit_counts=(1024, 1536),
+        capacity=capacity,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026082700,
+    )
+    replay_case_a = _make_noncompact_split_case(
+        hit_counts=(2048, 0),
+        capacity=capacity,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026082701,
+    )
+    replay_case_b = _make_noncompact_split_case(
+        hit_counts=(257, 1791),
+        capacity=capacity,
+        num_heads=num_heads,
+        dtype=dtype,
+        device=device,
+        seed=2026082702,
+    )
+
+    def eager_reference(case: SplitSFACase, stage: str) -> AttentionState:
+        try:
+            union_state = _run_sfa(case.union, scale)
+            split_state = _run_split_sfa(case.split, scale)
+            torch.npu.synchronize()
+        except Exception as error:
+            raise AssertionError(
+                f"{stage}: noncompact SFA failed in eager mode; {runtime}; "
+                f"original error: {type(error).__name__}: {error}"
+            ) from error
+
+        _validate_contract(union_state, case.union, stage=f"{stage} union")
+        _validate_contract(split_state, case.union, stage=f"{stage} split")
+        union_state = _clone_state(union_state)
+        split_state = _clone_state(split_state)
+        _assert_matches(
+            split_state,
+            union_state,
+            output_atol=output_atol,
+            output_rtol=output_rtol,
+            stage=f"{stage} noncompact split vs union",
+        )
+        return split_state
+
+    eager_a = eager_reference(replay_case_a, "replay A")
+    eager_b = eager_reference(replay_case_b, "replay B")
+    assert (
+        _max_abs_error(eager_a.output, eager_b.output) > 1e-3
+    ), "noncompact replay cases are not distinct enough to detect frozen output"
+
+    static_inputs = _clone_noncompact_split_inputs(capture_case.split)
+    assert static_inputs.hit.key.data_ptr() == static_inputs.miss.key.data_ptr()
+    assert (
+        static_inputs.hit.key_rope.data_ptr() == static_inputs.miss.key_rope.data_ptr()
+    )
+    graph_output = torch.empty_like(static_inputs.query)
+    stats_shape = _expected_stats_shape(capture_case.union)
+    graph_softmax_max = torch.empty(stats_shape, dtype=torch.float32, device=device)
+    graph_softmax_sum = torch.empty_like(graph_softmax_max)
+
+    def run_once() -> None:
+        state = _run_split_sfa(static_inputs, scale)
+        graph_output.copy_(state.output)
+        graph_softmax_max.copy_(state.softmax_max)
+        graph_softmax_sum.copy_(state.softmax_sum)
+
+    graph = None
+    try:
+        capture_stream = torch.npu.Stream()
+        graph_pool = torch.npu.graph_pool_handle()
+        graph = torch.npu.NPUGraph()
+        capture_stream.wait_stream(torch.npu.current_stream())
+        with torch.npu.stream(capture_stream):
+            run_once()
+            run_once()
+        torch.npu.synchronize()
+        with torch.npu.graph(
+            graph, pool=graph_pool, stream=capture_stream, auto_dispatch_capture=True,
+        ):
+            run_once()
+        torch.npu.synchronize()
+    except Exception as error:
+        raise AssertionError(
+            "Could not capture two SFA calls over shared noncompact KV; "
+            f"{runtime}; original error: {type(error).__name__}: {error}"
+        ) from error
+
+    input_pointers = tuple(tensor.data_ptr() for tensor in static_inputs.tensors())
+    output_pointers = (
+        graph_output.data_ptr(),
+        graph_softmax_max.data_ptr(),
+        graph_softmax_sum.data_ptr(),
+    )
+
+    def replay(case: SplitSFACase, stage: str) -> AttentionState:
+        _copy_noncompact_split_inputs(static_inputs, case.split)
+        graph_output.fill_(float("nan"))
+        graph_softmax_max.fill_(float("nan"))
+        graph_softmax_sum.fill_(float("nan"))
+        torch.npu.synchronize()
+        graph.replay()
+        torch.npu.synchronize()
+
+        assert tuple(tensor.data_ptr() for tensor in static_inputs.tensors()) == (
+            input_pointers
+        ), f"{stage}: a static input address changed"
+        assert (
+            graph_output.data_ptr(),
+            graph_softmax_max.data_ptr(),
+            graph_softmax_sum.data_ptr(),
+        ) == output_pointers, f"{stage}: a static output address changed"
+        state = _clone_state(
+            AttentionState(graph_output, graph_softmax_max, graph_softmax_sum)
+        )
+        _validate_contract(state, case.union, stage=stage)
+        return state
+
+    graph_a = replay(replay_case_a, "noncompact graph replay A")
+    graph_b = replay(replay_case_b, "noncompact graph replay B")
+    _assert_matches(
+        graph_a,
+        eager_a,
+        output_atol=output_atol,
+        output_rtol=output_rtol,
+        stage="noncompact graph replay A",
+    )
+    _assert_matches(
+        graph_b,
+        eager_b,
+        output_atol=output_atol,
+        output_rtol=output_rtol,
+        stage="noncompact graph replay B",
+    )
+    assert (
+        _max_abs_error(graph_a.output, graph_b.output) > 1e-3
+    ), "NPUGraph did not refresh the noncompact sparse selection"
+    print("PASSED: scattered sparse indices select shared noncompact KV in NPUGraph")
 
 
 if __name__ == "__main__":

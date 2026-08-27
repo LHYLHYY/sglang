@@ -20,6 +20,7 @@ for _ in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.sparsity_driven_kv_offload",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sglang.srt.speculative",
@@ -41,9 +42,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import (
     attention as sparse_kv_attention,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
-    _SfaPartitionState,
     _merge_decode_sfa_partitions,
     _select_split_decode_mode,
+    _SfaPartitionState,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_COMBINED,
@@ -51,12 +52,16 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     SPARSE_KV_MERGE_IMPL_AUTO,
     SPARSE_KV_MERGE_IMPL_ENV_VAR,
     SPARSE_KV_MERGE_IMPL_FUSED,
     SPARSE_KV_MERGE_IMPL_PYTHON,
     get_sparse_kv_attn_impl,
     get_sparse_kv_merge_impl,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
+    _assign_miss_cache_slots,
 )
 
 
@@ -71,6 +76,10 @@ class TestSparseKVAttentionImplementation(unittest.TestCase):
             ("  SPLIT_EAGER  ", SPARSE_KV_ATTN_IMPL_SPLIT_EAGER),
             ("  SPLIT_GRAPH  ", SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH),
             ("  SPLIT_GRAPH_DUAL  ", SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL),
+            (
+                "  SPLIT_GRAPH_DUAL_V2  ",
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+            ),
         )
         for value, expected in cases:
             with self.subTest(value=value), patch.dict(
@@ -93,12 +102,54 @@ class TestSparseKVAttentionImplementation(unittest.TestCase):
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH, True, "single_stream"),
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL, False, "parallel"),
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL, True, "dual_stream"),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2, False, "parallel"),
+            (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2, True, "dual_stream_v2"),
         )
         for attn_impl, graph_mode, expected in cases:
             with self.subTest(attn_impl=attn_impl, graph_mode=graph_mode):
                 self.assertEqual(
                     _select_split_decode_mode(attn_impl, graph_mode), expected
                 )
+
+
+class TestSparseKVCacheSlotPlanner(unittest.TestCase):
+    def test_misses_use_only_the_complement_of_hit_slots(self):
+        hit_valid = torch.tensor(
+            [
+                [True, False, True, False, True, False, False, False],
+                [False, False, False, False, False, False, False, False],
+                [True, True, True, True, True, True, True, True],
+            ]
+        )
+        miss_valid = torch.tensor(
+            [
+                [False, True, False, True, False, True, False, False],
+                [True, True, True, True, False, False, False, False],
+                [False, False, False, False, False, False, False, False],
+            ]
+        )
+        device_token_pos = torch.tensor(
+            [
+                [6, -1, 1, -1, 4, -1, -1, -1],
+                [-1, -1, -1, -1, -1, -1, -1, -1],
+                [7, 5, 3, 1, 6, 4, 2, 0],
+            ],
+            dtype=torch.int32,
+        )
+        miss_ranks = torch.cumsum(miss_valid.to(torch.int32), dim=1).to(
+            torch.int64
+        ) - 1
+
+        assigned = _assign_miss_cache_slots(
+            hit_valid, device_token_pos, miss_ranks, topk_len=8
+        )
+
+        self.assertEqual(assigned[0, miss_valid[0]].tolist(), [0, 2, 3])
+        self.assertEqual(assigned[1, miss_valid[1]].tolist(), [0, 1, 2, 3])
+        hit_slots = set(device_token_pos[0, hit_valid[0]].tolist())
+        miss_slots = set(assigned[0, miss_valid[0]].tolist())
+        self.assertTrue(hit_slots.isdisjoint(miss_slots))
+        self.assertEqual(len(miss_slots), int(miss_valid[0].sum()))
 
 
 class TestSparseKVAttentionMergeImplementation(unittest.TestCase):
@@ -268,27 +319,34 @@ class TestSparseKVDualGraphIntegration(unittest.TestCase):
             use_mla_backend=True,
         )
 
-        with (
-            patch.dict(sys.modules, {manager_module_name: fake_manager_module}),
-            patch.object(backend_module.torch, "tensor", return_value=MagicMock()),
-            patch.object(
-                backend_module, "AscendTorchNativeAttnBackend", return_value=MagicMock()
-            ),
-            patch.object(
-                backend_module,
-                "is_sparsity_driven_kv_offload_enabled",
-                return_value=True,
-            ),
-            patch.object(
-                backend_module,
-                "get_sparse_kv_attn_impl",
-                return_value=SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
-            ),
+        for attn_impl in (
+            SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+            SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
         ):
-            with self.assertRaisesRegex(RuntimeError, "does not support PDMux"):
-                AscendAttnBackend(model_runner)
+            with (
+                self.subTest(attn_impl=attn_impl),
+                patch.dict(sys.modules, {manager_module_name: fake_manager_module}),
+                patch.object(backend_module.torch, "tensor", return_value=MagicMock()),
+                patch.object(
+                    backend_module,
+                    "AscendTorchNativeAttnBackend",
+                    return_value=MagicMock(),
+                ),
+                patch.object(
+                    backend_module,
+                    "is_sparsity_driven_kv_offload_enabled",
+                    return_value=True,
+                ),
+                patch.object(
+                    backend_module,
+                    "get_sparse_kv_attn_impl",
+                    return_value=attn_impl,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "do not support PDMux"):
+                    AscendAttnBackend(model_runner)
 
-        manager_constructor.assert_not_called()
+            manager_constructor.assert_not_called()
 
     def test_dual_graph_metadata_registers_main_and_miss_streams(self):
         backend_module = sys.modules[AscendAttnBackend.__module__]
@@ -338,6 +396,59 @@ class TestSparseKVDualGraphIntegration(unittest.TestCase):
         self.assertEqual(
             register_stream.call_args_list,
             [call(main_stream, device), call(miss_stream, device)],
+        )
+
+    def test_dual_v2_graph_metadata_registers_main_and_miss_streams(self):
+        backend_module = sys.modules[AscendAttnBackend.__module__]
+        register_stream = MagicMock(name="register_npu_host_callback_stream")
+        host_callback_module_name = (
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
+            "host_callback"
+        )
+        main_stream = object()
+        miss_stream = object()
+        backend = object.__new__(AscendAttnBackend)
+        backend.enable_sparsity_driven_kv_offload = True
+        backend.device = torch.device("cpu")
+        backend.sparse_kv_manager = SimpleNamespace(
+            attn_impl=SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+            _graph_dual_v2_state=SimpleNamespace(miss_stream=miss_stream),
+        )
+        backend.graph_metadata = {"block_tables": torch.empty((2, 4))}
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.speculative_num_draft_tokens = None
+        backend.q_head_num_padding = None
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = False
+        forward_mode.is_draft_extend_v2.return_value = False
+        forward_mode.is_dllm_extend.return_value = False
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    host_callback_module_name: SimpleNamespace(
+                        register_npu_host_callback_stream=register_stream
+                    )
+                },
+            ),
+            patch.object(
+                backend_module.torch,
+                "npu",
+                SimpleNamespace(current_stream=MagicMock(return_value=main_stream)),
+                create=True,
+            ),
+        ):
+            backend._init_cuda_graph_metadata(
+                bs=2,
+                forward_mode=forward_mode,
+                seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+            )
+
+        self.assertEqual(
+            register_stream.call_args_list,
+            [call(main_stream, backend.device), call(miss_stream, backend.device)],
         )
 
 

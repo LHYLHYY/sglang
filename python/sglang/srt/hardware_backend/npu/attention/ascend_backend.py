@@ -21,6 +21,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     get_sparse_kv_attn_impl,
     is_sparsity_driven_kv_offload_enabled,
 )
@@ -348,10 +349,14 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.enable_sparsity_driven_kv_offload
             and self.enable_pdmux
-            and get_sparse_kv_attn_impl() == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL
+            and get_sparse_kv_attn_impl()
+            in (
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+            )
         ):
             raise RuntimeError(
-                "Sparse KV split_graph_dual does not support PDMux: its fixed "
+                "Sparse KV graph-dual modes do not support PDMux: their fixed "
                 "workspace and Events require serialized graph replay."
             )
         self.sparse_kv_manager = None
@@ -589,14 +594,24 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.enable_sparsity_driven_kv_offload
             and self.sparse_kv_manager is not None
-            and self.sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL
+            and self.sparse_kv_manager.attn_impl
+            in (
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+            )
         ):
             if self.enable_pdmux:
                 raise RuntimeError(
-                    "Sparse KV split_graph_dual does not support PDMux: its "
+                    "Sparse KV graph-dual modes do not support PDMux: their "
                     "fixed workspace and Events require serialized graph replay."
                 )
-            self.sparse_kv_manager.prepare_graph_dual_state(max_bs)
+            if (
+                self.sparse_kv_manager.attn_impl
+                == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2
+            ):
+                self.sparse_kv_manager.prepare_graph_dual_v2_state(max_bs)
+            else:
+                self.sparse_kv_manager.prepare_graph_dual_state(max_bs)
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -664,13 +679,22 @@ class AscendAttnBackend(AttentionBackend):
             if (
                 self.sparse_kv_manager is not None
                 and self.sparse_kv_manager.attn_impl
-                == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL
-                and self.sparse_kv_manager._graph_dual_state is not None
-            ):
-                register_npu_host_callback_stream(
-                    self.sparse_kv_manager._graph_dual_state.miss_stream,
-                    self.device,
+                in (
+                    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+                    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
                 )
+            ):
+                graph_state = (
+                    self.sparse_kv_manager._graph_dual_v2_state
+                    if self.sparse_kv_manager.attn_impl
+                    == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2
+                    else self.sparse_kv_manager._graph_dual_state
+                )
+                if graph_state is not None:
+                    register_npu_host_callback_stream(
+                        graph_state.miss_stream,
+                        self.device,
+                    )
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
