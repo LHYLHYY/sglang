@@ -158,6 +158,11 @@ class SparseKVGraphDualV2State:
     miss_valid_mask: torch.Tensor
     slot_map_flat_indices: torch.Tensor
     slot_map_slot_values: torch.Tensor
+    tile_hit_counts: torch.Tensor
+    tile_miss_counts: torch.Tensor
+    tile_hit_offsets: torch.Tensor
+    tile_miss_offsets: torch.Tensor
+    selected_slots: torch.Tensor
     miss_stream: torch.npu.Stream
     layer_events: list[SparseKVGraphDualV2LayerEvents]
 
@@ -423,7 +428,10 @@ class SparseKVCacheManager:
         required_ops = (
             ("unidex_split_copy_inplace", "unidex_split_copy"),
             ("unidex_split_copy_promote_inplace", "unidex_split_copy_promote"),
-            ("sparse_kv_partition_plan_inplace", "sparse_kv_partition_plan"),
+            (
+                "sparse_kv_partition_plan_parallel_inplace",
+                "sparse_kv_partition_plan_parallel",
+            ),
         )
         for python_symbol, native_schema in required_ops:
             if not hasattr(sparse_kv_ops, python_symbol) or not hasattr(
@@ -502,6 +510,16 @@ class SparseKVCacheManager:
             slot_map_slot_values = torch.empty(
                 plan_shape, dtype=torch.int32, device=self.device
             )
+            tile_shape = (max_batch_size, self.sparse_context_len // 64)
+            tile_hit_counts = torch.empty(
+                tile_shape, dtype=torch.int32, device=self.device
+            )
+            tile_miss_counts = torch.empty_like(tile_hit_counts)
+            tile_hit_offsets = torch.empty_like(tile_hit_counts)
+            tile_miss_offsets = torch.empty_like(tile_hit_counts)
+            selected_slots = torch.empty(
+                plan_shape, dtype=torch.int32, device=self.device
+            )
             miss_stream = torch.npu.Stream()
             layer_events = [
                 SparseKVGraphDualV2LayerEvents(
@@ -535,6 +553,11 @@ class SparseKVCacheManager:
             miss_valid_mask=miss_valid_mask,
             slot_map_flat_indices=slot_map_flat_indices,
             slot_map_slot_values=slot_map_slot_values,
+            tile_hit_counts=tile_hit_counts,
+            tile_miss_counts=tile_miss_counts,
+            tile_hit_offsets=tile_hit_offsets,
+            tile_miss_offsets=tile_miss_offsets,
+            selected_slots=selected_slots,
             miss_stream=miss_stream,
             layer_events=layer_events,
         )
@@ -557,6 +580,11 @@ class SparseKVCacheManager:
                     miss_valid_mask,
                     slot_map_flat_indices,
                     slot_map_slot_values,
+                    tile_hit_counts,
+                    tile_miss_counts,
+                    tile_hit_offsets,
+                    tile_miss_offsets,
+                    selected_slots,
                 )
             )
         )
@@ -1507,9 +1535,10 @@ class SparseKVCacheManager:
         Hit rows keep their existing hot-cache slots. Miss rows are copied once
         from registered Host memory into both the shared SFA buffers and free
         hot-cache slots. Only the sparse-index lists are compacted; the KV rows
-        remain at their original Top-K positions in the shared buffers. A fused
-        partition planner replaces the former cumsum/scatter/gather operator
-        chain and writes all fixed-address copy and publication descriptors.
+        remain at their original Top-K positions in the shared buffers. A
+        three-kernel planner classifies 64-entry tiles in parallel, scans the
+        32 tile counts per request, and scatters stable compact prefixes before
+        writing the fixed-address copy and publication descriptors.
         """
 
         state = self._graph_dual_v2_state
@@ -1616,9 +1645,9 @@ class SparseKVCacheManager:
             slot_map_slot_values = state.slot_map_slot_values[:batch_size]
 
             plan_range = _profile_push(
-                "sparse_kv_prefetch_graph_dual_v2.partition_plan"
+                "sparse_kv_prefetch_graph_dual_v2.partition_plan_parallel"
             )
-            sparse_kv_ops.sparse_kv_partition_plan_inplace(
+            sparse_kv_ops.sparse_kv_partition_plan_parallel_inplace(
                 token_on_device,
                 device_token_pos,
                 topk_indices_int32,
@@ -1636,6 +1665,11 @@ class SparseKVCacheManager:
                 miss_valid_flat,
                 slot_map_flat_indices,
                 slot_map_slot_values,
+                state.tile_hit_counts[:batch_size],
+                state.tile_miss_counts[:batch_size],
+                state.tile_hit_offsets[:batch_size],
+                state.tile_miss_offsets[:batch_size],
+                state.selected_slots[:batch_size],
                 self.max_context_len,
                 self._slot_map_width,
             )
