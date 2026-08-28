@@ -163,6 +163,9 @@ class SparseKVGraphDualV2State:
     tile_hit_offsets: torch.Tensor
     tile_miss_offsets: torch.Tensor
     selected_slots: torch.Tensor
+    tile_occupied_bitmaps: torch.Tensor
+    occupied_bitmaps: torch.Tensor
+    free_slot_prefixes: torch.Tensor
     miss_stream: torch.npu.Stream
     layer_events: list[SparseKVGraphDualV2LayerEvents]
 
@@ -520,6 +523,22 @@ class SparseKVCacheManager:
             selected_slots = torch.empty(
                 plan_shape, dtype=torch.int32, device=self.device
             )
+            bitmap_words = self.sparse_context_len // 32
+            tile_occupied_bitmaps = torch.empty(
+                (
+                    max_batch_size,
+                    self.sparse_context_len // 64,
+                    bitmap_words,
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            occupied_bitmaps = torch.empty(
+                (max_batch_size, bitmap_words),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            free_slot_prefixes = torch.empty_like(occupied_bitmaps)
             miss_stream = torch.npu.Stream()
             layer_events = [
                 SparseKVGraphDualV2LayerEvents(
@@ -558,6 +577,9 @@ class SparseKVCacheManager:
             tile_hit_offsets=tile_hit_offsets,
             tile_miss_offsets=tile_miss_offsets,
             selected_slots=selected_slots,
+            tile_occupied_bitmaps=tile_occupied_bitmaps,
+            occupied_bitmaps=occupied_bitmaps,
+            free_slot_prefixes=free_slot_prefixes,
             miss_stream=miss_stream,
             layer_events=layer_events,
         )
@@ -585,6 +607,9 @@ class SparseKVCacheManager:
                     tile_hit_offsets,
                     tile_miss_offsets,
                     selected_slots,
+                    tile_occupied_bitmaps,
+                    occupied_bitmaps,
+                    free_slot_prefixes,
                 )
             )
         )
@@ -1670,6 +1695,9 @@ class SparseKVCacheManager:
                 state.tile_hit_offsets[:batch_size],
                 state.tile_miss_offsets[:batch_size],
                 state.selected_slots[:batch_size],
+                state.tile_occupied_bitmaps[:batch_size],
+                state.occupied_bitmaps[:batch_size],
+                state.free_slot_prefixes[:batch_size],
                 self.max_context_len,
                 self._slot_map_width,
             )
