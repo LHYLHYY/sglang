@@ -137,7 +137,6 @@ class SparseKVIndexedPartition:
 class SparseKVGraphDualV2LayerEvents:
     inputs_ready: torch.npu.Event
     miss_copy_done: torch.npu.Event
-    miss_attention_done: torch.npu.Event
 
 
 @dataclass
@@ -544,7 +543,6 @@ class SparseKVCacheManager:
                 SparseKVGraphDualV2LayerEvents(
                     inputs_ready=torch.npu.Event(),
                     miss_copy_done=torch.npu.Event(),
-                    miss_attention_done=torch.npu.Event(),
                 )
                 for _ in range(self.layer_num)
             ]
@@ -1785,11 +1783,10 @@ class SparseKVCacheManager:
     def publish_graph_dual_v2_slot_map(
         self, ticket: SparseKVGraphDualV2Prefetch, stream: torch.npu.Stream
     ) -> None:
-        """Publish the new residency map after all miss KV rows are resident."""
+        """Publish the new residency map after the caller joins miss copy."""
 
         profile_range = _profile_push("sparse_kv_graph_dual_v2.slot_map_publish")
         with torch.npu.stream(stream):
-            _wait_stream_event(stream, ticket.events.miss_copy_done)
             slot_map = self.device_slot_map[ticket.layer_idx]
             slot_map.index_fill_(0, ticket.slot_map_row_indices, -1)
             slot_map.view(-1).scatter_(
