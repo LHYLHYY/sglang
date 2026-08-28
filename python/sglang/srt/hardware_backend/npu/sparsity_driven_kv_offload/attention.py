@@ -534,9 +534,10 @@ def _run_split_decode_attention_graph_dual_v2(
     scale_value: float,
     stream,
 ) -> torch.Tensor:
-    """Overlap Host miss copy with hit SFA, then serialize both SFA calls."""
+    """Overlap miss H2D with hit SFA and serialize both SFA calls."""
 
     with torch.npu.stream(stream):
+        _wait_stream_event(stream, ticket.events.hit_copy_done)
         with torch.profiler.record_function(
             "sparse_kv_split_graph_dual_v2.hit_attention"
         ):
@@ -546,11 +547,13 @@ def _run_split_decode_attention_graph_dual_v2(
                 query_rope=query_rope,
                 scale_value=scale_value,
             )
+        _record_stream_event(stream, ticket.events.hit_attention_done)
 
-        # The miss copy/promote was launched on the worker stream before hit
-        # attention.  Join it only after hit attention so H2D can remain hidden,
-        # while the two SFA calls cannot contend with each other.
-        _wait_stream_event(stream, ticket.events.miss_copy_done)
+    with torch.npu.stream(ticket.miss.stream):
+        # Hit D2D and miss H2D were already enqueued on this worker stream.
+        # Waiting here lets miss H2D overlap hit SFA, while preventing the two
+        # SFA calls from using compute resources at the same time.
+        _wait_stream_event(ticket.miss.stream, ticket.events.hit_attention_done)
         with torch.profiler.record_function(
             "sparse_kv_split_graph_dual_v2.miss_attention"
         ):
@@ -560,15 +563,24 @@ def _run_split_decode_attention_graph_dual_v2(
                 query_rope=query_rope,
                 scale_value=scale_value,
             )
+        _record_stream_event(ticket.miss.stream, ticket.events.miss_attention_done)
 
+    with torch.npu.stream(stream):
+        _wait_stream_event(stream, ticket.events.miss_attention_done)
+        for tensor in (
+            miss_state.output,
+            miss_state.softmax_max,
+            miss_state.softmax_sum,
+            miss_state.true_counts,
+        ):
+            tensor.record_stream(stream)
         with torch.profiler.record_function("sparse_kv_split_graph_dual_v2.merge"):
             merged = _merge_decode_sfa_partitions(
                 hit_state, miss_state, manager.merge_impl
             )
 
-        # The current attention no longer consumes the residency map.  Publish
-        # it after both SFA calls so index_fill/scatter cannot contend with them;
-        # same-stream ordering makes it visible before the next layer/replay.
+        # Publish after both SFA calls so index_fill/scatter cannot contend with
+        # attention; same-stream ordering makes the map visible next replay.
         manager.publish_graph_dual_v2_slot_map(ticket, stream)
         return merged
 

@@ -5,6 +5,7 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 import os
 import sys
 import unittest
+from contextlib import nullcontext
 from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -292,6 +293,106 @@ class TestSparseKVAttentionMergeImplementation(unittest.TestCase):
 
 
 class TestSparseKVDualGraphIntegration(unittest.TestCase):
+    def test_dual_v2_overlaps_miss_copy_but_serializes_sfa(self):
+        call_order = []
+        main_stream = object()
+        miss_stream = object()
+        events = SimpleNamespace(
+            hit_copy_done=object(),
+            hit_attention_done=object(),
+            miss_attention_done=object(),
+        )
+        hit_partition = SimpleNamespace(name="hit")
+        miss_partition = SimpleNamespace(name="miss", stream=miss_stream)
+        ticket = SimpleNamespace(
+            hit=hit_partition,
+            miss=miss_partition,
+            events=events,
+        )
+
+        def make_state(name):
+            return SimpleNamespace(
+                output=MagicMock(name=f"{name}_output"),
+                softmax_max=MagicMock(name=f"{name}_max"),
+                softmax_sum=MagicMock(name=f"{name}_sum"),
+                true_counts=MagicMock(name=f"{name}_counts"),
+            )
+
+        states = {"hit": make_state("hit"), "miss": make_state("miss")}
+        merged = object()
+        manager = SimpleNamespace(
+            merge_impl="fused",
+            publish_graph_dual_v2_slot_map=lambda _ticket, _stream: call_order.append(
+                ("publish", _stream)
+            ),
+        )
+
+        def run_partition(partition, **_kwargs):
+            call_order.append(("sfa", partition.name))
+            return states[partition.name]
+
+        with (
+            patch.object(
+                sparse_kv_attention.torch,
+                "npu",
+                SimpleNamespace(stream=lambda _stream: nullcontext()),
+                create=True,
+            ),
+            patch.object(
+                sparse_kv_attention.torch.profiler,
+                "record_function",
+                side_effect=lambda _name: nullcontext(),
+            ),
+            patch.object(
+                sparse_kv_attention,
+                "_wait_stream_event",
+                side_effect=lambda stream, event: call_order.append(
+                    ("wait", stream, event)
+                ),
+            ),
+            patch.object(
+                sparse_kv_attention,
+                "_record_stream_event",
+                side_effect=lambda stream, event: call_order.append(
+                    ("record", stream, event)
+                ),
+            ),
+            patch.object(
+                sparse_kv_attention,
+                "_run_decode_sfa_indexed_partition",
+                side_effect=run_partition,
+            ),
+            patch.object(
+                sparse_kv_attention,
+                "_merge_decode_sfa_partitions",
+                side_effect=lambda *_args: call_order.append(("merge",)) or merged,
+            ),
+        ):
+            result = sparse_kv_attention._run_split_decode_attention_graph_dual_v2(
+                ticket,
+                manager,
+                query=MagicMock(),
+                query_rope=MagicMock(),
+                scale_value=1.0,
+                stream=main_stream,
+            )
+
+        self.assertIs(result, merged)
+        self.assertEqual(
+            call_order,
+            [
+                ("wait", main_stream, events.hit_copy_done),
+                ("sfa", "hit"),
+                ("record", main_stream, events.hit_attention_done),
+                ("wait", miss_stream, events.hit_attention_done),
+                ("sfa", "miss"),
+                ("record", miss_stream, events.miss_attention_done),
+                ("wait", main_stream, events.miss_attention_done),
+                ("merge",),
+                ("publish", main_stream),
+            ],
+        )
+
     def test_pdmux_rejected_before_sparse_manager_construction(self):
         backend_module = sys.modules[AscendAttnBackend.__module__]
         manager_constructor = MagicMock(name="SparseKVCacheManager")
