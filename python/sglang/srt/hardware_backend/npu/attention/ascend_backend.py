@@ -20,6 +20,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_ATTN_IMPL_PA_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     get_sparse_kv_attn_impl,
@@ -353,11 +354,12 @@ class AscendAttnBackend(AttentionBackend):
             in (
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+                SPARSE_KV_ATTN_IMPL_PA_GRAPH,
             )
         ):
             raise RuntimeError(
-                "Sparse KV graph-dual modes do not support PDMux: their fixed "
-                "workspace and Events require serialized graph replay."
+                "Sparse KV split/PA graph modes do not support PDMux: their "
+                "fixed workspace requires serialized graph replay."
             )
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
@@ -598,18 +600,23 @@ class AscendAttnBackend(AttentionBackend):
             in (
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+                SPARSE_KV_ATTN_IMPL_PA_GRAPH,
             )
         ):
             if self.enable_pdmux:
                 raise RuntimeError(
-                    "Sparse KV graph-dual modes do not support PDMux: their "
-                    "fixed workspace and Events require serialized graph replay."
+                    "Sparse KV split/PA graph modes do not support PDMux: their "
+                    "fixed workspace requires serialized graph replay."
                 )
             if (
                 self.sparse_kv_manager.attn_impl
                 == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2
             ):
                 self.sparse_kv_manager.prepare_graph_dual_v2_state(max_bs)
+            elif (
+                self.sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_PA_GRAPH
+            ):
+                self.sparse_kv_manager.prepare_pa_state(max_bs)
             else:
                 self.sparse_kv_manager.prepare_graph_dual_state(max_bs)
         total_context_len = self.max_context_len + self.page_size - 1
@@ -682,14 +689,21 @@ class AscendAttnBackend(AttentionBackend):
                 in (
                     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
                     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+                    SPARSE_KV_ATTN_IMPL_PA_GRAPH,
                 )
             ):
-                graph_state = (
-                    self.sparse_kv_manager._graph_dual_v2_state
-                    if self.sparse_kv_manager.attn_impl
+                if (
+                    self.sparse_kv_manager.attn_impl
                     == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2
-                    else self.sparse_kv_manager._graph_dual_state
-                )
+                ):
+                    graph_state = self.sparse_kv_manager._graph_dual_v2_state
+                elif (
+                    self.sparse_kv_manager.attn_impl
+                    == SPARSE_KV_ATTN_IMPL_PA_GRAPH
+                ):
+                    graph_state = self.sparse_kv_manager._pa_state
+                else:
+                    graph_state = self.sparse_kv_manager._graph_dual_state
                 if graph_state is not None:
                     register_npu_host_callback_stream(
                         graph_state.miss_stream,

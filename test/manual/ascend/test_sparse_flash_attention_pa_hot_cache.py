@@ -11,6 +11,8 @@ the same selected KV rows:
 The paged cache uses nontrivial request IDs, randomly scattered physical slots,
 and unrelated data in every unselected slot.  The test therefore fails if the
 operator ignores either the block table or the physical sparse indices.
+It also splits those physical indices into hit/miss partitions and verifies
+that PA_BSND softmax statistics reconstruct the single-call union output.
 
 Run on the target Ascend host with:
 
@@ -57,7 +59,37 @@ def _run_sfa(
     layout_kv: str,
     block_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    output, _, _ = torch_npu.npu_sparse_flash_attention(
+    output, _, _ = _run_sfa_state(
+        query=query,
+        key=key,
+        query_rope=query_rope,
+        key_rope=key_rope,
+        sparse_indices=sparse_indices,
+        actual_query_lengths=actual_query_lengths,
+        actual_kv_lengths=actual_kv_lengths,
+        scale=scale,
+        layout_kv=layout_kv,
+        block_table=block_table,
+        return_softmax_lse=False,
+    )
+    return output
+
+
+def _run_sfa_state(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_rope: torch.Tensor,
+    key_rope: torch.Tensor,
+    sparse_indices: torch.Tensor,
+    actual_query_lengths: torch.Tensor,
+    actual_kv_lengths: torch.Tensor,
+    scale: float,
+    layout_kv: str,
+    block_table: torch.Tensor | None = None,
+    return_softmax_lse: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    return torch_npu.npu_sparse_flash_attention(
         query=query,
         key=key,
         value=key,
@@ -73,9 +105,27 @@ def _run_sfa(
         layout_kv=layout_kv,
         sparse_mode=0,
         attention_mode=2,
-        return_softmax_lse=False,
+        return_softmax_lse=return_softmax_lse,
     )
-    return output
+
+
+def _merge_sfa_states(
+    hit_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    miss_state: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    hit_output, hit_max, hit_sum = hit_state
+    miss_output, miss_max, miss_sum = miss_state
+    global_max = torch.maximum(hit_max.float(), miss_max.float())
+    hit_mass = hit_sum.float() * torch.exp(hit_max.float() - global_max)
+    miss_mass = miss_sum.float() * torch.exp(miss_max.float() - global_max)
+    denominator = (hit_mass + miss_mass).clamp_min(
+        torch.finfo(torch.float32).tiny
+    )
+    hit_weight = (hit_mass / denominator).permute(0, 2, 3, 1)
+    miss_weight = (miss_mass / denominator).permute(0, 2, 3, 1)
+    return (
+        hit_output.float() * hit_weight + miss_output.float() * miss_weight
+    ).to(hit_output.dtype)
 
 
 @pytest.mark.skipif(
@@ -254,6 +304,66 @@ def test_pa_bsnd_hot_cache_matches_bsnd_selected_kv() -> None:
         ),
     )
     print("PASSED: PA_BSND SFA reads scattered physical hot slots without D2D")
+
+    hit_indices = torch.full_like(physical_indices, -1)
+    miss_indices = torch.full_like(physical_indices, -1)
+    for batch_index, selected_count in enumerate(selected_counts):
+        hit_count = selected_count * 3 // 4
+        miss_count = selected_count - hit_count
+        hit_indices[batch_index, 0, 0, :hit_count].copy_(
+            physical_indices[batch_index, 0, 0, :hit_count]
+        )
+        miss_indices[batch_index, 0, 0, :miss_count].copy_(
+            physical_indices[
+                batch_index, 0, 0, hit_count : hit_count + miss_count
+            ]
+        )
+
+    hit_state = _run_sfa_state(
+        query=query,
+        key=paged_key,
+        query_rope=query_rope,
+        key_rope=paged_key_rope,
+        sparse_indices=hit_indices,
+        actual_query_lengths=actual_query_lengths,
+        actual_kv_lengths=actual_kv_lengths,
+        scale=scale,
+        layout_kv="PA_BSND",
+        block_table=block_table,
+    )
+    miss_state = _run_sfa_state(
+        query=query,
+        key=paged_key,
+        query_rope=query_rope,
+        key_rope=paged_key_rope,
+        sparse_indices=miss_indices,
+        actual_query_lengths=actual_query_lengths,
+        actual_kv_lengths=actual_kv_lengths,
+        scale=scale,
+        layout_kv="PA_BSND",
+        block_table=block_table,
+    )
+    assert all(value is not None for value in hit_state[1:])
+    assert all(value is not None for value in miss_state[1:])
+    split_output = _merge_sfa_states(hit_state, miss_state)
+    split_max_abs_error = (
+        split_output.float() - paged_output.float()
+    ).abs().max().item()
+    print(
+        "PA_BSND split hit/miss merge: "
+        f"max_abs_error={split_max_abs_error:.4e}"
+    )
+    torch.testing.assert_close(
+        split_output.float().cpu(),
+        paged_output.float().cpu(),
+        atol=output_atol,
+        rtol=output_rtol,
+        msg=(
+            "two PA_BSND SFA partitions plus online-softmax merge differ from "
+            "the union PA_BSND result"
+        ),
+    )
+    print("PASSED: split PA-SFA statistics merge matches union PA-SFA")
 
 
 if __name__ == "__main__":

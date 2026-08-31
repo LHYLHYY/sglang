@@ -43,12 +43,15 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import (
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
     _merge_decode_sfa_partitions,
+    _run_decode_sfa_pa_partition,
+    _run_split_decode_attention_pa_hot_cache,
     _select_split_decode_mode,
     _SfaPartitionState,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_COMBINED,
     SPARSE_KV_ATTN_IMPL_ENV_VAR,
+    SPARSE_KV_ATTN_IMPL_PA_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
@@ -80,6 +83,7 @@ class TestSparseKVAttentionImplementation(unittest.TestCase):
                 "  SPLIT_GRAPH_DUAL_V2  ",
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
             ),
+            ("  PA_GRAPH  ", SPARSE_KV_ATTN_IMPL_PA_GRAPH),
         )
         for value, expected in cases:
             with self.subTest(value=value), patch.dict(
@@ -104,6 +108,8 @@ class TestSparseKVAttentionImplementation(unittest.TestCase):
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL, True, "dual_stream"),
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2, False, "parallel"),
             (SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2, True, "dual_stream_v2"),
+            (SPARSE_KV_ATTN_IMPL_PA_GRAPH, False, "pa_hot_cache"),
+            (SPARSE_KV_ATTN_IMPL_PA_GRAPH, True, "pa_hot_cache"),
         )
         for attn_impl, graph_mode, expected in cases:
             with self.subTest(attn_impl=attn_impl, graph_mode=graph_mode):
@@ -150,6 +156,129 @@ class TestSparseKVCacheSlotPlanner(unittest.TestCase):
         miss_slots = set(assigned[0, miss_valid[0]].tolist())
         self.assertTrue(hit_slots.isdisjoint(miss_slots))
         self.assertEqual(len(miss_slots), int(miss_valid[0].sum()))
+
+
+class TestSparseKVPAHotCacheAttention(unittest.TestCase):
+    def test_pa_partition_sfa_returns_merge_statistics(self):
+        query = torch.randn(2, 1, 4, 512, dtype=torch.bfloat16)
+        query_rope = torch.randn(2, 1, 4, 64, dtype=torch.bfloat16)
+        key = torch.randn(4, 1024, 1, 512, dtype=torch.bfloat16)
+        key_rope = torch.randn(4, 1024, 1, 64, dtype=torch.bfloat16)
+        sparse_indices = torch.randint(0, 2048, (2, 1, 1, 2048))
+        block_table = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32)
+        actual_seq_lengths_query = torch.ones(2, dtype=torch.int32)
+        actual_seq_lengths_kv = torch.tensor([2048, 2048], dtype=torch.int32)
+        true_counts = torch.tensor([1024, 1536], dtype=torch.int32)
+        partition = SimpleNamespace(
+            key=key,
+            key_rope=key_rope,
+            sparse_indices=sparse_indices,
+            block_table=block_table,
+            actual_seq_lengths_query=actual_seq_lengths_query,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            true_counts=true_counts,
+        )
+        expected_output = torch.empty_like(query)
+        expected_max = torch.empty(2, 1, 1, 4, dtype=torch.float32)
+        expected_sum = torch.empty_like(expected_max)
+        sparse_flash_attention = MagicMock(
+            return_value=(expected_output, expected_max, expected_sum)
+        )
+
+        with patch.object(
+            sparse_kv_attention.torch_npu,
+            "npu_sparse_flash_attention",
+            sparse_flash_attention,
+        ):
+            actual = _run_decode_sfa_pa_partition(
+                partition,
+                query=query,
+                query_rope=query_rope,
+                scale_value=0.125,
+            )
+
+        self.assertIs(actual.output, expected_output)
+        self.assertIs(actual.softmax_max, expected_max)
+        self.assertIs(actual.softmax_sum, expected_sum)
+        self.assertIs(actual.true_counts, true_counts)
+        sparse_flash_attention.assert_called_once()
+        kwargs = sparse_flash_attention.call_args.kwargs
+        self.assertIs(kwargs["key"], key)
+        self.assertIs(kwargs["value"], key)
+        self.assertIs(kwargs["key_rope"], key_rope)
+        self.assertIs(kwargs["sparse_indices"], sparse_indices)
+        self.assertIs(kwargs["block_table"], block_table)
+        self.assertIs(kwargs["actual_seq_lengths_query"], actual_seq_lengths_query)
+        self.assertIs(kwargs["actual_seq_lengths_kv"], actual_seq_lengths_kv)
+        self.assertEqual(kwargs["layout_query"], "BSND")
+        self.assertEqual(kwargs["layout_kv"], "PA_BSND")
+        self.assertEqual(kwargs["sparse_block_size"], 1)
+        self.assertEqual(kwargs["attention_mode"], 2)
+        self.assertTrue(kwargs["return_softmax_lse"])
+
+    def test_pa_schedule_serializes_sfa_around_h2d_wait(self):
+        execution_order = []
+        hit_partition = object()
+        miss_partition = object()
+        hit_state = object()
+        miss_state = object()
+        expected = torch.empty(1)
+        ticket = SimpleNamespace(hit=hit_partition, miss=miss_partition)
+        stream = object()
+
+        def run_partition(partition, **_kwargs):
+            execution_order.append(
+                "hit_sfa" if partition is hit_partition else "miss_sfa"
+            )
+            return hit_state if partition is hit_partition else miss_state
+
+        manager = SimpleNamespace(merge_impl="fused")
+
+        def publish(_ticket, _stream):
+            execution_order.append("wait_h2d_and_publish")
+
+        manager.publish_pa_slot_map = publish
+
+        def merge(actual_hit, actual_miss, merge_impl):
+            self.assertIs(actual_hit, hit_state)
+            self.assertIs(actual_miss, miss_state)
+            self.assertEqual(merge_impl, "fused")
+            execution_order.append("merge")
+            return expected
+
+        stream_context = MagicMock()
+        with (
+            patch.object(
+                sparse_kv_attention.torch,
+                "npu",
+                SimpleNamespace(stream=stream_context),
+                create=True,
+            ),
+            patch.object(
+                sparse_kv_attention,
+                "_run_decode_sfa_pa_partition",
+                side_effect=run_partition,
+            ),
+            patch.object(
+                sparse_kv_attention,
+                "_merge_decode_sfa_partitions",
+                side_effect=merge,
+            ),
+        ):
+            actual = _run_split_decode_attention_pa_hot_cache(
+                ticket,
+                manager,
+                query=torch.empty(1),
+                query_rope=torch.empty(1),
+                scale_value=0.125,
+                stream=stream,
+            )
+
+        self.assertIs(actual, expected)
+        self.assertEqual(
+            execution_order,
+            ["hit_sfa", "wait_h2d_and_publish", "miss_sfa", "merge"],
+        )
 
 
 class TestSparseKVAttentionMergeImplementation(unittest.TestCase):
@@ -322,6 +451,7 @@ class TestSparseKVDualGraphIntegration(unittest.TestCase):
         for attn_impl in (
             SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
             SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+            SPARSE_KV_ATTN_IMPL_PA_GRAPH,
         ):
             with (
                 self.subTest(attn_impl=attn_impl),
@@ -413,6 +543,59 @@ class TestSparseKVDualGraphIntegration(unittest.TestCase):
         backend.sparse_kv_manager = SimpleNamespace(
             attn_impl=SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
             _graph_dual_v2_state=SimpleNamespace(miss_stream=miss_stream),
+        )
+        backend.graph_metadata = {"block_tables": torch.empty((2, 4))}
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.speculative_num_draft_tokens = None
+        backend.q_head_num_padding = None
+        forward_mode = MagicMock()
+        forward_mode.is_target_verify.return_value = False
+        forward_mode.is_draft_extend_v2.return_value = False
+        forward_mode.is_dllm_extend.return_value = False
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    host_callback_module_name: SimpleNamespace(
+                        register_npu_host_callback_stream=register_stream
+                    )
+                },
+            ),
+            patch.object(
+                backend_module.torch,
+                "npu",
+                SimpleNamespace(current_stream=MagicMock(return_value=main_stream)),
+                create=True,
+            ),
+        ):
+            backend._init_cuda_graph_metadata(
+                bs=2,
+                forward_mode=forward_mode,
+                seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+            )
+
+        self.assertEqual(
+            register_stream.call_args_list,
+            [call(main_stream, backend.device), call(miss_stream, backend.device)],
+        )
+
+    def test_pa_graph_metadata_registers_main_and_h2d_streams(self):
+        backend_module = sys.modules[AscendAttnBackend.__module__]
+        register_stream = MagicMock(name="register_npu_host_callback_stream")
+        host_callback_module_name = (
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload."
+            "host_callback"
+        )
+        main_stream = object()
+        miss_stream = object()
+        backend = object.__new__(AscendAttnBackend)
+        backend.enable_sparsity_driven_kv_offload = True
+        backend.device = torch.device("cpu")
+        backend.sparse_kv_manager = SimpleNamespace(
+            attn_impl=SPARSE_KV_ATTN_IMPL_PA_GRAPH,
+            _pa_state=SimpleNamespace(miss_stream=miss_stream),
         )
         backend.graph_metadata = {"block_tables": torch.empty((2, 4))}
         backend.is_hybrid_swa = False
