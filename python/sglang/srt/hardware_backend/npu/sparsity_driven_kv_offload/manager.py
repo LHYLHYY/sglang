@@ -136,18 +136,15 @@ class SparseKVIndexedPartition:
 @dataclass
 class SparseKVGraphDualV2LayerEvents:
     inputs_ready: torch.npu.Event
-    hit_copy_done: torch.npu.Event
-    hit_attention_done: torch.npu.Event
+    miss_copy_done: torch.npu.Event
     miss_attention_done: torch.npu.Event
 
 
 @dataclass
 class SparseKVGraphDualV2State:
     max_batch_size: int
-    hit_k_nope: torch.Tensor
-    hit_k_rope: torch.Tensor
-    miss_k_nope: torch.Tensor
-    miss_k_rope: torch.Tensor
+    selected_k_nope: torch.Tensor
+    selected_k_rope: torch.Tensor
     attention_dst_indices: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
     hit_sparse_indices: torch.Tensor
@@ -478,16 +475,10 @@ class SparseKVCacheManager:
             self.qk_rope_head_dim,
         )
         try:
-            hit_k_nope = torch.zeros(
+            selected_k_nope = torch.zeros(
                 nope_shape, dtype=self.store_dtype, device=self.device
             )
-            hit_k_rope = torch.zeros(
-                rope_shape, dtype=self.store_dtype, device=self.device
-            )
-            miss_k_nope = torch.zeros(
-                nope_shape, dtype=self.store_dtype, device=self.device
-            )
-            miss_k_rope = torch.zeros(
+            selected_k_rope = torch.zeros(
                 rope_shape, dtype=self.store_dtype, device=self.device
             )
             plan_shape = (max_batch_size, self.sparse_context_len)
@@ -552,8 +543,7 @@ class SparseKVCacheManager:
             layer_events = [
                 SparseKVGraphDualV2LayerEvents(
                     inputs_ready=torch.npu.Event(),
-                    hit_copy_done=torch.npu.Event(),
-                    hit_attention_done=torch.npu.Event(),
+                    miss_copy_done=torch.npu.Event(),
                     miss_attention_done=torch.npu.Event(),
                 )
                 for _ in range(self.layer_num)
@@ -567,10 +557,8 @@ class SparseKVCacheManager:
 
         self._graph_dual_v2_state = SparseKVGraphDualV2State(
             max_batch_size=max_batch_size,
-            hit_k_nope=hit_k_nope,
-            hit_k_rope=hit_k_rope,
-            miss_k_nope=miss_k_nope,
-            miss_k_rope=miss_k_rope,
+            selected_k_nope=selected_k_nope,
+            selected_k_rope=selected_k_rope,
             attention_dst_indices=attention_dst_indices,
             actual_seq_lengths_kv=actual_seq_lengths_kv,
             hit_sparse_indices=hit_sparse_indices,
@@ -596,15 +584,8 @@ class SparseKVCacheManager:
             layer_events=layer_events,
         )
         workspace_bytes = (
-            sum(
-                tensor.numel() * tensor.element_size()
-                for tensor in (
-                    hit_k_nope,
-                    hit_k_rope,
-                    miss_k_nope,
-                    miss_k_rope,
-                )
-            )
+            (selected_k_nope.numel() + selected_k_rope.numel())
+            * selected_k_nope.element_size()
             + sum(
                 tensor.numel() * tensor.element_size()
                 for tensor in (
@@ -1577,11 +1558,9 @@ class SparseKVCacheManager:
         """Prepare noncompact hit/miss SFA inputs with two KV copy kernels.
 
         Hit rows keep their existing hot-cache slots. Miss rows are copied once
-        from registered Host memory into both the miss SFA buffers and free
-        hot-cache slots. Hit and miss use separate fixed-address workspaces so
-        miss H2D writes can overlap hit SFA reads without tensor aliasing. Only
-        the sparse-index lists are compacted; the KV rows remain at their
-        original Top-K positions in their respective buffers. A
+        from registered Host memory into both the shared SFA buffers and free
+        hot-cache slots. Only the sparse-index lists are compacted; the KV rows
+        remain at their original Top-K positions in the shared buffers. A
         three-kernel planner classifies 64-entry tiles in parallel, scans the
         32 tile counts per request, and scatters stable compact prefixes before
         writing the fixed-address copy and publication descriptors.
@@ -1734,39 +1713,19 @@ class SparseKVCacheManager:
             miss_actual_lengths = hit_actual_lengths
             attention_dst_indices = state.attention_dst_indices[:plan_size]
 
-            hit_k_nope = state.hit_k_nope[:batch_size]
-            hit_k_rope = state.hit_k_rope[:batch_size]
-            miss_k_nope = state.miss_k_nope[:batch_size]
-            miss_k_rope = state.miss_k_rope[:batch_size]
+            selected_k_nope = state.selected_k_nope[:batch_size]
+            selected_k_rope = state.selected_k_rope[:batch_size]
             _record_stream_event(stream, events.inputs_ready)
 
+        miss_copy_range = _profile_push(
+            "sparse_kv_prefetch_graph_dual_v2.h2d_miss_copy_promote"
+        )
         with torch.npu.stream(state.miss_stream):
             _wait_stream_event(state.miss_stream, events.inputs_ready)
-
-            hit_copy_range = _profile_push(
-                "sparse_kv_prefetch_graph_dual_v2.d2d_hit_split_copy"
-            )
-            sparse_kv_ops.unidex_split_copy_inplace(
-                self.device_kv_buffer[layer_idx],
-                hit_k_nope,
-                hit_k_rope,
-                hit_src_indices,
-                attention_dst_indices,
-                hit_valid_flat,
-                2,
-                2,
-                block_dim=24,
-            )
-            _profile_pop(hit_copy_range)
-            _record_stream_event(state.miss_stream, events.hit_copy_done)
-
-            miss_copy_range = _profile_push(
-                "sparse_kv_prefetch_graph_dual_v2.h2d_miss_copy_promote"
-            )
             sparse_kv_ops.unidex_split_copy_promote_inplace(
                 self.host_kv_buffer[layer_idx],
-                miss_k_nope,
-                miss_k_rope,
+                selected_k_nope,
+                selected_k_rope,
                 self.device_kv_buffer[layer_idx],
                 miss_src_indices,
                 attention_dst_indices,
@@ -1778,21 +1737,39 @@ class SparseKVCacheManager:
                 block_dim=24,
                 src_ptr=self.dev_ptr_list[layer_idx],
             )
-            _profile_pop(miss_copy_range)
+            _record_stream_event(state.miss_stream, events.miss_copy_done)
+        _profile_pop(miss_copy_range)
+
+        hit_copy_range = _profile_push(
+            "sparse_kv_prefetch_graph_dual_v2.d2d_hit_split_copy"
+        )
+        with torch.npu.stream(stream):
+            sparse_kv_ops.unidex_split_copy_inplace(
+                self.device_kv_buffer[layer_idx],
+                selected_k_nope,
+                selected_k_rope,
+                hit_src_indices,
+                attention_dst_indices,
+                hit_valid_flat,
+                2,
+                2,
+                block_dim=24,
+            )
+        _profile_pop(hit_copy_range)
         _profile_pop(profile_range)
 
         return SparseKVGraphDualV2Prefetch(
             hit=SparseKVIndexedPartition(
-                key=hit_k_nope,
-                key_rope=hit_k_rope,
+                key=selected_k_nope,
+                key_rope=selected_k_rope,
                 sparse_indices=hit_sparse_indices,
                 actual_seq_lengths_kv=hit_actual_lengths,
                 true_counts=hit_counts,
                 stream=stream,
             ),
             miss=SparseKVIndexedPartition(
-                key=miss_k_nope,
-                key_rope=miss_k_rope,
+                key=selected_k_nope,
+                key_rope=selected_k_rope,
                 sparse_indices=miss_sparse_indices,
                 actual_seq_lengths_kv=miss_actual_lengths,
                 true_counts=miss_counts,
@@ -1808,10 +1785,11 @@ class SparseKVCacheManager:
     def publish_graph_dual_v2_slot_map(
         self, ticket: SparseKVGraphDualV2Prefetch, stream: torch.npu.Stream
     ) -> None:
-        """Publish the new residency map after the caller joins miss SFA."""
+        """Publish the new residency map after all miss KV rows are resident."""
 
         profile_range = _profile_push("sparse_kv_graph_dual_v2.slot_map_publish")
         with torch.npu.stream(stream):
+            _wait_stream_event(stream, ticket.events.miss_copy_done)
             slot_map = self.device_slot_map[ticket.layer_idx]
             slot_map.index_fill_(0, ticket.slot_map_row_indices, -1)
             slot_map.view(-1).scatter_(
