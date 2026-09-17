@@ -506,15 +506,40 @@ For two eight-NPU nodes, retain the usual `--nnodes 2`, shared
 
 This mode requires Ascend attention for both prefill and decode. It rejects
 prefill/decode context parallelism, pipeline parallelism, two-batch overlap,
-DSA cache layer splitting, and prefill/decode disaggregation. Delayed QLoRA
+and DSA cache layer splitting. Delayed QLoRA
 all-gather, MLAPO, and FIA NZ are also incompatible with this implementation.
 The ordinary dynamic-quantization Linear path handles Q/O projections.
 Unsetting `SGLANG_NPU_USE_ASYM_MLA` restores symmetric attention.
+
+For PD disaggregation, use symmetric attention on the prefill server and
+asymmetric attention on the decode server, with
+`--disaggregation-transfer-backend ascend` on both. Keep the prefill server's
+existing parallelism: for example, P can use `--tp-size 16 --dp-size 4` while
+D uses `--tp-size 16 --dp-size 8`, both with `--enable-dp-attention`.
+Set the environment variable inside each role's launch branch so the prefill
+server does not inherit the decode setting:
+
+```bash
+# Before launching the prefill server:
+export SGLANG_NPU_USE_ASYM_MLA=0
+
+# Before launching the decode server:
+export SGLANG_NPU_USE_ASYM_MLA=1
+```
+
+Every symmetric prefill attention TP rank holds the complete latent, rope,
+and Indexer KV buffers. Ascend transfers all three groups to each decode
+rank, which consumes the buffers for its role. With prefill attention TP4
+and decode attention TP2, prefill local ranks 0 and 2 send to decode local
+ranks 0 and 1 respectively; prefill ranks 1 and 3 participate as dummy senders.
+Enabling asymmetric attention on the PD prefill server is rejected because
+those source ranks would no longer hold interchangeable complete caches.
 
 Run the CPU contract tests from the repository root with Python 3.10 or later:
 
 ```bash
 python test/registered/unit/models/test_npu_asymmetric_mla.py
+python test/registered/unit/disaggregation/test_npu_asymmetric_mla_transfer.py
 ```
 
 These tests do not validate NPU kernels or graph execution. Before measuring

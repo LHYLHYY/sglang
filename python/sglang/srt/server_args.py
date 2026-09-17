@@ -5604,6 +5604,25 @@ class ServerArgs:
         prefix = "SGLANG_NPU_USE_ASYM_MLA"
         if view.device != "npu":
             raise ValueError(f"{prefix} requires --device npu.")
+        # Symmetric prefill ranks hold complete MLA and indexer KV caches.
+        # Ascend transfers all three NPU buffer groups (latent, rope, indexer)
+        # to each decode rank; the asymmetric ranks consume their own subset.
+        # Keep prefill symmetric: its ranks are treated as interchangeable KV
+        # replicas by PD routing when prefill and decode attention TP differ.
+        if view.disaggregation_mode == "prefill":
+            raise ValueError(
+                f"{prefix} supports PD disaggregation on the decode server only. "
+                "Set SGLANG_NPU_USE_ASYM_MLA=0 on the prefill server so every "
+                "prefill attention TP rank has both MLA and indexer KV caches."
+            )
+        if (
+            view.disaggregation_mode == "decode"
+            and view.disaggregation_transfer_backend != "ascend"
+        ):
+            raise ValueError(
+                f"{prefix} requires --disaggregation-transfer-backend ascend "
+                "for PD disaggregation."
+            )
         from sglang.srt.configs.model_config import is_deepseek_dsa
 
         hf_config = self.get_model_config().hf_config
@@ -5641,11 +5660,6 @@ class ServerArgs:
             raise ValueError(
                 f"{prefix} does not support two-batch overlap: "
                 "TopK indices must be propagated between layers."
-            )
-        if view.disaggregation_mode != "null":
-            raise ValueError(
-                f"{prefix} does not support prefill/decode disaggregation: "
-                "KV transfer must account for the indexer and compute roles."
             )
         for name, enabled in (
             ("SGLANG_USE_AG_AFTER_QLORA", envs.SGLANG_USE_AG_AFTER_QLORA.get()),

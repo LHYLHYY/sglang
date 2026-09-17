@@ -410,6 +410,7 @@ class TestAsymmetricMLAConfiguration(unittest.TestCase):
             enable_two_batch_overlap=False,
             enable_single_batch_overlap=False,
             disaggregation_mode="null",
+            disaggregation_transfer_backend="ascend",
             attention_backend="ascend",
             prefill_attention_backend="ascend",
             decode_attention_backend="ascend",
@@ -428,6 +429,30 @@ class TestAsymmetricMLAConfiguration(unittest.TestCase):
 
     def test_supported_configuration(self):
         self.make_args()._handle_npu_asymmetric_mla()
+
+    def test_ascend_pd_decode_is_supported(self):
+        self.make_args(disaggregation_mode="decode")._handle_npu_asymmetric_mla()
+
+    def test_pd_prefill_requires_symmetric_attention(self):
+        # The deployment uses P TP16/DP4 and D TP16/DP8. Diagnose an inherited
+        # asymmetric flag on P before reporting its different attention TP.
+        with self.assertRaisesRegex(ValueError, "SGLANG_NPU_USE_ASYM_MLA=0"):
+            self.make_args(
+                disaggregation_mode="prefill", dp_size=4
+            )._handle_npu_asymmetric_mla()
+        self.make_args(
+            enabled=False, disaggregation_mode="prefill", dp_size=4
+        )._handle_npu_asymmetric_mla()
+
+    def test_pd_decode_requires_ascend_transfer(self):
+        for backend in ("mooncake", "nixl", "fake"):
+            with self.subTest(backend=backend), self.assertRaisesRegex(
+                ValueError, "--disaggregation-transfer-backend ascend"
+            ):
+                self.make_args(
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend=backend,
+                )._handle_npu_asymmetric_mla()
 
     def test_incompatible_configurations_fail_early(self):
         cases = (
