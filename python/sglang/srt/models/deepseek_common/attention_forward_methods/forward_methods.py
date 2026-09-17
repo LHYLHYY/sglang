@@ -30,3 +30,6 @@ class AttnForwardMethod(IntEnum):
 
     # Use Deepseek V3.2 sparse multi-latent attention for NPU
     DSA_NPU = auto()
+
+    # Indexer and full-head attention on separate members of an NPU TP2 pair.
+    DSA_NPU_ASYM = auto()

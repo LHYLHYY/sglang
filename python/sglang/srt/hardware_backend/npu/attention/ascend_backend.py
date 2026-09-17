@@ -10,8 +10,9 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
     AscendTorchNativeAttnBackend,
 )
@@ -358,9 +359,15 @@ class AscendAttnBackend(AttentionBackend):
         self.padding_size_list = [1, 2, 4, 8, 16, 32, 64, 128]
         self.q_head_num_padding = None
         if hasattr(model_runner.model_config, "num_attention_heads") and self.use_mla:
+            attn_tp_size = get_parallel().attn_tp_size
+            use_asym_mla = envs.SGLANG_NPU_USE_ASYM_MLA.get() and is_deepseek_dsa(
+                model_runner.model_config.hf_config
+            )
+            if use_asym_mla and attn_tp_size != 2:
+                raise ValueError("Asymmetric MLA requires attention TP size 2.")
             self.tp_q_head_num = (
                 model_runner.model_config.num_attention_heads
-                // get_parallel().attn_tp_size
+                // (1 if use_asym_mla else attn_tp_size)
             )
             for num in self.padding_size_list:
                 if num >= self.tp_q_head_num:

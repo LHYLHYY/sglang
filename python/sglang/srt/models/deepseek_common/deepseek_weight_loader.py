@@ -149,6 +149,23 @@ class DeepseekV2WeightLoaderMixin:
     pp_group: GroupCoordinator
     num_fused_shared_experts: int
 
+    def _is_missing_asym_dsa_attention_weight(
+        self, name: str, params_dict: Dict[str, torch.nn.Parameter]
+    ) -> bool:
+        """Ignore all parameters of projections owned by the other TP2 role."""
+        if not envs.SGLANG_NPU_USE_ASYM_MLA.get() or name in params_dict:
+            return False
+        layer_prefix, separator, parameter_name = name.partition(".self_attn.")
+        if not separator:
+            return False
+        projection = parameter_name.split(".", 1)[0]
+        if projection not in ("indexer", "q_b_proj", "kv_b_proj", "o_proj"):
+            return False
+        self_attn = self.get_submodule(layer_prefix + ".self_attn")
+        return getattr(self_attn, "is_asym_dsa_npu", False) and not hasattr(
+            self_attn, projection
+        )
+
     def do_load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
@@ -255,6 +272,9 @@ class DeepseekV2WeightLoaderMixin:
                                     continue
 
                 if "rotary_emb.inv_freq" in name:
+                    continue
+
+                if self._is_missing_asym_dsa_attention_weight(name, params_dict):
                     continue
 
                 # CUDA fuses wk + weights_proj into one bf16 wk_weights_proj; the
@@ -506,6 +526,10 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+            if getattr(self_attn, "is_asym_dsa_npu", False) and not getattr(
+                self_attn, "is_asym_compute", False
+            ):
+                continue
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
@@ -630,6 +654,14 @@ class DeepseekV2WeightLoaderMixin:
             w_kc, w_vc = w.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            if (
+                getattr(self_attn, "is_asym_dsa_npu", False)
+                and w_kc.shape[0] != self_attn.num_heads
+            ):
+                raise ValueError(
+                    "Asymmetric DSA NPU compute rank must load all attention "
+                    f"heads, got {w_kc.shape[0]} instead of {self_attn.num_heads}"
+                )
 
             if (
                 _use_aiter_gfx95

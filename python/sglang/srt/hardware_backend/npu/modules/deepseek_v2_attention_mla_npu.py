@@ -2,6 +2,7 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
@@ -17,12 +18,39 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _normalize_asym_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    # DSA and IndexShare use [T, K]; Ascend attention adds the singleton head
+    # dimension at the kernel boundary. Also accept the older indexer layout.
+    if topk_indices.dim() == 3 and topk_indices.shape[1] == 1:
+        topk_indices = topk_indices.squeeze(1)
+    if topk_indices.dim() != 2:
+        raise ValueError(
+            "Asymmetric DSA NPU expects topk_indices with shape [T, K], "
+            f"got {tuple(topk_indices.shape)}"
+        )
+    return topk_indices.to(torch.int32).contiguous()
+
+
+def _all_reduce_asym_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
+    """Exchange newly computed TopK only within this DP worker's TP2 pair."""
+    group = get_parallel().attn_tp_group
+    if group.world_size != 2:
+        raise ValueError("Asymmetric DSA NPU requires attention TP2")
+    if topk_indices.dtype != torch.int32 or not topk_indices.is_contiguous():
+        raise ValueError("Asymmetric DSA NPU requires contiguous int32 TopK")
+    # The controller contributes indices and the compute rank contributes zeros.
+    # Reusing the device group avoids creating a group during graph capture.
+    dist.all_reduce(topk_indices, op=dist.ReduceOp.SUM, group=group.device_group)
+    return topk_indices
 
 
 # region MHA
@@ -503,6 +531,167 @@ def forward_dsa_core_npu(
         return output, None
     else:
         return output, topk_indices
+
+
+def forward_dsa_asym_prepare_npu(
+    m: "DeepseekV2AttentionMLA",
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    zero_allocator: "BumpAllocator",
+    layer_scatter_modes,
+    prev_topk_indices: torch.Tensor = None,
+):
+    # The regular model prepare path handles empty batches. Both ranks receive
+    # this DP worker's complete attention input, without delayed QLoRA gathering.
+    compute_topk = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
+    topk_indices = None
+    if not compute_topk:
+        if prev_topk_indices is None:
+            # Ordinary IndexShare layers may not have any indexer weights, so
+            # recomputing is not a valid fallback for missing previous indices.
+            raise ValueError(
+                f"Asymmetric DSA NPU layer {m.layer_id} requires previous TopK "
+                "indices for IndexShare"
+            )
+        topk_indices = _normalize_asym_topk_indices(prev_topk_indices)
+
+    if m.is_asym_controller:
+        if compute_topk:
+            fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+            q, _ = fused_qkv_a_proj_out.split(
+                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+            )
+            q_lora = m.q_a_layernorm(q)
+            topk_indices = m.indexer(
+                hidden_states,
+                q_lora,
+                positions,
+                forward_batch,
+                m.layer_id,
+                layer_scatter_modes,
+                None,
+            )
+            topk_indices = _normalize_asym_topk_indices(topk_indices)
+            topk_indices = _all_reduce_asym_topk_indices(topk_indices)
+        # Reused TopK is already present on both ranks: summing it again would
+        # double every index. Both ranks skip the collective on sharing layers.
+        return (
+            None,
+            None,
+            None,
+            None,
+            topk_indices,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            positions,
+        )
+
+    # Keep dynamic W8A8 projections on their ordinary Linear path. MLAPO's
+    # static quantization parameters are not available in GLM-5.2 W4A8 weights.
+    fused_qkv_a_proj_out = m.fused_qkv_a_proj_with_mqa(hidden_states)[0]
+    if m.rotary_emb.is_neox_style:
+        q, latent_cache = fused_qkv_a_proj_out.split(
+            [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+        )
+        q_lora = m.q_a_layernorm(q)
+        q_event = None
+        if m.alt_stream is not None:
+            m.alt_stream.wait_stream(torch.npu.current_stream())
+            with torch.npu.stream(m.alt_stream):
+                q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+                q.record_stream(m.alt_stream)
+                q_event = m.alt_stream.record_event()
+        else:
+            q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+
+        k_nope, k_pe = latent_cache.unsqueeze(1).split(
+            [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+        )
+        k_nope = m.kv_a_layernorm(k_nope)
+        if q_event is not None:
+            torch.npu.current_stream().wait_event(q_event)
+    else:
+        if fused_qkv_a_proj_out.shape[0] < 65535:
+            q_lora, k_nope, k_pe = fused_split_qk_norm(
+                fused_qkv_a_proj_out,
+                m.q_a_layernorm,
+                m.kv_a_layernorm,
+                m.q_lora_rank,
+                m.kv_lora_rank,
+                m.qk_rope_head_dim,
+                eps=m.q_a_layernorm.variance_epsilon,
+            )
+        else:
+            q, latent_cache = fused_qkv_a_proj_out.split(
+                [m.q_lora_rank, m.kv_lora_rank + m.qk_rope_head_dim], dim=-1
+            )
+            q_lora = m.q_a_layernorm(q)
+            k_nope, k_pe = latent_cache.unsqueeze(1).split(
+                [m.kv_lora_rank, m.qk_rope_head_dim], dim=-1
+            )
+            k_nope = m.kv_a_layernorm(k_nope)
+        q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
+
+    q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
+    q_nope_out = torch.bmm(q_nope.transpose(0, 1), m.w_kc).transpose(0, 1)
+    if m.layer_id == 0:
+        m.rotary_emb.sin_cos_cache = m.rotary_emb.cos_sin_cache.index_select(
+            0, positions
+        )
+    q_pe, k_pe = m.rotary_emb(positions, q_pe, k_pe)
+
+    if compute_topk:
+        topk_indices = torch.zeros(
+            (q_lora.shape[0], m.asym_index_topk),
+            dtype=torch.int32,
+            device=hidden_states.device,
+        )
+        topk_indices = _all_reduce_asym_topk_indices(topk_indices)
+
+    return (
+        q_pe,
+        k_pe,
+        q_nope_out,
+        k_nope,
+        topk_indices,
+        hidden_states,
+        forward_batch,
+        zero_allocator,
+        positions,
+    )
+
+
+def forward_dsa_asym_core_npu(
+    m: "DeepseekV2AttentionMLA",
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    q_nope_out: torch.Tensor,
+    k_nope: torch.Tensor,
+    topk_indices: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    zero_allocator: "BumpAllocator",
+    positions: torch.Tensor,
+):
+    if m.is_asym_controller:
+        # The existing attention output reduction combines this zero with the
+        # compute rank's full-head output before the shared FFN/MoE path.
+        output = hidden_states.new_zeros((hidden_states.shape[0], m.hidden_size))
+        return output, topk_indices if m.next_skip_topk else None
+
+    return forward_dsa_core_npu(
+        m,
+        q_pe,
+        k_pe,
+        q_nope_out,
+        k_nope,
+        topk_indices,
+        forward_batch,
+        zero_allocator,
+        positions,
+    )
 
 
 def npu_mla_preprocess(

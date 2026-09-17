@@ -63,6 +63,7 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.common import (
     LORA_TARGET_ALL_MODULES,
     SUPPORTED_LORA_TARGET_MODULES,
+    get_bool_env_var,
     get_device,
     get_device_memory_capacity,
     get_device_sm,
@@ -3002,6 +3003,7 @@ class ServerArgs:
         self._handle_hicache()
 
         # Handle data parallelism.
+        self._handle_npu_asymmetric_mla()
         self._handle_data_parallelism()
 
         # Normalize load balancing defaults.
@@ -3070,6 +3072,7 @@ class ServerArgs:
         # Model-capability adjustments that legacy code applied at model-load
         # time; last declarations of the resolution, mirroring that order.
         self._handle_model_capability_adjustments()
+        self._handle_npu_asymmetric_mla()
 
         # End of resolution: apply the accumulated declarations onto the
         # fields once (gate order). From here on server_args carries the
@@ -5591,6 +5594,66 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _handle_npu_asymmetric_mla(self):
+        """Validate asymmetric MLA before DP normalization and after resolution."""
+        if not envs.SGLANG_NPU_USE_ASYM_MLA.get():
+            return
+
+        view = self._resolved()
+        prefix = "SGLANG_NPU_USE_ASYM_MLA"
+        if view.device != "npu":
+            raise ValueError(f"{prefix} requires --device npu.")
+        from sglang.srt.configs.model_config import is_deepseek_dsa
+
+        hf_config = self.get_model_config().hf_config
+        if not is_deepseek_dsa(hf_config):
+            raise ValueError(f"{prefix} requires a DSA model with MLA attention.")
+        if (
+            view.tp_size != 16
+            or view.dp_size != 8
+            or not view.enable_dp_attention
+            or view.attn_cp_size != 1
+            or view.dcp_size != 1
+            or view.pp_size != 1
+        ):
+            raise ValueError(
+                f"{prefix} requires --tp-size 16 --dp-size 8 "
+                "--enable-dp-attention, with attention CP, decode CP, and PP "
+                "sizes all equal to 1."
+            )
+        if (
+            view.enable_prefill_cp
+            or view.cp_strategy is not None
+            or view.enable_prefill_context_parallel
+            or view.enable_dsa_prefill_context_parallel
+            or view.enable_dsa_cache_layer_split
+        ):
+            raise ValueError(
+                f"{prefix} does not support prefill context parallelism "
+                "or DSA cache layer splitting."
+            )
+        if self._resolved_attention_backends() != ("ascend", "ascend"):
+            raise ValueError(
+                f"{prefix} requires the ascend prefill and decode attention backends."
+            )
+        if view.enable_two_batch_overlap:
+            raise ValueError(
+                f"{prefix} does not support two-batch overlap: "
+                "TopK indices must be propagated between layers."
+            )
+        if view.disaggregation_mode != "null":
+            raise ValueError(
+                f"{prefix} does not support prefill/decode disaggregation: "
+                "KV transfer must account for the indexer and compute roles."
+            )
+        for name, enabled in (
+            ("SGLANG_USE_AG_AFTER_QLORA", envs.SGLANG_USE_AG_AFTER_QLORA.get()),
+            ("SGLANG_NPU_USE_MLAPO", envs.SGLANG_NPU_USE_MLAPO.get()),
+            ("SGLANG_USE_FIA_NZ", get_bool_env_var("SGLANG_USE_FIA_NZ")),
+        ):
+            if enabled:
+                raise ValueError(f"{prefix} does not support {name}.")
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline

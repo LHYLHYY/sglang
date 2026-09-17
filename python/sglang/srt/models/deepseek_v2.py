@@ -217,6 +217,8 @@ if _is_cuda:
     )
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
+        forward_dsa_asym_core_npu,
+        forward_dsa_asym_prepare_npu,
         forward_dsa_core_npu,
         forward_dsa_prepare_npu,
         forward_mha_core_npu,
@@ -1590,6 +1592,33 @@ class DeepseekV2AttentionMLA(
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
+        self.is_asym_dsa_npu = (
+            _is_npu and self.use_dsa and envs.SGLANG_NPU_USE_ASYM_MLA.get()
+        )
+        self.is_asym_controller = self.is_asym_dsa_npu and attn_tp_rank == 0
+        self.is_asym_compute = self.is_asym_dsa_npu and attn_tp_rank == 1
+        if self.is_asym_dsa_npu:
+            if attn_tp_size != 2 or q_lora_rank is None:
+                raise ValueError(
+                    "Asymmetric DSA NPU requires attention TP2 and q_lora_rank"
+                )
+            if dsa_enable_prefill_cp or mla_enable_prefill_cp:
+                raise ValueError("Asymmetric DSA NPU does not support prefill CP")
+            if envs.SGLANG_USE_AG_AFTER_QLORA.get():
+                raise ValueError(
+                    "Asymmetric DSA NPU requires SGLANG_USE_AG_AFTER_QLORA=0"
+                )
+            if reduce_results:
+                raise ValueError(
+                    "Asymmetric DSA NPU merges outputs through LayerCommunicator"
+                )
+            if layer_id == 0:
+                logger.info(
+                    "Asymmetric DSA NPU: attention ranks=%s, role=%s, heads=%s",
+                    get_parallel().attn_tp_group.ranks,
+                    "indexer" if self.is_asym_controller else "compute",
+                    num_heads,
+                )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
         if self.dsa_enable_prefill_cp:
@@ -1600,8 +1629,16 @@ class DeepseekV2AttentionMLA(
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
         self.num_heads = num_heads
-        assert num_heads % attn_tp_size == 0
-        self.num_local_heads = num_heads // attn_tp_size
+        if self.is_asym_dsa_npu:
+            self.num_local_heads = num_heads
+        else:
+            assert num_heads % attn_tp_size == 0
+            self.num_local_heads = num_heads // attn_tp_size
+        self.asym_index_topk = get_dsa_index_topk(config) if self.use_dsa else None
+        build_attention_projections = not self.is_asym_dsa_npu or self.is_asym_compute
+        # These projections own all heads; the real communication group stays TP2.
+        proj_tp_rank = 0 if self.is_asym_dsa_npu else attn_tp_rank
+        proj_tp_size = 1 if self.is_asym_dsa_npu else attn_tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1621,15 +1658,16 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-            self.q_b_proj = ColumnParallelLinear(
-                q_lora_rank,
-                self.num_heads * self.qk_head_dim,
-                bias=False,
-                quant_config=self._get_q_b_proj_quant_config(quant_config),
-                prefix=add_prefix("q_b_proj", prefix),
-                tp_rank=attn_tp_rank,
-                tp_size=attn_tp_size,
-            )
+            if build_attention_projections:
+                self.q_b_proj = ColumnParallelLinear(
+                    q_lora_rank,
+                    self.num_heads * self.qk_head_dim,
+                    bias=False,
+                    quant_config=self._get_q_b_proj_quant_config(quant_config),
+                    prefix=add_prefix("q_b_proj", prefix),
+                    tp_rank=proj_tp_rank,
+                    tp_size=proj_tp_size,
+                )
         else:
             self.q_proj = ColumnParallelLinear(
                 self.hidden_size,
@@ -1652,25 +1690,26 @@ class DeepseekV2AttentionMLA(
         self.next_skip_topk = None
         if self.use_dsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
-            self.indexer = Indexer(
-                hidden_size=hidden_size,
-                index_n_heads=get_dsa_index_n_heads(config),
-                index_head_dim=get_dsa_index_head_dim(config),
-                rope_head_dim=qk_rope_head_dim,
-                index_topk=get_dsa_index_topk(config),
-                q_lora_rank=q_lora_rank,
-                max_position_embeddings=max_position_embeddings,
-                rope_theta=rope_theta,
-                scale_fmt="ue8m0",
-                block_size=128,
-                rope_scaling=rope_scaling,
-                is_neox_style=is_neox_style,
-                prefix=add_prefix("indexer", prefix),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                alt_stream=alt_stream,
-                config=config,
-            )
+            if not self.is_asym_dsa_npu or self.is_asym_controller:
+                self.indexer = Indexer(
+                    hidden_size=hidden_size,
+                    index_n_heads=get_dsa_index_n_heads(config),
+                    index_head_dim=get_dsa_index_head_dim(config),
+                    rope_head_dim=qk_rope_head_dim,
+                    index_topk=get_dsa_index_topk(config),
+                    q_lora_rank=q_lora_rank,
+                    max_position_embeddings=max_position_embeddings,
+                    rope_theta=rope_theta,
+                    scale_fmt="ue8m0",
+                    block_size=128,
+                    rope_scaling=rope_scaling,
+                    is_neox_style=is_neox_style,
+                    prefix=add_prefix("indexer", prefix),
+                    quant_config=quant_config,
+                    layer_id=layer_id,
+                    alt_stream=alt_stream,
+                    config=config,
+                )
             # Refer: https://arxiv.org/abs/2603.12201 for more details.
             # skip_topk: when True, this layer will skip computation and reuse previous layer's topk indices.
             # next_skip_topk: when True, the next layer will skip computation and reuse this layer's topk indices.
@@ -1686,26 +1725,27 @@ class DeepseekV2AttentionMLA(
                     self.skip_topk = dsa_layer_skips_topk(config, layer_id)
                     self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
 
-        self.kv_b_proj = ColumnParallelLinear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("kv_b_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
-        # O projection.
-        self.o_proj = RowParallelLinear(
-            self.num_heads * self.v_head_dim,
-            self.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            prefix=add_prefix("o_proj", prefix),
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-        )
+        if build_attention_projections:
+            self.kv_b_proj = ColumnParallelLinear(
+                self.kv_lora_rank,
+                self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("kv_b_proj", prefix),
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
+            )
+            # O projection; LayerCommunicator merges the pair's outputs once.
+            self.o_proj = RowParallelLinear(
+                self.num_heads * self.v_head_dim,
+                self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                reduce_results=reduce_results,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=proj_tp_rank,
+                tp_size=proj_tp_size,
+            )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
         if not skip_rope:
@@ -1881,7 +1921,7 @@ class DeepseekV2AttentionMLA(
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        if self.attn_mha.kv_b_proj is None:
+        if self.attn_mha.kv_b_proj is None and hasattr(self, "kv_b_proj"):
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
@@ -1891,7 +1931,7 @@ class DeepseekV2AttentionMLA(
                 and hidden_states[0].shape[0] == 0
             ):
                 assert (
-                    not self.o_proj.reduce_results
+                    not hasattr(self, "o_proj") or not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states[0]
         else:
@@ -1900,7 +1940,7 @@ class DeepseekV2AttentionMLA(
                 and hidden_states.shape[0] == 0
             ):
                 assert (
-                    not self.o_proj.reduce_results
+                    not hasattr(self, "o_proj") or not self.o_proj.reduce_results
                 ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states, None, forward_batch, None
 
@@ -1962,6 +2002,16 @@ class DeepseekV2AttentionMLA(
                 layer_scatter_modes,
                 prev_topk_indices,
             )
+        elif attn_forward_method == AttnForwardMethod.DSA_NPU_ASYM:
+            inner_state = forward_dsa_asym_prepare_npu(
+                self,
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                layer_scatter_modes,
+                prev_topk_indices,
+            )
         else:
             raise NotImplementedError
         return None, attn_forward_method, forward_batch, inner_state
@@ -1991,6 +2041,8 @@ class DeepseekV2AttentionMLA(
             return forward_mla_core_npu(self, *inner_state)
         elif attn_forward_method == AttnForwardMethod.DSA_NPU:
             return forward_dsa_core_npu(self, *inner_state)
+        elif attn_forward_method == AttnForwardMethod.DSA_NPU_ASYM:
+            return forward_dsa_asym_core_npu(self, *inner_state)
         else:
             raise NotImplementedError
 

@@ -463,6 +463,74 @@ python3 -m sglang_router.launch_router \
 --port 6688
 ```
 
+## Asymmetric attention TP2 with DP8
+
+On 16 Ascend NPUs, `SGLANG_NPU_USE_ASYM_MLA=1` assigns different attention
+roles to the two members of each attention TP group. With global TP16 and
+attention DP8, the groups are `[0, 1]`, `[2, 3]`, through `[14, 15]`. Local
+rank 0 runs the Indexer; local rank 1 computes all 64 attention heads. Both
+members still participate in the existing dense FFN and MoE execution.
+
+The [Eco-Tech GLM-5.2-W4A8 checkpoint](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8)
+uses ModelSlim mixed precision: routed experts use `W4A8_DYNAMIC`, Q/O
+projections use `W8A8_DYNAMIC`, and `kv_b_proj` remains floating point.
+The compute member loads complete attention projections, including their
+scales and offsets. This increases attention projection memory per compute
+rank compared with symmetric TP2 head sharding.
+
+GLM-5.2 shares TopK across layers. Only producer layers run the Indexer and
+exchange indices within their pair; sharing layers reuse the indices already
+held by both members. The Indexer member contributes zero attention output,
+which the normal layer communicator combines with the compute output and
+residual. Do not broadcast attention output before that reduction.
+
+For an initial eager smoke test, add these settings to your validated
+GLM-5.2-W4A8 Ascend command, retaining its memory and MoE settings:
+
+```bash
+export SGLANG_NPU_USE_ASYM_MLA=1
+export SGLANG_USE_AG_AFTER_QLORA=0
+export SGLANG_NPU_USE_MLAPO=0
+export SGLANG_USE_FIA_NZ=0
+
+# Parallelism, backend, and quantization arguments:
+# --device npu --attention-backend ascend --quantization modelslim
+# --tp-size 16 --dp-size 8 --enable-dp-attention
+# --attn-cp-size 1 --dcp-size 1 --pp-size 1 --disable-cuda-graph
+```
+
+Do not set global `--tp-size 2`: the attention TP size is `16 / 8 = 2`.
+For two eight-NPU nodes, retain the usual `--nnodes 2`, shared
+`--dist-init-addr HOST:PORT`, and node ranks 0 and 1. DP attention divides
+`--chunked-prefill-size` by eight; for example, 65536 becomes 8192 per group.
+
+This mode requires Ascend attention for both prefill and decode. It rejects
+prefill/decode context parallelism, pipeline parallelism, two-batch overlap,
+DSA cache layer splitting, and prefill/decode disaggregation. Delayed QLoRA
+all-gather, MLAPO, and FIA NZ are also incompatible with this implementation.
+The ordinary dynamic-quantization Linear path handles Q/O projections.
+Unsetting `SGLANG_NPU_USE_ASYM_MLA` restores symmetric attention.
+
+Run the CPU contract tests from the repository root with Python 3.10 or later:
+
+```bash
+python test/registered/unit/models/test_npu_asymmetric_mla.py
+```
+
+These tests do not validate NPU kernels or graph execution. Before measuring
+performance, compare eager generation and accuracy with symmetric attention
+using the same checkpoint, then validate NPU graph capture and replay. Cover
+prefill, decode, prompts longer than `index_topk=2048`, unequal request lengths,
+chunked prefill, prefix-cache hits, and active/idle DP groups. Confirm that
+producer layers run the Indexer only on even ranks and attention only on odd
+ranks. Measure throughput and single-request latency separately.
+
+Validate NEXTN/MTP separately after the main-model smoke test. This checkpoint
+also quantizes its MTP layer, so do not copy
+`--speculative-draft-model-quantization unquant` from a different checkpoint's
+recipe. Preserve MTP TopK reuse and
+verify any rotation-weight configuration required by your draft model.
+
 ## Functional verification
 
 After the service is started, you can invoke the model by sending a prompt:

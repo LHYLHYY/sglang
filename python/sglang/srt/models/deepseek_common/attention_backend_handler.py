@@ -47,6 +47,8 @@ def _dispatch_mla_subtype(attn, forward_batch):
 
 
 def handle_attention_ascend(attn, forward_batch):
+    if getattr(attn, "is_asym_dsa_npu", False):
+        return AttnForwardMethod.DSA_NPU_ASYM
     if (
         forward_batch.forward_mode.is_extend()
         and not forward_batch.forward_mode.is_target_verify()
