@@ -85,9 +85,9 @@ class TestAsymmetricMLARankMapping(unittest.TestCase):
             class_name="CommonKVReceiver",
         )
 
-    def resolve(self, engine_rank, prefill_tp):
+    def resolve(self, engine_rank, prefill_tp, decode_tp=2):
         manager = self.namespace["CommonKVManager"]()
-        manager.attn_tp_size = 2
+        manager.attn_tp_size = decode_tp
         manager.attn_cp_size = manager.pp_size = 1
         manager.attn_cp_rank = manager.pp_rank = 0
         manager.is_mla_backend = True
@@ -171,6 +171,27 @@ class TestAsymmetricMLARankMapping(unittest.TestCase):
         self.assertEqual(receiver.bootstrap_infos, first_entries)
         self.assertEqual(receiver._get_bootstrap_info_from_server.call_count, 4)
         receiver._register_kv_args.assert_called_once()
+
+    def test_tp4_prefill_fans_out_to_all_tp16_decode_roles(self):
+        # 1+TP8 keeps a real TP16 group: even attention-idle ranks complete
+        # their PD handshake before participating in the shared FFN/MoE path.
+        destinations = {rank: [] for rank in range(4)}
+        for rank in range(16):
+            with self.subTest(decode_rank=rank):
+                manager, info = self.resolve(rank, prefill_tp=4, decode_tp=16)
+                receiver = self.bootstrap(manager, info, prefill_dp_rank=3)
+                self.assertEqual(info.target_tp_ranks, [rank // 4])
+                self.assertEqual(info.required_dst_info_num, 4)
+                self.assertEqual(info.required_prefill_response_num, 1)
+                self.assertEqual(len(receiver.bootstrap_infos), 1)
+                entry = receiver.bootstrap_infos[0]
+                self.assertFalse(entry["is_dummy"])
+                self.assertEqual(entry["dp_rank"], 3)
+                destinations[entry["tp_rank"]].append(rank)
+        self.assertEqual(
+            destinations,
+            {0: [0, 1, 2, 3], 1: [4, 5, 6, 7], 2: [8, 9, 10, 11], 3: [12, 13, 14, 15]},
+        )
 
 
 class Buffer:

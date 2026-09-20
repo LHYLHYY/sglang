@@ -5600,6 +5600,9 @@ class ServerArgs:
         if not envs.SGLANG_NPU_USE_ASYM_MLA.get():
             return
 
+        compute_tp_size = envs.SGLANG_NPU_ASYM_MLA_COMPUTE_TP.get()
+        if compute_tp_size not in (1, 8):
+            raise ValueError("SGLANG_NPU_ASYM_MLA_COMPUTE_TP must be 1 or 8.")
         view = self._resolved()
         prefix = "SGLANG_NPU_USE_ASYM_MLA"
         if view.device != "npu":
@@ -5628,17 +5631,20 @@ class ServerArgs:
         hf_config = self.get_model_config().hf_config
         if not is_deepseek_dsa(hf_config):
             raise ValueError(f"{prefix} requires a DSA model with MLA attention.")
+        expected_dp_size = 8 if compute_tp_size == 1 else 1
         if (
             view.tp_size != 16
-            or view.dp_size != 8
-            or not view.enable_dp_attention
+            or view.dp_size != expected_dp_size
+            or (compute_tp_size == 1 and not view.enable_dp_attention)
             or view.attn_cp_size != 1
             or view.dcp_size != 1
             or view.pp_size != 1
         ):
+            dp_attention_arg = " --enable-dp-attention" if compute_tp_size == 1 else ""
             raise ValueError(
-                f"{prefix} requires --tp-size 16 --dp-size 8 "
-                "--enable-dp-attention, with attention CP, decode CP, and PP "
+                f"{prefix} with SGLANG_NPU_ASYM_MLA_COMPUTE_TP={compute_tp_size} "
+                f"requires --tp-size 16 --dp-size {expected_dp_size}"
+                f"{dp_attention_arg}, with attention CP, decode CP, and PP "
                 "sizes all equal to 1."
             )
         if (

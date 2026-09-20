@@ -225,6 +225,7 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+        init_dsa_asym_topk_group_npu,
     )
 else:
     pass
@@ -1595,12 +1596,26 @@ class DeepseekV2AttentionMLA(
         self.is_asym_dsa_npu = (
             _is_npu and self.use_dsa and envs.SGLANG_NPU_USE_ASYM_MLA.get()
         )
+        self.asym_num_compute_ranks = (
+            envs.SGLANG_NPU_ASYM_MLA_COMPUTE_TP.get() if self.is_asym_dsa_npu else 1
+        )
         self.is_asym_controller = self.is_asym_dsa_npu and attn_tp_rank == 0
-        self.is_asym_compute = self.is_asym_dsa_npu and attn_tp_rank == 1
+        self.is_asym_compute = (
+            self.is_asym_dsa_npu and 1 <= attn_tp_rank <= self.asym_num_compute_ranks
+        )
+        self.is_asym_idle = self.is_asym_dsa_npu and not (
+            self.is_asym_controller or self.is_asym_compute
+        )
         if self.is_asym_dsa_npu:
-            if attn_tp_size != 2 or q_lora_rank is None:
+            expected_attn_tp = {1: 2, 8: 16}.get(self.asym_num_compute_ranks)
+            if attn_tp_size != expected_attn_tp or q_lora_rank is None:
                 raise ValueError(
-                    "Asymmetric DSA NPU requires attention TP2 and q_lora_rank"
+                    "Asymmetric DSA NPU requires q_lora_rank and either "
+                    "attention TP2 with compute TP1 or attention TP16 with compute TP8"
+                )
+            if num_heads % self.asym_num_compute_ranks:
+                raise ValueError(
+                    "Attention heads must be divisible by asymmetric compute TP"
                 )
             if dsa_enable_prefill_cp or mla_enable_prefill_cp:
                 raise ValueError("Asymmetric DSA NPU does not support prefill CP")
@@ -1612,12 +1627,23 @@ class DeepseekV2AttentionMLA(
                 raise ValueError(
                     "Asymmetric DSA NPU merges outputs through LayerCommunicator"
                 )
+            # Every rank enters during model initialization, including idle
+            # attention ranks. Never create process groups during graph capture.
+            init_dsa_asym_topk_group_npu()
             if layer_id == 0:
                 logger.info(
-                    "Asymmetric DSA NPU: attention ranks=%s, role=%s, heads=%s",
+                    "Asymmetric DSA NPU: attention ranks=%s, role=%s, "
+                    "compute_tp=%s, compute_heads=%s",
                     get_parallel().attn_tp_group.ranks,
-                    "indexer" if self.is_asym_controller else "compute",
-                    num_heads,
+                    (
+                        "indexer"
+                        if self.is_asym_controller
+                        else "compute" if self.is_asym_compute else "attention idle"
+                    ),
+                    self.asym_num_compute_ranks,
+                    num_heads // self.asym_num_compute_ranks
+                    if self.is_asym_compute
+                    else 0,
                 )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
@@ -1630,15 +1656,18 @@ class DeepseekV2AttentionMLA(
             self.cp_size = get_parallel().attn_cp_size
         self.num_heads = num_heads
         if self.is_asym_dsa_npu:
-            self.num_local_heads = num_heads
+            self.num_local_heads = num_heads // self.asym_num_compute_ranks
         else:
             assert num_heads % attn_tp_size == 0
             self.num_local_heads = num_heads // attn_tp_size
         self.asym_index_topk = get_dsa_index_topk(config) if self.use_dsa else None
         build_attention_projections = not self.is_asym_dsa_npu or self.is_asym_compute
-        # These projections own all heads; the real communication group stays TP2.
-        proj_tp_rank = 0 if self.is_asym_dsa_npu else attn_tp_rank
-        proj_tp_size = 1 if self.is_asym_dsa_npu else attn_tp_size
+        # Only compute ranks own head shards. The real attention group also
+        # includes the indexer and idle ranks, which contribute zero output.
+        proj_tp_rank = attn_tp_rank - 1 if self.is_asym_dsa_npu else attn_tp_rank
+        proj_tp_size = (
+            self.asym_num_compute_ranks if self.is_asym_dsa_npu else attn_tp_size
+        )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1735,7 +1764,7 @@ class DeepseekV2AttentionMLA(
                 tp_rank=proj_tp_rank,
                 tp_size=proj_tp_size,
             )
-            # O projection; LayerCommunicator merges the pair's outputs once.
+            # LayerCommunicator merges compute partials and zero outputs once.
             self.o_proj = RowParallelLinear(
                 self.num_heads * self.v_head_dim,
                 self.hidden_size,

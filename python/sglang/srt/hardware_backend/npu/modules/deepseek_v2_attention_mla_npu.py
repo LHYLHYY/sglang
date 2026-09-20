@@ -6,6 +6,7 @@ import torch.distributed as dist
 import torch_npu
 from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
 
+from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     NPUFusedMLAPreprocess,
@@ -40,16 +41,70 @@ def _normalize_asym_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices.to(torch.int32).contiguous()
 
 
+def init_dsa_asym_topk_group_npu():
+    """Initialize TopK communication on every rank during model construction.
+
+    A compute TP1 pair reuses its attention group. With compute TP8, only
+    attention ranks 0..8 exchange TopK; ranks 9..15 still join the ordinary
+    attention output reduction and FFN/MoE collectives.
+    """
+    attn_group = get_parallel().attn_tp_group
+    compute_tp = envs.SGLANG_NPU_ASYM_MLA_COMPUTE_TP.get()
+    expected_attn_tp = {1: 2, 8: 16}.get(compute_tp)
+    if expected_attn_tp is None or attn_group.world_size != expected_attn_tp:
+        raise ValueError(
+            "Asymmetric DSA NPU requires attention TP2 for compute TP1, "
+            "or attention TP16 for compute TP8"
+        )
+
+    # Scope the cache to the owning coordinator and its live device group,
+    # rather than a module global that could survive an engine reinitialization.
+    # Cache nonmembership too: idle ranks must not recreate the group per layer.
+    state = getattr(attn_group, "_dsa_asym_topk_state", None)
+    if state is not None and state[0] is attn_group.device_group:
+        if state[1] != compute_tp:
+            raise ValueError("Cannot change asymmetric compute TP on a live group")
+        return state[2]
+
+    if compute_tp == 1:
+        topk_group = attn_group.device_group
+    else:
+        # All world ranks call this helper in the same construction order.
+        # The utility orders subgroup creation consistently across DP groups.
+        topk_group = create_custom_parallel_group(
+            attn_group.ranks[: compute_tp + 1],
+            backend=dist.get_backend(attn_group.device_group),
+        )
+        if attn_group.rank_in_group > compute_tp:
+            topk_group = None
+    attn_group._dsa_asym_topk_state = (
+        attn_group.device_group,
+        compute_tp,
+        topk_group,
+    )
+    return topk_group
+
+
+def _get_dsa_asym_topk_group_npu():
+    """Return a preinitialized group without creating collectives in forward."""
+    attn_group = get_parallel().attn_tp_group
+    state = getattr(attn_group, "_dsa_asym_topk_state", None)
+    if state is None or state[0] is not attn_group.device_group:
+        raise RuntimeError(
+            "Asymmetric DSA TopK group must be initialized before forward"
+        )
+    if state[2] is None:
+        raise RuntimeError("Idle attention ranks must not participate in TopK exchange")
+    return state[2]
+
+
 def _all_reduce_asym_topk_indices(topk_indices: torch.Tensor) -> torch.Tensor:
-    """Exchange newly computed TopK only within this DP worker's TP2 pair."""
-    group = get_parallel().attn_tp_group
-    if group.world_size != 2:
-        raise ValueError("Asymmetric DSA NPU requires attention TP2")
+    """Exchange fresh TopK between the controller and its MLA compute ranks."""
+    group = _get_dsa_asym_topk_group_npu()
     if topk_indices.dtype != torch.int32 or not topk_indices.is_contiguous():
         raise ValueError("Asymmetric DSA NPU requires contiguous int32 TopK")
-    # The controller contributes indices and the compute rank contributes zeros.
-    # Reusing the device group avoids creating a group during graph capture.
-    dist.all_reduce(topk_indices, op=dist.ReduceOp.SUM, group=group.device_group)
+    # The controller contributes indices; every compute rank contributes zeros.
+    dist.all_reduce(topk_indices, op=dist.ReduceOp.SUM, group=group)
     return topk_indices
 
 
@@ -542,8 +597,23 @@ def forward_dsa_asym_prepare_npu(
     layer_scatter_modes,
     prev_topk_indices: torch.Tensor = None,
 ):
-    # The regular model prepare path handles empty batches. Both ranks receive
-    # this DP worker's complete attention input, without delayed QLoRA gathering.
+    # The regular model prepare path handles empty batches. All ranks receive
+    # the complete attention input, without delayed QLoRA gathering.
+    if m.is_asym_idle:
+        # Idle attention ranks still run FFN/MoE, but never hold shared TopK or
+        # enter its subgroup. Return before validating previous-layer indices.
+        return (
+            None,
+            None,
+            None,
+            None,
+            None,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            positions,
+        )
+
     compute_topk = not m.skip_topk or (m.is_nextn and prev_topk_indices is None)
     topk_indices = None
     if not compute_topk:
@@ -574,8 +644,8 @@ def forward_dsa_asym_prepare_npu(
             )
             topk_indices = _normalize_asym_topk_indices(topk_indices)
             topk_indices = _all_reduce_asym_topk_indices(topk_indices)
-        # Reused TopK is already present on both ranks: summing it again would
-        # double every index. Both ranks skip the collective on sharing layers.
+        # Reused TopK is already present on every active rank: summing it again
+        # would multiply each index. All active ranks skip it on sharing layers.
         return (
             None,
             None,
@@ -675,11 +745,12 @@ def forward_dsa_asym_core_npu(
     zero_allocator: "BumpAllocator",
     positions: torch.Tensor,
 ):
-    if m.is_asym_controller:
-        # The existing attention output reduction combines this zero with the
-        # compute rank's full-head output before the shared FFN/MoE path.
+    if not m.is_asym_compute:
+        # The existing attention output reduction combines these zeros with
+        # the compute ranks' partial outputs before the shared FFN/MoE path.
         output = hidden_states.new_zeros((hidden_states.shape[0], m.hidden_size))
-        return output, topk_indices if m.next_skip_topk else None
+        next_topk = topk_indices if m.is_asym_controller and m.next_skip_topk else None
+        return output, next_topk
 
     return forward_dsa_core_npu(
         m,

@@ -1,4 +1,4 @@
-"""CPU contracts for GLM-5.2 asymmetric MLA with attention TP2 and DP8.
+"""CPU contracts for GLM-5.2 asymmetric MLA TP2/DP8 and 1+TP8/DP1.
 
 Run directly with ``python test/registered/unit/models/test_npu_asymmetric_mla.py``.
 Only the standard library is required. Production definitions are AST-loaded
@@ -73,6 +73,7 @@ def load_definitions(relative_path, names, namespace, class_name=None):
 def env_namespace(enabled=True, **overrides):
     values = {
         "SGLANG_NPU_USE_ASYM_MLA": enabled,
+        "SGLANG_NPU_ASYM_MLA_COMPUTE_TP": 1,
         "SGLANG_USE_AG_AFTER_QLORA": False,
         "SGLANG_NPU_USE_MLAPO": False,
     }
@@ -154,7 +155,11 @@ class FakeTensor:
         )
 
 
-def make_attention(local_rank, enabled=True, use_dsa=True, tp_size=2, layer_id=0):
+def make_attention(
+    local_rank, enabled=True, use_dsa=True, tp_size=None, layer_id=0, compute_tp=1
+):
+    if tp_size is None:
+        tp_size = 16 if compute_tp == 8 else 2
     server_args = SimpleNamespace(kv_cache_dtype="auto", device="npu")
     parallel = SimpleNamespace(
         attn_tp_rank=local_rank,
@@ -162,13 +167,14 @@ def make_attention(local_rank, enabled=True, use_dsa=True, tp_size=2, layer_id=0
         attn_cp_size=1,
         attn_dcp_size=1,
         dcp_enabled=False,
-        attn_tp_group=SimpleNamespace(ranks=[0, 1], world_size=tp_size),
+        attn_tp_group=SimpleNamespace(ranks=list(range(tp_size)), world_size=tp_size),
     )
     namespace = {
         "_is_npu": True,
         "_is_cuda": False,
         "logger": Mock(),
-        "envs": env_namespace(enabled),
+        "envs": env_namespace(enabled, SGLANG_NPU_ASYM_MLA_COMPUTE_TP=compute_tp),
+        "init_dsa_asym_topk_group_npu": Mock(),
         "get_parallel": lambda: parallel,
         "get_server_args": lambda: server_args,
         "is_deepseek_dsa": lambda config: use_dsa,
@@ -270,6 +276,59 @@ class TestAsymmetricMLATopology(unittest.TestCase):
                 self.assertEqual(getattr(attention, name).kwargs["tp_rank"], rank)
                 self.assertEqual(getattr(attention, name).kwargs["tp_size"], 2)
 
+    def test_one_plus_tp8_roles_and_glm_projection_shards(self):
+        for rank in range(16):
+            with self.subTest(rank=rank):
+                attention, namespace = make_attention(rank, compute_tp=8)
+                self.assertEqual(attention.is_asym_controller, rank == 0)
+                self.assertEqual(attention.is_asym_compute, 1 <= rank <= 8)
+                self.assertEqual(attention.is_asym_idle, rank >= 9)
+                self.assertEqual(attention.asym_num_compute_ranks, 8)
+                self.assertEqual(attention.num_local_heads, 8)
+                self.assertEqual(hasattr(attention, "indexer"), rank == 0)
+                namespace["init_dsa_asym_topk_group_npu"].assert_called_once_with()
+                self.assertEqual(namespace["get_parallel"]().attn_tp_size, 16)
+                for name in ("q_b_proj", "kv_b_proj", "o_proj"):
+                    if 1 <= rank <= 8:
+                        projection = getattr(attention, name)
+                        self.assertEqual(projection.kwargs["tp_rank"], rank - 1)
+                        self.assertEqual(projection.kwargs["tp_size"], 8)
+                        self.assertIs(
+                            projection.kwargs["quant_config"], attention.quant_config
+                        )
+                    else:
+                        self.assertFalse(hasattr(attention, name))
+                self.assertEqual(attention.attn_mqa.args[0], 8)
+                self.assertEqual(attention.attn_mha.args[0], 8)
+                if attention.is_asym_compute:
+                    self.assertFalse(attention.o_proj.kwargs["reduce_results"])
+
+    def test_one_plus_tp8_uses_one_dp_worker_with_all_sixteen_ffn_ranks(self):
+        namespace = load_definitions(
+            "layers/dp_attention.py", ["compute_dp_attention_world_info"], {}
+        )
+        for rank in range(16):
+            self.assertEqual(
+                namespace["compute_dp_attention_world_info"](False, rank, 16, 1, 1),
+                (rank, 16, 0, 1),
+            )
+
+    def test_one_plus_tp8_rejects_incompatible_physical_attention_groups(self):
+        for tp_size in (2, 8, 9, 32):
+            with self.subTest(tp_size=tp_size), self.assertRaises(ValueError):
+                make_attention(0, tp_size=tp_size, compute_tp=8)
+
+    def test_disabled_one_plus_tp8_preserves_symmetric_tp16(self):
+        for rank in (0, 1, 8, 15):
+            attention, namespace = make_attention(rank, enabled=False, compute_tp=8)
+            self.assertFalse(attention.is_asym_dsa_npu)
+            self.assertEqual(attention.num_local_heads, 4)
+            namespace["init_dsa_asym_topk_group_npu"].assert_not_called()
+            for name in ("q_b_proj", "kv_b_proj", "o_proj"):
+                projection = getattr(attention, name)
+                self.assertEqual(projection.kwargs["tp_rank"], rank)
+                self.assertEqual(projection.kwargs["tp_size"], 16)
+
     def test_invalid_attention_group_size_is_rejected(self):
         for tp_size in (1, 4, 16):
             with self.subTest(tp_size=tp_size), self.assertRaises(ValueError):
@@ -313,7 +372,12 @@ class TestAsymmetricMLATopology(unittest.TestCase):
             mixed_chunk_attn_mask=None,
             ringmla_mask=None,
         )
-        for enabled, expected_heads in ((True, 64), (False, 32)):
+        for enabled, compute_tp, expected_heads in (
+            (True, 1, 64),
+            (False, 1, 32),
+            (True, 8, 8),
+            (False, 8, 4),
+        ):
             namespace = load_definitions(
                 "hardware_backend/npu/attention/ascend_backend.py",
                 ["__init__"],
@@ -323,11 +387,15 @@ class TestAsymmetricMLATopology(unittest.TestCase):
                     "AscendTorchNativeAttnBackend": Mock(),
                     "AscendAttnMaskBuilder": Mock(return_value=mask_builder),
                     "get_bool_env_var": lambda *args: False,
-                    "get_parallel": lambda: SimpleNamespace(attn_tp_size=2),
+                    "get_parallel": lambda: SimpleNamespace(
+                        attn_tp_size=16 if compute_tp == 8 else 2
+                    ),
                     "get_flags": lambda: SimpleNamespace(
                         capture=SimpleNamespace(enable_torch_compile=False)
                     ),
-                    "envs": env_namespace(enabled),
+                    "envs": env_namespace(
+                        enabled, SGLANG_NPU_ASYM_MLA_COMPUTE_TP=compute_tp
+                    ),
                     "is_deepseek_dsa": lambda config: True,
                     "SWAKVPool": type("SWAKVPool", (), {}),
                     "DllmConfig": SimpleNamespace(from_server_args=lambda args: None),
@@ -365,17 +433,22 @@ class TestAsymmetricMLADispatch(unittest.TestCase):
             self.assertIs(dispatch(attention, batch), methods.DSA_NPU)
 
     def test_idle_controller_does_not_access_missing_projection(self):
-        controller, namespace = make_attention(0)
-        namespace["get_attn_tp_context"] = lambda: SimpleNamespace(input_scattered=False)
-        hidden_states = SimpleNamespace(shape=(0, 6144))
-        batch = object()
-        state = controller.forward_prepare(None, hidden_states, batch, None)
-        self.assertIs(controller.forward_core(state), hidden_states)
+        for rank, compute_tp in ((0, 1), (0, 8), (9, 8), (15, 8)):
+            controller, namespace = make_attention(rank, compute_tp=compute_tp)
+            namespace["get_attn_tp_context"] = lambda: SimpleNamespace(
+                input_scattered=False
+            )
+            hidden_states = SimpleNamespace(shape=(0, 6144))
+            batch = object()
+            state = controller.forward_prepare(None, hidden_states, batch, None)
+            self.assertIs(controller.forward_core(state), hidden_states)
 
 
 class TestAsymmetricMLAConfiguration(unittest.TestCase):
     def setUp(self):
-        self.model_module = SimpleNamespace(is_deepseek_dsa=lambda config: config.is_dsa)
+        self.model_module = SimpleNamespace(
+            is_deepseek_dsa=lambda config: config.is_dsa
+        )
         module_patch = patch.dict(
             sys.modules, {"sglang.srt.configs.model_config": self.model_module}
         )
@@ -384,6 +457,7 @@ class TestAsymmetricMLAConfiguration(unittest.TestCase):
 
     def make_args(self, enabled=True, env_overrides=None, **overrides):
         env_overrides = env_overrides or {}
+        compute_tp = env_overrides.get("SGLANG_NPU_ASYM_MLA_COMPUTE_TP", 1)
         namespace = load_definitions(
             "server_args.py",
             ["_handle_npu_asymmetric_mla"],
@@ -397,8 +471,8 @@ class TestAsymmetricMLAConfiguration(unittest.TestCase):
         defaults = dict(
             device="npu",
             tp_size=16,
-            dp_size=8,
-            enable_dp_attention=True,
+            dp_size=1 if compute_tp == 8 else 8,
+            enable_dp_attention=compute_tp != 8,
             attn_cp_size=1,
             dcp_size=1,
             pp_size=1,
@@ -432,6 +506,35 @@ class TestAsymmetricMLAConfiguration(unittest.TestCase):
 
     def test_ascend_pd_decode_is_supported(self):
         self.make_args(disaggregation_mode="decode")._handle_npu_asymmetric_mla()
+
+    def test_one_plus_tp8_configuration_and_ascend_pd_decode(self):
+        for mode in ("null", "decode"):
+            self.make_args(
+                env_overrides={"SGLANG_NPU_ASYM_MLA_COMPUTE_TP": 8},
+                disaggregation_mode=mode,
+            )._handle_npu_asymmetric_mla()
+
+    def test_one_plus_tp8_rejects_old_dp8_and_other_topologies(self):
+        for overrides in (
+            {"tp_size": 8},
+            {"tp_size": 9},
+            {"tp_size": 32},
+            {"dp_size": 8, "enable_dp_attention": True},
+            {"attn_cp_size": 2},
+            {"dcp_size": 2},
+            {"pp_size": 2},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                self.make_args(
+                    env_overrides={"SGLANG_NPU_ASYM_MLA_COMPUTE_TP": 8}, **overrides
+                )._handle_npu_asymmetric_mla()
+
+    def test_unsupported_compute_tp_is_rejected(self):
+        for compute_tp in (0, 2, 4, 7, 9, 16):
+            with self.subTest(compute_tp=compute_tp), self.assertRaises(ValueError):
+                self.make_args(
+                    env_overrides={"SGLANG_NPU_ASYM_MLA_COMPUTE_TP": compute_tp}
+                )._handle_npu_asymmetric_mla()
 
     def test_pd_prefill_requires_symmetric_attention(self):
         # The deployment uses P TP16/DP4 and D TP16/DP8. Diagnose an inherited
@@ -528,9 +631,15 @@ class TestAsymmetricMLATopK(unittest.TestCase):
             },
         )
 
-    def make_role(self, controller, skip_topk, is_nextn=False):
+    def make_role(
+        self, controller, skip_topk, is_nextn=False, compute_tp=1, idle=False
+    ):
+        local_heads = 64 // compute_tp
         model = SimpleNamespace(
             is_asym_controller=controller,
+            is_asym_compute=not controller and not idle,
+            is_asym_idle=idle,
+            asym_num_compute_ranks=compute_tp,
             skip_topk=skip_topk,
             is_nextn=is_nextn,
             next_skip_topk=True,
@@ -540,17 +649,19 @@ class TestAsymmetricMLATopK(unittest.TestCase):
             qk_rope_head_dim=64,
             qk_nope_head_dim=192,
             qk_head_dim=256,
-            num_local_heads=64,
+            num_local_heads=local_heads,
             asym_index_topk=2048,
             hidden_size=6144,
             alt_stream=None,
-            w_kc=FakeTensor((64, 192, 512), "bfloat16"),
+            w_kc=FakeTensor((local_heads, 192, 512), "bfloat16"),
             fused_qkv_a_proj_with_mqa=Mock(
                 return_value=(FakeTensor((7, 2048 + 512 + 64), "bfloat16"), None)
             ),
             q_a_layernorm=Mock(side_effect=lambda value: value),
             kv_a_layernorm=Mock(side_effect=lambda value: value),
-            q_b_proj=Mock(return_value=(FakeTensor((7, 64 * 256), "bfloat16"), None)),
+            q_b_proj=Mock(
+                return_value=(FakeTensor((7, local_heads * 256), "bfloat16"), None)
+            ),
             indexer=Mock(return_value=FakeTensor((7, 2048))),
         )
         model.rotary_emb = Mock(side_effect=lambda positions, query, key: (query, key))
@@ -590,9 +701,14 @@ class TestAsymmetricMLATopK(unittest.TestCase):
             all_reduce = Mock()
             namespace = load_definitions(
                 "hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py",
-                ["_all_reduce_asym_topk_indices"],
+                [
+                    "init_dsa_asym_topk_group_npu",
+                    "_get_dsa_asym_topk_group_npu",
+                    "_all_reduce_asym_topk_indices",
+                ],
                 {
                     "get_parallel": lambda: SimpleNamespace(attn_tp_group=pair),
+                    "envs": env_namespace(),
                     "torch": SimpleNamespace(int32="int32"),
                     "dist": SimpleNamespace(
                         all_reduce=all_reduce, ReduceOp=SimpleNamespace(SUM="sum")
@@ -601,6 +717,7 @@ class TestAsymmetricMLATopK(unittest.TestCase):
             )
             indices = FakeTensor((7, 2048))
             reduce_topk = namespace["_all_reduce_asym_topk_indices"]
+            namespace["init_dsa_asym_topk_group_npu"]()
             self.assertIs(reduce_topk(indices), indices)
             all_reduce.assert_called_once_with(
                 indices, op="sum", group=pair.device_group
@@ -613,19 +730,22 @@ class TestAsymmetricMLATopK(unittest.TestCase):
                     reduce_topk(invalid)
             pair.world_size = 16
             with self.assertRaises(ValueError):
-                reduce_topk(indices)
+                namespace["init_dsa_asym_topk_group_npu"]()
 
     def test_shared_topk_skips_collective_on_both_roles(self):
         previous = FakeTensor((7, 2048))
-        for controller in (True, False):
-            model = self.make_role(controller, skip_topk=True)
-            state = self.prepare(model, previous)
-            self.assertIs(state[4], previous)
-            model.indexer.assert_not_called()
-            if controller:
-                model.fused_qkv_a_proj_with_mqa.assert_not_called()
-            else:
-                model.q_b_proj.assert_called_once()
+        for compute_tp in (1, 8):
+            for controller in (True, False):
+                model = self.make_role(
+                    controller, skip_topk=True, compute_tp=compute_tp
+                )
+                state = self.prepare(model, previous)
+                self.assertIs(state[4], previous)
+                model.indexer.assert_not_called()
+                if controller:
+                    model.fused_qkv_a_proj_with_mqa.assert_not_called()
+                else:
+                    model.q_b_proj.assert_called_once()
         # A SUM on already-replicated TopK would double every token index.
         self.collective.assert_not_called()
 
@@ -637,6 +757,32 @@ class TestAsymmetricMLATopK(unittest.TestCase):
             model.fused_qkv_a_proj_with_mqa.assert_not_called()
             model.indexer.assert_not_called()
         self.collective.assert_not_called()
+
+    def test_attention_idle_ranks_skip_topk_and_projections_on_all_layers(self):
+        for skip_topk in (False, True):
+            for previous in (None, FakeTensor((7, 2048))):
+                model = self.make_role(
+                    False, skip_topk=skip_topk, compute_tp=8, idle=True
+                )
+                state = self.prepare(model, previous)
+                self.assertEqual(state[:5], (None,) * 5)
+                model.indexer.assert_not_called()
+                model.q_b_proj.assert_not_called()
+                model.fused_qkv_a_proj_with_mqa.assert_not_called()
+        self.collective.assert_not_called()
+
+    def test_attention_idle_core_returns_zero_without_carrying_topk(self):
+        zero_output = object()
+        hidden_states = SimpleNamespace(
+            shape=(7, 6144), new_zeros=Mock(return_value=zero_output)
+        )
+        model = self.make_role(False, skip_topk=True, compute_tp=8, idle=True)
+        output, carry = self.namespace["forward_dsa_asym_core_npu"](
+            model, None, None, None, None, None, hidden_states, None, None, None
+        )
+        self.assertIs(output, zero_output)
+        self.assertIsNone(carry)
+        hidden_states.new_zeros.assert_called_once_with((7, 6144))
 
     def test_fresh_topk_controller_supplies_indices_compute_supplies_zeros(self):
         controller = self.make_role(True, skip_topk=False)
@@ -673,15 +819,15 @@ class TestAsymmetricMLATopK(unittest.TestCase):
             )
         )
         self.namespace["fused_split_qk_norm"] = fused_norm
-        for reuse in (False, True):
-            with self.subTest(reuse=reuse):
-                compute = self.make_role(False, skip_topk=reuse)
+        for compute_tp, reuse in ((1, False), (1, True), (8, False), (8, True)):
+            with self.subTest(compute_tp=compute_tp, reuse=reuse):
+                compute = self.make_role(False, skip_topk=reuse, compute_tp=compute_tp)
                 compute.rotary_emb.is_neox_style = False
                 previous = FakeTensor((7, 2048)) if reuse else None
                 self.collective.reset_mock()
                 state = self.prepare(compute, previous)
-                self.assertEqual(state[0].shape, (7, 64, 64))
-                self.assertEqual(state[2].shape, (7, 64, 512))
+                self.assertEqual(state[0].shape, (7, 64 // compute_tp, 64))
+                self.assertEqual(state[2].shape, (7, 64 // compute_tp, 512))
                 self.assertEqual(state[3].shape, (7, 1, 512))
                 compute.q_b_proj.assert_called_once_with(fused_norm.return_value[0])
                 compute.indexer.assert_not_called()
@@ -699,7 +845,11 @@ class TestAsymmetricMLATopK(unittest.TestCase):
         topk = FakeTensor((7, 2048))
         for next_skip_topk in (True, False):
             model = SimpleNamespace(
-                is_asym_controller=True, hidden_size=6144, next_skip_topk=next_skip_topk
+                is_asym_controller=True,
+                is_asym_compute=False,
+                is_asym_idle=False,
+                hidden_size=6144,
+                next_skip_topk=next_skip_topk,
             )
             output, carry = self.namespace["forward_dsa_asym_core_npu"](
                 model, None, None, None, None, topk, hidden_states, None, None, None
@@ -711,7 +861,9 @@ class TestAsymmetricMLATopK(unittest.TestCase):
     def test_compute_core_delegates_to_standard_dynamic_quantization_path(self):
         core = Mock(return_value=(object(), object()))
         self.namespace["forward_dsa_core_npu"] = core
-        model = SimpleNamespace(is_asym_controller=False)
+        model = SimpleNamespace(
+            is_asym_controller=False, is_asym_compute=True, is_asym_idle=False
+        )
         inner = tuple(object() for _ in range(9))
         result = self.namespace["forward_dsa_asym_core_npu"](model, *inner)
         self.assertIs(result, core.return_value)
@@ -748,8 +900,16 @@ class TestAsymmetricMLAWeights(unittest.TestCase):
         return loader
 
     def test_missing_role_projection_weights_and_scales_are_filtered(self):
-        for rank in (0, 1):
-            attention, _ = make_attention(rank)
+        for rank, compute_tp in (
+            (0, 1),
+            (1, 1),
+            (0, 8),
+            (1, 8),
+            (8, 8),
+            (9, 8),
+            (15, 8),
+        ):
+            attention, _ = make_attention(rank, compute_tp=compute_tp)
             loader = self.make_loader(attention)
             for prefix in ("model.layers.0", "model.decoder"):
                 for projection in ("q_b_proj", "kv_b_proj", "o_proj", "indexer"):
@@ -782,15 +942,16 @@ class TestAsymmetricMLAWeights(unittest.TestCase):
         )
 
     def test_controller_skips_kv_b_postprocessing_in_target_and_mtp(self):
-        controller, _ = make_attention(0)
-        loader = self.make_loader(controller)
-        loader.post_load_weights()
-        loader.post_load_weights(is_nextn=True)
-        loader.post_load_weights(
-            weight_names=["model.layers.0.self_attn.kv_b_proj.weight"]
-        )
-        self.assertIsNone(controller.w_kc)
-        self.assertIsNone(controller.w_vc)
+        for rank, compute_tp in ((0, 1), (0, 8), (9, 8), (15, 8)):
+            controller, _ = make_attention(rank, compute_tp=compute_tp)
+            loader = self.make_loader(controller)
+            loader.post_load_weights()
+            loader.post_load_weights(is_nextn=True)
+            loader.post_load_weights(
+                weight_names=["model.layers.0.self_attn.kv_b_proj.weight"]
+            )
+            self.assertIsNone(controller.w_kc)
+            self.assertIsNone(controller.w_vc)
 
     def test_compute_float_kv_b_is_split_into_all_glm_heads(self):
         compute, _ = make_attention(1)
@@ -800,8 +961,100 @@ class TestAsymmetricMLAWeights(unittest.TestCase):
         self.assertEqual(compute.w_kc.shape, (64, 192, 512))
         self.assertEqual(compute.w_vc.shape, (64, 512, 256))
         compute.kv_b_proj.weight = FakeTensor((32 * (192 + 256), 512), "bfloat16")
-        with self.assertRaisesRegex(ValueError, "all attention heads"):
+        with self.assertRaisesRegex(ValueError, "head shard"):
             loader.post_load_weights()
+
+    def test_one_plus_tp8_loads_eight_head_kv_b_shards_and_rejects_full_heads(self):
+        for rank in range(1, 9):
+            compute, _ = make_attention(rank, compute_tp=8)
+            loader = self.make_loader(compute)
+            compute.kv_b_proj.weight = FakeTensor((8 * (192 + 256), 512), "bfloat16")
+            loader.post_load_weights()
+            self.assertEqual(compute.w_kc.shape, (8, 192, 512))
+            self.assertEqual(compute.w_vc.shape, (8, 512, 256))
+            compute.kv_b_proj.weight = FakeTensor((64 * (192 + 256), 512), "bfloat16")
+            with self.assertRaisesRegex(ValueError, "head shard"):
+                loader.post_load_weights()
+
+
+class TestAsymmetricMLATopKGroup(unittest.TestCase):
+    def make_group(self, rank, compute_tp=8):
+        world_size = 16 if compute_tp == 8 else 2
+        attention_group = SimpleNamespace(
+            world_size=world_size,
+            ranks=list(range(world_size)),
+            rank_in_group=rank,
+            device_group=object(),
+        )
+        create_group = Mock(return_value=object())
+        all_reduce = Mock()
+        namespace = load_definitions(
+            "hardware_backend/npu/modules/deepseek_v2_attention_mla_npu.py",
+            [
+                "init_dsa_asym_topk_group_npu",
+                "_get_dsa_asym_topk_group_npu",
+                "_all_reduce_asym_topk_indices",
+            ],
+            {
+                "envs": env_namespace(SGLANG_NPU_ASYM_MLA_COMPUTE_TP=compute_tp),
+                "get_parallel": lambda: SimpleNamespace(attn_tp_group=attention_group),
+                "create_custom_parallel_group": create_group,
+                "torch": SimpleNamespace(int32="int32"),
+                "dist": SimpleNamespace(
+                    get_backend=Mock(return_value="hccl"),
+                    all_reduce=all_reduce,
+                    ReduceOp=SimpleNamespace(SUM="sum"),
+                ),
+            },
+        )
+        return attention_group, namespace, create_group, all_reduce
+
+    def test_all_sixteen_ranks_initialize_once_but_only_nine_exchange_topk(self):
+        for rank in range(16):
+            with self.subTest(rank=rank):
+                _, namespace, create_group, all_reduce = self.make_group(rank)
+                initialize = namespace["init_dsa_asym_topk_group_npu"]
+                expected_group = create_group.return_value if rank <= 8 else None
+                self.assertIs(initialize(), expected_group)
+                self.assertIs(initialize(), expected_group)
+                create_group.assert_called_once_with(list(range(9)), backend="hccl")
+                indices = FakeTensor((7, 2048))
+                if rank <= 8:
+                    self.assertIs(
+                        namespace["_all_reduce_asym_topk_indices"](indices), indices
+                    )
+                    all_reduce.assert_called_once_with(
+                        indices, op="sum", group=expected_group
+                    )
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "Idle attention"):
+                        namespace["_all_reduce_asym_topk_indices"](indices)
+                    all_reduce.assert_not_called()
+                self.assertEqual(create_group.call_count, 1)
+
+    def test_forward_never_creates_a_group(self):
+        _, namespace, create_group, all_reduce = self.make_group(1)
+        with self.assertRaisesRegex(RuntimeError, "initialized before forward"):
+            namespace["_all_reduce_asym_topk_indices"](FakeTensor((7, 2048)))
+        create_group.assert_not_called()
+        all_reduce.assert_not_called()
+
+    def test_pair_reuses_existing_group_without_creating_subgroup(self):
+        group, namespace, create_group, _ = self.make_group(0, compute_tp=1)
+        self.assertIs(namespace["init_dsa_asym_topk_group_npu"](), group.device_group)
+        self.assertIs(namespace["_get_dsa_asym_topk_group_npu"](), group.device_group)
+        create_group.assert_not_called()
+
+    def test_recreated_engine_does_not_reuse_stale_process_group(self):
+        group, namespace, create_group, _ = self.make_group(1)
+        original = namespace["init_dsa_asym_topk_group_npu"]()
+        group.device_group = object()
+        with self.assertRaisesRegex(RuntimeError, "initialized before forward"):
+            namespace["_get_dsa_asym_topk_group_npu"]()
+        create_group.return_value = object()
+        replacement = namespace["init_dsa_asym_topk_group_npu"]()
+        self.assertIsNot(replacement, original)
+        self.assertEqual(create_group.call_count, 2)
 
 
 if __name__ == "__main__":

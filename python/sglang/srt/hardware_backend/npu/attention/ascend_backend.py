@@ -363,11 +363,24 @@ class AscendAttnBackend(AttentionBackend):
             use_asym_mla = envs.SGLANG_NPU_USE_ASYM_MLA.get() and is_deepseek_dsa(
                 model_runner.model_config.hf_config
             )
-            if use_asym_mla and attn_tp_size != 2:
-                raise ValueError("Asymmetric MLA requires attention TP size 2.")
+            projection_tp_size = attn_tp_size
+            if use_asym_mla:
+                projection_tp_size = envs.SGLANG_NPU_ASYM_MLA_COMPUTE_TP.get()
+                if projection_tp_size not in (1, 8):
+                    raise ValueError("SGLANG_NPU_ASYM_MLA_COMPUTE_TP must be 1 or 8.")
+                expected_attn_tp_size = 2 if projection_tp_size == 1 else 16
+                if attn_tp_size != expected_attn_tp_size:
+                    raise ValueError(
+                        f"Asymmetric MLA compute TP{projection_tp_size} requires "
+                        f"attention TP size {expected_attn_tp_size}, got {attn_tp_size}."
+                    )
+                if model_runner.model_config.num_attention_heads % projection_tp_size:
+                    raise ValueError(
+                        "Asymmetric MLA attention heads must be divisible by "
+                        f"compute TP size {projection_tp_size}."
+                    )
             self.tp_q_head_num = (
-                model_runner.model_config.num_attention_heads
-                // (1 if use_asym_mla else attn_tp_size)
+                model_runner.model_config.num_attention_heads // projection_tp_size
             )
             for num in self.padding_size_list:
                 if num >= self.tp_q_head_num:

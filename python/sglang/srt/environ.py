@@ -586,8 +586,10 @@ class Envs:
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
-    # Split DSA indexer and full-head MLA across each attention TP2 group.
+    # Assign DSA indexer and MLA computation to separate attention ranks.
     SGLANG_NPU_USE_ASYM_MLA = EnvBool(False)
+    # 1: TP2 pairs with DP8; 8: one indexer and eight compute ranks in TP16.
+    SGLANG_NPU_ASYM_MLA_COMPUTE_TP = EnvInt(1)
     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
     # Forward native implementation for gemma rms norm for model Skywork-Reward-Gemma-2-27B-v0.2

@@ -463,20 +463,22 @@ python3 -m sglang_router.launch_router \
 --port 6688
 ```
 
-## Asymmetric attention TP2 with DP8
+## Asymmetric MLA on 16 NPUs
 
 On 16 Ascend NPUs, `SGLANG_NPU_USE_ASYM_MLA=1` assigns different attention
 roles to the two members of each attention TP group. With global TP16 and
 attention DP8, the groups are `[0, 1]`, `[2, 3]`, through `[14, 15]`. Local
 rank 0 runs the Indexer; local rank 1 computes all 64 attention heads. Both
-members still participate in the existing dense FFN and MoE execution.
+members still participate in the existing dense FFN and MoE execution. This
+is the default layout (`SGLANG_NPU_ASYM_MLA_COMPUTE_TP=1`). You can also select
+the 1+TP8 layout described below with `SGLANG_NPU_ASYM_MLA_COMPUTE_TP=8`.
 
 The [Eco-Tech GLM-5.2-W4A8 checkpoint](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8)
 uses ModelSlim mixed precision: routed experts use `W4A8_DYNAMIC`, Q/O
 projections use `W8A8_DYNAMIC`, and `kv_b_proj` remains floating point.
-The compute member loads complete attention projections, including their
-scales and offsets. This increases attention projection memory per compute
-rank compared with symmetric TP2 head sharding.
+In the TP2/DP8 layout, the compute member loads complete attention projections,
+including their scales and offsets. This increases attention projection memory
+per compute rank compared with symmetric TP2 head sharding.
 
 GLM-5.2 shares TopK across layers. Only producer layers run the Indexer and
 exchange indices within their pair; sharing layers reuse the indices already
@@ -484,11 +486,12 @@ held by both members. The Indexer member contributes zero attention output,
 which the normal layer communicator combines with the compute output and
 residual. Do not broadcast attention output before that reduction.
 
-For an initial eager smoke test, add these settings to your validated
+For an initial TP2/DP8 eager smoke test, add these settings to your validated
 GLM-5.2-W4A8 Ascend command, retaining its memory and MoE settings:
 
 ```bash
 export SGLANG_NPU_USE_ASYM_MLA=1
+export SGLANG_NPU_ASYM_MLA_COMPUTE_TP=1
 export SGLANG_USE_AG_AFTER_QLORA=0
 export SGLANG_NPU_USE_MLAPO=0
 export SGLANG_USE_FIA_NZ=0
@@ -535,6 +538,53 @@ ranks 0 and 1 respectively; prefill ranks 1 and 3 participate as dummy senders.
 Enabling asymmetric attention on the PD prefill server is rejected because
 those source ranks would no longer hold interchangeable complete caches.
 
+### 1+TP8 layout
+
+This layout uses the same 16-NPU world with one attention DP group. Rank 0
+runs the Indexer, ranks 1–8 split the 64 attention heads eight ways, and ranks
+9–15 skip attention computation. All 16 ranks still participate in FFN/MoE
+and attention-output reduction. It is not a nine-NPU deployment, and
+`--tp-size` remains 16.
+
+Each compute rank loads one eighth of `q_b_proj`, `kv_b_proj`, and `o_proj`,
+including their quantization parameters. Newly computed TopK indices are
+exchanged only among ranks 0–8 through a group created before graph capture.
+IndexShare layers reuse those indices without another exchange. Idle
+attention ranks contribute zero to the existing output reduction.
+
+For the decode branch of a PD launch script, use:
+
+```bash
+export SGLANG_NPU_USE_ASYM_MLA=1
+export SGLANG_NPU_ASYM_MLA_COMPUTE_TP=8
+export SGLANG_USE_AG_AFTER_QLORA=0
+export SGLANG_NPU_USE_MLAPO=0
+export SGLANG_USE_FIA_NZ=0
+
+# Replace the decode parallelism arguments with:
+# --tp-size 16 --dp-size 1 --ep-size 16
+# Keep --attention-backend ascend --disaggregation-transfer-backend ascend
+# and the existing ModelSlim / DeepEP settings.
+# Remove --enable-dp-attention and --prefill-round-robin-balance.
+# First validate with --disable-cuda-graph, then enable graph capture/replay.
+# With --max-running-requests 128, use --cuda-graph-max-bs 128, not 4.
+```
+
+With DeepEP, graph batches must be divisible by the real attention TP size
+16. A graph maximum of 4 leaves no valid capture sizes and fails at startup;
+128 captures batches 16, 32, 48, 64, 80, 96, 112, and 128 for non-MTP decode.
+
+Keep `SGLANG_NPU_USE_ASYM_MLA=0` on the prefill server; P can retain TP16/DP4.
+The existing transfer path copies full KV buffers to all 16 decode ranks,
+including the idle attention ranks, and waits for their transfer completion.
+With attention TP4 on P, each prefill rank sends to four decode ranks.
+
+Compare generation accuracy with symmetric attention, then measure decode
+latency and throughput separately. This layout reduces attention work per
+compute rank but replaces eight independent attention DP groups with one,
+adds a nine-rank TopK exchange, and transfers more KV replicas per request.
+CPU tests cannot establish a performance gain or validate HCCL graph replay.
+
 Run the CPU contract tests from the repository root with Python 3.10 or later:
 
 ```bash
@@ -548,7 +598,9 @@ using the same checkpoint, then validate NPU graph capture and replay. Cover
 prefill, decode, prompts longer than `index_topk=2048`, unequal request lengths,
 chunked prefill, prefix-cache hits, and active/idle DP groups. Confirm that
 producer layers run the Indexer only on even ranks and attention only on odd
-ranks. Measure throughput and single-request latency separately.
+ranks in TP2/DP8 mode. In 1+TP8 mode, verify Indexer execution on rank 0,
+attention execution on ranks 1–8, and FFN/MoE participation on all 16 ranks.
+Measure throughput and single-request latency separately.
 
 Validate NEXTN/MTP separately after the main-model smoke test. This checkpoint
 also quantizes its MTP layer, so do not copy

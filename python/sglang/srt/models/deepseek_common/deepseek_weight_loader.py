@@ -152,7 +152,7 @@ class DeepseekV2WeightLoaderMixin:
     def _is_missing_asym_dsa_attention_weight(
         self, name: str, params_dict: Dict[str, torch.nn.Parameter]
     ) -> bool:
-        """Ignore all parameters of projections owned by the other TP2 role."""
+        """Ignore parameters of attention projections owned by other roles."""
         if not envs.SGLANG_NPU_USE_ASYM_MLA.get() or name in params_dict:
             return False
         layer_prefix, separator, parameter_name = name.partition(".self_attn.")
@@ -656,11 +656,12 @@ class DeepseekV2WeightLoaderMixin:
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             if (
                 getattr(self_attn, "is_asym_dsa_npu", False)
-                and w_kc.shape[0] != self_attn.num_heads
+                and w_kc.shape[0] != self_attn.num_local_heads
             ):
                 raise ValueError(
-                    "Asymmetric DSA NPU compute rank must load all attention "
-                    f"heads, got {w_kc.shape[0]} instead of {self_attn.num_heads}"
+                    "Asymmetric DSA NPU compute rank has an incorrect attention "
+                    f"head shard: got {w_kc.shape[0]} instead of "
+                    f"{self_attn.num_local_heads}"
                 )
 
             if (
