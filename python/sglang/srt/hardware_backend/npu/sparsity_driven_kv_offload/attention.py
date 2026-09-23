@@ -1029,22 +1029,24 @@ def forward_sparsity_driven_kv_offload(
             rope_head_dim,
         )
 
-        ret = torch_npu.npu_sparse_flash_attention(
-            q_nope_sfa,
-            k_nope_sfa,
-            k_nope_sfa,
-            sparse_indices,
-            layer.scaling,
-            actual_seq_lengths_query=actual_seq_lengths_query,
-            actual_seq_lengths_kv=actual_seq_lengths_kv,
+        # Graph-capture smoke test only: attend over the full KV capacity,
+        # including invalid/padded slots. This does not preserve DSA accuracy.
+        ret = torch_npu.npu_fused_infer_attention_score(
+            query=q_nope_sfa,
+            key=k_nope_sfa,
+            value=k_nope_sfa,
             query_rope=q_rope_sfa,
             key_rope=k_rope_sfa,
-            sparse_block_size=1,
-            layout_query="BSND",
-            layout_kv="BSND",
+            num_heads=padded_query_heads,
+            num_key_value_heads=num_kv_heads,
+            input_layout="BSND",
+            scale=layer.scaling,
             sparse_mode=0,
-            attention_mode=2,
-            return_softmax_lse=False,
+            atten_mask=None,
+            block_table=None,
+            actual_seq_lengths=None,
+            actual_seq_lengths_kv=None,
+            softmax_lse_flag=False,
         )
 
         attn_out = ret[0] if isinstance(ret, tuple) else ret
