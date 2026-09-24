@@ -128,8 +128,9 @@ def _run_combined_decode_fia(
 ) -> torch.Tensor:
     """FIA smoke test matching AscendAttnBackend.forward_decode_graph's MLA ABI.
 
-    The selected KV is still the result of sparse prefetch. Treat its entire
-    capacity (including padding) as valid; this is NOT accuracy-preserving DSA.
+    The selected KV comes from sparse prefetch, or is zero-filled in diagnostic
+    experiment A. Treat its entire capacity (including padding) as valid;
+    this is NOT accuracy-preserving DSA.
     Only reinterpret its contiguous storage as pages -- no additional KV copy.
     """
     batch_size, _, num_heads, _ = query.shape
@@ -763,7 +764,12 @@ def forward_sparsity_driven_kv_offload(
     sparse_kv_manager = _get_sparse_kv_manager(backend)
     stream = torch.npu.current_stream(backend.device)
 
-    if save_kv_cache:
+    # The startup-only diagnostic must cover both warmup and capture. Never
+    # bypass prefill: it still needs the authoritative host KV for attention.
+    skip_decode_kv_io = (
+        forward_batch.forward_mode.is_decode() and sparse_kv_manager.fia_skip_kv_io
+    )
+    if save_kv_cache and not skip_decode_kv_io:
         sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
 
     if is_prefill:
@@ -995,9 +1001,12 @@ def forward_sparsity_driven_kv_offload(
             dtype=k.dtype,
             device=backend.device,
         )
-        sparse_kv_manager.prefetch(
-            layer, forward_batch, topk_indices, selected_kv, stream
-        )
+        # Experiment A keeps the same initialized buffer, splits, contiguous
+        # conversions and FIA call, but removes real KV traffic and its events.
+        if not skip_decode_kv_io:
+            sparse_kv_manager.prefetch(
+                layer, forward_batch, topk_indices, selected_kv, stream
+            )
         selected_k_nope, selected_k_rope = selected_kv.split(
             [nope_head_dim, rope_head_dim], dim=-1
         )

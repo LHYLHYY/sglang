@@ -276,6 +276,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     raw_bs=self.raw_bs,
                     padded_bs=self.bs,
                     route="sparse_fia_mla",
+                    skip_kv_io=getattr(sparse_kv_manager, "fia_skip_kv_io", False),
                 )
             else:
                 self.backend.debug_log("seq_lens.cpu.begin", graph_key, debug_id)

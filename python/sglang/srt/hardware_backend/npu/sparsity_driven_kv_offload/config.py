@@ -31,6 +31,9 @@ SPARSE_KV_ATTN_IMPL_CHOICES = (
     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
 )
 
+# Diagnostic experiment A: keep FIA but remove real decode KV traffic.
+SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR = "SGLANG_NPU_SPARSE_KV_FIA_SKIP_KV_IO"
+
 SPARSE_KV_MERGE_IMPL_ENV_VAR = "SGLANG_NPU_SPARSE_KV_MERGE_IMPL"
 SPARSE_KV_MERGE_IMPL_AUTO = "auto"
 SPARSE_KV_MERGE_IMPL_PYTHON = "python"
@@ -59,6 +62,22 @@ def get_sparse_kv_attn_impl() -> str:
             f"got {value!r}."
         )
     return value
+
+
+def get_sparse_kv_fia_skip_kv_io(attn_impl: str) -> bool:
+    """Read the decode-only FIA diagnostic switch once at manager startup.
+
+    This invalidates generated outputs. Restart the service to change the
+    switch, since it changes which operations are captured in the graph.
+    """
+    enabled = get_bool_env_var(SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR)
+    if enabled and attn_impl != SPARSE_KV_ATTN_IMPL_COMBINED:
+        raise ValueError(
+            f"{SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR}=1 requires "
+            f"{SPARSE_KV_ATTN_IMPL_ENV_VAR}={SPARSE_KV_ATTN_IMPL_COMBINED}; "
+            f"got {attn_impl!r}. This diagnostic is not supported for SFA modes."
+        )
+    return enabled
 
 
 def get_sparse_kv_merge_impl() -> str:

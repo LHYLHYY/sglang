@@ -18,6 +18,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
     get_sparse_kv_attn_impl,
+    get_sparse_kv_fia_skip_kv_io,
     get_sparse_kv_merge_impl,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -285,11 +286,21 @@ class SparseKVCacheManager:
         self.layer_num = self.paged_kv_cache.layer_num
         self.attn_impl = get_sparse_kv_attn_impl()
         self.merge_impl = get_sparse_kv_merge_impl()
+        self.fia_skip_kv_io = get_sparse_kv_fia_skip_kv_io(self.attn_impl)
         logger.info(
             "Sparse KV attention implementation: %s; merge implementation: %s.",
             self.attn_impl,
             self.merge_impl,
         )
+        if self.fia_skip_kv_io:
+            logger.warning(
+                "[FIA_DIAGNOSTIC] experiment A enabled: decode offload and "
+                "prefetch (including hit/miss copies, refill and slot-map "
+                "updates) are skipped; FIA uses zero-initialized selected KV. "
+                "Prefill and graph update/replay are unchanged. Outputs are "
+                "NOT valid for accuracy or performance evaluation. Restart "
+                "the service after changing this diagnostic switch."
+            )
         self._split_graph_fallback_logged = False
         self._split_graph_phase_one_logged = False
         self._split_graph_dual_logged = False

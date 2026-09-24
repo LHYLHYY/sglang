@@ -57,6 +57,86 @@ class FakeTensor:
     def view(self, *shape):
         return FakeTensor(self.data.reshape(shape))
 
+    reshape = view
+
+    def contiguous(self):
+        return FakeTensor(np.ascontiguousarray(self.data))
+
+    def numel(self):
+        return self.data.size
+
+    def dim(self):
+        return self.data.ndim
+
+    def unsqueeze(self, dim):
+        return FakeTensor(np.expand_dims(self.data, axis=dim))
+
+    def split(self, sizes, dim):
+        return [
+            FakeTensor(part)
+            for part in np.split(self.data, np.cumsum(sizes)[:-1], axis=dim)
+        ]
+
+    def to(self, *, device, dtype):
+        return FakeTensor(self.data.astype(dtype))
+
+    def __getitem__(self, index):
+        return FakeTensor(self.data[index])
+
+
+def load_sparse_kv_forward(torch_module, torch_npu_module):
+    """Load the real forward/config decisions, without the model/NPU imports."""
+    namespace = {
+        "torch": torch_module,
+        "torch_npu": torch_npu_module,
+        "os": os,
+        "logger": logging.getLogger(__name__),
+        "_warned_bool_env_var_keys": set(),
+        "is_dsa_enable_prefill_cp": lambda: False,
+    }
+    sources = (
+        (
+            NPU_ROOT / "sparsity_driven_kv_offload/config.py",
+            {"get_sparse_kv_fia_skip_kv_io"},
+            "SPARSE_KV_",
+        ),
+        (
+            NPU_ROOT / "sparsity_driven_kv_offload/attention.py",
+            {
+                "_get_sparse_kv_manager",
+                "_expand_dsa_sparse_indices",
+                "_select_split_decode_mode",
+                "forward_sparsity_driven_kv_offload",
+            },
+            "_SPLIT_MODE_",
+        ),
+        (NPU_ROOT.parents[1] / "utils/common.py", {"get_bool_env_var"}, None),
+    )
+    for path, functions, prefix in sources:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes = [
+            node
+            for node in tree.body
+            if (isinstance(node, ast.FunctionDef) and node.name in functions)
+            or (
+                prefix is not None
+                and isinstance(node, ast.Assign)
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.startswith(prefix)
+            )
+        ]
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0,
+                ),
+                *nodes,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace
+
 
 def load_backend_class():
     path = NPU_ROOT / "graph_runner/npu_cudagraph_backend.py"
@@ -442,6 +522,21 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
                 graph.update.assert_not_called()
                 graph.replay.assert_called_once_with()
 
+    def test_skip_kv_io_runner_keeps_fia_update_and_replay(self):
+        graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
+        execute, runner, batch = self.make_runner(
+            manager=SimpleNamespace(
+                attn_impl="combined", sparse_context_len=2048, fia_skip_kv_io=True
+            ),
+            bs=2,
+            raw_bs=1,
+        )
+        execute(runner, batch)
+        graph.update.assert_called_once_with(
+            cpu_update_input=[{"actual_seq_lengths_kv": [2048, 0]}]
+        )
+        graph.replay.assert_called_once_with()
+
     def test_normal_mla_runner_still_updates_full_context_length(self):
         graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
         execute, runner, batch = self.make_runner(is_dsa=False, bs=2, raw_bs=1)
@@ -515,6 +610,134 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
                         page_size=page_size,
                         scale_value=0.125,
                     )
+
+
+class TestFIASkipKVIO(unittest.TestCase):
+    def setUp(self):
+        self.torch_mock = SimpleNamespace(
+            int32=np.int32,
+            zeros=lambda shape, **kw: FakeTensor(np.zeros(shape, dtype=kw["dtype"])),
+            cumsum=lambda tensor, dim: FakeTensor(np.cumsum(tensor.data, axis=dim)),
+            npu=SimpleNamespace(current_stream=Mock(return_value="main_stream")),
+        )
+        self.npu_mock = SimpleNamespace(npu_sparse_flash_attention=Mock())
+        self.namespace = load_sparse_kv_forward(self.torch_mock, self.npu_mock)
+        self.call_fia = Mock(side_effect=lambda query, *args, **kwargs: query)
+        self.namespace["_run_combined_decode_fia"] = self.call_fia
+        self.forward = self.namespace["forward_sparsity_driven_kv_offload"]
+
+    def make_case(self, *, skip=False, prefill=False, graph_mode=True):
+        def tensor(shape):
+            return FakeTensor(np.ones(shape, dtype=np.float32))
+
+        batch_size, heads, nope_dim, rope_dim = 2, 2, 512, 64
+        q = tensor((batch_size, heads, nope_dim))
+        k = tensor((batch_size, 1, nope_dim))
+        q_rope = tensor((batch_size, heads, rope_dim))
+        k_rope = tensor((batch_size, 1, rope_dim))
+        self.manager = SimpleNamespace(
+            fia_skip_kv_io=skip,
+            attn_impl="combined",
+            sparse_context_len=128,
+            offload_v2=Mock(),
+            prefetch=Mock(),
+            get_forward_kv=Mock(return_value=(k, k_rope)),
+        )
+        # A recognizable value verifies that the normal path still consumes
+        # prefetch output, whereas the diagnostic consumes the initialized zeros.
+        self.manager.prefetch.side_effect = lambda layer, batch, topk, selected, stream: selected.data.fill(
+            7
+        )
+        backend = SimpleNamespace(
+            sparse_kv_manager=self.manager,
+            device="npu",
+            kv_lora_rank=nope_dim,
+            qk_rope_head_dim=rope_dim,
+            page_size=128,
+            graph_mode=graph_mode,
+            forward_metadata=SimpleNamespace(
+                actual_seq_lengths_q=tensor((batch_size,)),
+                actual_seq_lengths_kv=tensor((batch_size,)),
+            ),
+        )
+        self.npu_mock.npu_sparse_flash_attention.return_value = (q, None, None)
+        batch = SimpleNamespace(
+            batch_size=batch_size,
+            seq_lens=tensor((batch_size,)),
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: not prefill,
+                is_extend_without_speculative=lambda: prefill,
+            ),
+        )
+        layer = SimpleNamespace(tp_k_head_num=1, tp_q_head_num=heads, scaling=0.125)
+        return dict(
+            backend=backend,
+            q=q,
+            k=k,
+            v=k,
+            layer=layer,
+            forward_batch=batch,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            topk_indices=tensor((batch_size, 128)),
+        )
+
+    def test_diagnostic_defaults_off_and_rejects_other_attention_modes(self):
+        get_flag = self.namespace["get_sparse_kv_fia_skip_kv_io"]
+        env_name = self.namespace["SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR"]
+        with patch.dict(os.environ, {}, clear=True):
+            for impl in self.namespace["SPARSE_KV_ATTN_IMPL_CHOICES"]:
+                self.assertFalse(get_flag(impl))
+            for value in ("1", "true"):
+                os.environ[env_name] = value
+                self.assertTrue(get_flag("combined"))
+                for impl in self.namespace["SPARSE_KV_ATTN_IMPL_CHOICES"]:
+                    if impl != "combined":
+                        with self.assertRaisesRegex(ValueError, "requires"):
+                            get_flag(impl)
+            os.environ[env_name] = "0"
+            self.assertFalse(get_flag("combined"))
+
+    def test_decode_skips_both_io_calls_but_keeps_zero_kv_fia(self):
+        for graph_mode in (False, True):
+            with self.subTest(graph_mode=graph_mode):
+                case = self.make_case(skip=True, graph_mode=graph_mode)
+                self.call_fia.reset_mock()
+                output = self.forward(**case)
+                self.manager.offload_v2.assert_not_called()
+                self.manager.prefetch.assert_not_called()
+                self.call_fia.assert_called_once()
+                args, kwargs = self.call_fia.call_args
+                self.assertEqual(args[0].shape, (2, 1, 2, 512))
+                self.assertEqual(args[2].shape, (2, 128, 1, 512))
+                self.assertEqual(args[3].shape, (2, 128, 1, 64))
+                self.assertTrue(np.all(args[2].data == 0))
+                self.assertTrue(np.all(args[3].data == 0))
+                self.assertEqual(kwargs, {"page_size": 128, "scale_value": 0.125})
+                self.assertEqual(output.shape, (2, 1024))
+        self.npu_mock.npu_sparse_flash_attention.assert_not_called()
+
+    def test_switch_off_preserves_decode_io_and_uses_prefetched_kv(self):
+        self.forward(**self.make_case())
+        self.manager.offload_v2.assert_called_once()
+        self.manager.prefetch.assert_called_once()
+        self.call_fia.assert_called_once()
+        self.assertTrue(np.all(self.call_fia.call_args.args[2].data == 7))
+        self.assertTrue(np.all(self.call_fia.call_args.args[3].data == 7))
+
+    def test_switch_does_not_bypass_prefill_offload_or_attention(self):
+        self.forward(**self.make_case(skip=True, prefill=True))
+        self.manager.offload_v2.assert_called_once()
+        self.manager.get_forward_kv.assert_called_once()
+        self.manager.prefetch.assert_not_called()
+        self.call_fia.assert_not_called()
+        self.npu_mock.npu_sparse_flash_attention.assert_called_once()
+
+    def test_save_kv_cache_false_still_prefetches_when_diagnostic_is_off(self):
+        self.forward(**self.make_case(), save_kv_cache=False)
+        self.manager.offload_v2.assert_not_called()
+        self.manager.prefetch.assert_called_once()
+        self.call_fia.assert_called_once()
 
 
 if __name__ == "__main__":
