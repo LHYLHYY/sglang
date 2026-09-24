@@ -169,6 +169,58 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         self.assertEqual(self.backend._debug_replay_id, 0)
         graph.update.assert_called_once_with(cpu_update_input=[{}])
 
+    def test_model_forward_debug_uses_actual_module_imports(self):
+        path = NPU_ROOT.parents[1] / "model_executor/model_runner.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "ModelRunner"
+        )
+        log_method = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_log_npu_graph_forward"
+        )
+        # Use imports present in the production module, not an injected `os`.
+        # This must fail if the logging helper's module forgets that import.
+        imports = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.Import)
+            and all(alias.name in {"os", "logging"} for alias in node.names)
+        ]
+        module = ast.Module(body=imports + [log_method], type_ignores=[])
+        log = Mock()
+        namespace = {"logger": log}
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        log_forward = namespace["_log_npu_graph_forward"]
+
+        runner = SimpleNamespace(_npu_graph_debug=False)
+        log_forward(runner, "forward.enter", object())
+        log.info.assert_not_called()
+
+        runner = SimpleNamespace(
+            _npu_graph_debug=True,
+            gpu_id=5,
+            ps=SimpleNamespace(tp_rank=5),
+            forward_pass_id=1,
+            is_draft_worker=False,
+        )
+        for mode, decode_graph in (("EXTEND", False), ("DECODE", True)):
+            with self.subTest(mode=mode):
+                batch = SimpleNamespace(
+                    forward_mode=SimpleNamespace(name=mode), batch_size=1
+                )
+                log_forward(runner, "forward.route", batch, decode_graph)
+                fmt, *args = log.info.call_args.args
+                message = fmt % tuple(args)
+                self.assertIn(f"pid={os.getpid()} ", message)
+                self.assertIn("tp_rank=5 ", message)
+                self.assertIn(f"mode={mode} ", message)
+                self.assertIn(f"decode_graph={decode_graph}", message)
+
     def test_debug_records_update_replay_and_join_with_shared_id(self):
         graph, output = self.capture(1, ["npu_fused_infer_attention_score.out"])
         self.backend._graph_debug = True
