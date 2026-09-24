@@ -42,6 +42,10 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_ATTN_IMPL_COMBINED,
+    SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+)
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
     empty_context,
@@ -247,24 +251,51 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         graph_key = self._make_graph_key(self.bs)
         self.backend.debug_log("execute.graph_selected", graph_key, debug_id)
 
-        if not (
+        sparse_kv_manager = getattr(self.attn_backend, "sparse_kv_manager", None)
+        sparse_fia = (
+            forward_batch.forward_mode.is_decode()
+            and sparse_kv_manager is not None
+            and sparse_kv_manager.attn_impl
+            in (SPARSE_KV_ATTN_IMPL_COMBINED, SPARSE_KV_ATTN_IMPL_SPLIT_EAGER)
+        )
+        if sparse_fia or not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            self.backend.debug_log("seq_lens.cpu.begin", graph_key, debug_id)
-            if forward_batch.forward_mode.is_target_verify():
-                seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
-                seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
-            else:
-                seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
-                    self.bs - self.raw_bs
+            if sparse_fia:
+                # Match ordinary MLA's explicit CPU-length update, but describe
+                # the selected KV pages rather than the full host KV context.
+                # Padded graph requests use zero lengths, as in ordinary MLA.
+                capacity = sparse_kv_manager.sparse_context_len
+                seq_lens = [capacity] * self.raw_bs + [0] * (self.bs - self.raw_bs)
+                self.backend.debug_log(
+                    "seq_lens.selected_kv",
+                    graph_key,
+                    debug_id,
+                    capacity=sparse_kv_manager.sparse_context_len,
+                    raw_bs=self.raw_bs,
+                    padded_bs=self.bs,
+                    route="sparse_fia_mla",
                 )
-            self.backend.debug_log("seq_lens.cpu.returned", graph_key, debug_id)
+            else:
+                self.backend.debug_log("seq_lens.cpu.begin", graph_key, debug_id)
+                if forward_batch.forward_mode.is_target_verify():
+                    seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
+                    seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
+                else:
+                    seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
+                        self.bs - self.raw_bs
+                    )
+                self.backend.debug_log("seq_lens.cpu.returned", graph_key, debug_id)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
-                attr_name=self._get_update_attr_name(),
-                attr_type=self._get_update_attr_type(),
+                attr_name=(
+                    "actual_seq_lengths_kv"
+                    if sparse_fia
+                    else self._get_update_attr_name()
+                ),
+                attr_type=[] if sparse_fia else self._get_update_attr_type(),
                 debug_id=debug_id,
             )
         else:

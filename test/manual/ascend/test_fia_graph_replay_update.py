@@ -17,9 +17,45 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+import numpy as np
+
 NPU_ROOT = (
     Path(__file__).resolve().parents[3] / "python/sglang/srt/hardware_backend/npu"
 )
+
+
+def load_combined_fia(torch_module, torch_npu_module):
+    """Load only the production FIA helper, without importing custom KV ops."""
+    path = NPU_ROOT / "sparsity_driven_kv_offload/attention.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_combined_decode_fia"
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0,
+            ),
+            helper,
+        ],
+        type_ignores=[],
+    )
+    namespace = {"torch": torch_module, "torch_npu": torch_npu_module}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["_run_combined_decode_fia"]
+
+
+class FakeTensor:
+    def __init__(self, data):
+        self.data = data
+        self.shape = data.shape
+        self.dtype = data.dtype
+        self.device = "npu"
+
+    def view(self, *shape):
+        return FakeTensor(self.data.reshape(shape))
 
 
 def load_backend_class():
@@ -287,9 +323,7 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         self.assertIn("stage=replay.error", logs.output[0])
         self.assertIn("Traceback", logs.output[0])
 
-    def test_runner_traces_metadata_before_fia_replay(self):
-        graph, _ = self.capture(1, ["npu_fused_infer_attention_score.out"])
-        self.backend._graph_debug = True
+    def make_runner(self, *, manager=None, bs=1, raw_bs=1, is_dsa=True):
         path = NPU_ROOT / "graph_runner/npu_graph_runner.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
@@ -310,30 +344,46 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         output = SimpleNamespace(
             next_token_logits=[1], full_logits=None, hidden_states=None
         )
-        self.backend._outputs[1] = output
+        self.backend._outputs[bs] = output
         namespace = {
-            "is_deepseek_dsa": lambda config: True,
+            "is_deepseek_dsa": lambda config: is_dsa,
+            "is_deepseek_v4": lambda config: False,
             "LogitsProcessorOutput": SimpleNamespace,
+            "SPARSE_KV_ATTN_IMPL_COMBINED": "combined",
+            "SPARSE_KV_ATTN_IMPL_SPLIT_EAGER": "split_eager",
         }
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
         runner = SimpleNamespace(
             backend=self.backend,
+            attn_backend=SimpleNamespace(sparse_kv_manager=manager),
             load_batch=Mock(),
             _make_graph_key=lambda bs: bs,
-            bs=1,
-            raw_num_token=1,
+            _get_update_attr_name=lambda: "actual_seq_lengths_kv",
+            _get_update_attr_type=lambda: [],
+            bs=bs,
+            raw_bs=raw_bs,
+            raw_num_token=raw_bs,
             is_dllm=False,
             model_runner=SimpleNamespace(
                 model_config=SimpleNamespace(hf_config=object())
             ),
         )
         batch = SimpleNamespace(
-            forward_mode=SimpleNamespace(name="DECODE"),
-            batch_size=1,
+            forward_mode=SimpleNamespace(
+                name="DECODE", is_decode=lambda: True, is_target_verify=lambda: False
+            ),
+            batch_size=raw_bs,
+            seq_lens=Mock(),
             needs_forward_metadata_init=lambda: True,
         )
+        return namespace["execute"], runner, batch
+
+    def test_runner_traces_metadata_before_fia_replay(self):
+        graph, _ = self.capture(1, ["npu_fused_infer_attention_score.out"])
+        self.backend._graph_debug = True
+        execute, runner, batch = self.make_runner()
         with self.assertLogs(self.namespace["logger"], level="INFO") as logs:
-            result = namespace["execute"](runner, batch)
+            result = execute(runner, batch)
         stages = [message.split("stage=")[1].split()[0] for message in logs.output]
         self.assertEqual(
             stages[:4],
@@ -350,28 +400,121 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         runner.load_batch.assert_called_once_with(batch, None)
         graph.update.assert_called_once_with(cpu_update_input=[{}])
 
-    def test_attention_accepts_tuple_list_and_tensor_results(self):
-        path = NPU_ROOT / "sparsity_driven_kv_offload/attention.py"
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        assignment = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.IfExp)
-            and isinstance(node.value.orelse, ast.Name)
-            and node.value.orelse.id == "ret"
-            and any(
-                isinstance(target, ast.Name) and target.id == "attn_out"
-                for target in node.targets
-            )
+    def test_combined_runner_updates_selected_capacity_not_context_length(self):
+        for impl in ("combined", "split_eager"):
+            for raw_bs in (1, 2):
+                with self.subTest(impl=impl, raw_bs=raw_bs):
+                    graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
+                    execute, runner, batch = self.make_runner(
+                        manager=SimpleNamespace(
+                            attn_impl=impl, sparse_context_len=2048
+                        ),
+                        bs=2,
+                        raw_bs=raw_bs,
+                    )
+                    batch.seq_lens.cpu.side_effect = AssertionError(
+                        "Must not use full context lengths for selected KV"
+                    )
+                    execute(runner, batch)
+                    graph.update.assert_called_once_with(
+                        cpu_update_input=[
+                            {
+                                "actual_seq_lengths_kv": [2048] * raw_bs
+                                + [0] * (2 - raw_bs)
+                            }
+                        ]
+                    )
+                    graph.replay.assert_called_once_with()
+
+    def test_split_sfa_runner_does_not_get_fia_length_updates(self):
+        for impl in (
+            "split_graph",
+            "split_graph_dual",
+            "split_graph_dual_v2",
+            "pa_graph",
+        ):
+            with self.subTest(impl=impl):
+                graph, _ = self.capture(1, ["npu_sparse_flash_attention.default"])
+                execute, runner, batch = self.make_runner(
+                    manager=SimpleNamespace(attn_impl=impl, sparse_context_len=2048)
+                )
+                execute(runner, batch)
+                graph.update.assert_not_called()
+                graph.replay.assert_called_once_with()
+
+    def test_normal_mla_runner_still_updates_full_context_length(self):
+        graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
+        execute, runner, batch = self.make_runner(is_dsa=False, bs=2, raw_bs=1)
+        batch.seq_lens.cpu.return_value.tolist.return_value = [32768]
+        execute(runner, batch)
+        graph.update.assert_called_once_with(
+            cpu_update_input=[{"actual_seq_lengths_kv": [32768, 0]}]
         )
-        module = ast.Module(body=[assignment], type_ignores=[])
-        code = compile(ast.fix_missing_locations(module), str(path), "exec")
-        output = object()
-        for result in ((output, None), [output, None], output):
-            namespace = {"ret": result}
-            exec(code, namespace)
-            self.assertIs(namespace["attn_out"], output)
+
+    def test_combined_fia_matches_mla_out_and_page_mapping(self):
+        torch_mock = SimpleNamespace(
+            int32=np.int32,
+            arange=lambda n, **kwargs: FakeTensor(np.arange(n, dtype=kwargs["dtype"])),
+            empty_like=lambda x, **kwargs: FakeTensor(np.empty_like(x.data)),
+            empty=lambda n, **kwargs: FakeTensor(np.empty(n, dtype=kwargs["dtype"])),
+        )
+        workspace = object()
+        fia = Mock(side_effect=AssertionError("Use the explicit .out overload"))
+        npu_mock = SimpleNamespace(
+            _npu_fused_infer_attention_score_get_max_workspace=Mock(
+                return_value=workspace
+            ),
+            npu_fused_infer_attention_score=fia,
+        )
+        call = load_combined_fia(torch_mock, npu_mock)
+        query = FakeTensor(np.zeros((2, 1, 16, 512), dtype=np.float32))
+        query_rope = FakeTensor(np.zeros((2, 1, 16, 64), dtype=np.float32))
+        key = FakeTensor(np.zeros((2, 2048, 1, 512), dtype=np.float32))
+        key_rope = FakeTensor(np.zeros((2, 2048, 1, 64), dtype=np.float32))
+        output = call(
+            query, query_rope, key, key_rope, page_size=128, scale_value=0.125
+        )
+        fia.assert_not_called()
+        args, kwargs = fia.out.call_args
+        self.assertIs(args[0], query)
+        self.assertIs(args[1], args[2])
+        self.assertEqual(args[1].shape, (32, 128, 512))
+        self.assertEqual(kwargs["key_rope"].shape, (32, 128, 64))
+        self.assertTrue(np.shares_memory(args[1].data, key.data))
+        self.assertTrue(np.shares_memory(kwargs["key_rope"].data, key_rope.data))
+        np.testing.assert_array_equal(
+            kwargs["block_table"].data, np.arange(32, dtype=np.int32).reshape(2, 16)
+        )
+        self.assertEqual(kwargs["block_size"], 128)
+        self.assertEqual(kwargs["actual_seq_lengths_kv"], [2048, 2048])
+        self.assertEqual(kwargs["input_layout"], "BSND")
+        self.assertEqual(kwargs["sparse_mode"], 0)
+        self.assertEqual(kwargs["antiquant_mode"], 0)
+        self.assertIsNone(kwargs["antiquant_scale"])
+        self.assertIs(kwargs["workspace"], workspace)
+        self.assertIs(kwargs["out"][0], output)
+        self.assertEqual(output.shape, query.shape)
+        self.assertEqual(kwargs["out"][1].shape, (1,))
+        (
+            ws_args,
+            ws_kwargs,
+        ) = npu_mock._npu_fused_infer_attention_score_get_max_workspace.call_args
+        self.assertEqual(ws_args, args)
+        self.assertEqual(
+            ws_kwargs,
+            {k: v for k, v in kwargs.items() if k not in ("workspace", "out")},
+        )
+        for page_size in (0, 3, 4096):
+            with self.subTest(page_size=page_size):
+                with self.assertRaisesRegex(ValueError, "must be divisible"):
+                    call(
+                        query,
+                        query_rope,
+                        key,
+                        key_rope,
+                        page_size=page_size,
+                        scale_value=0.125,
+                    )
 
 
 if __name__ == "__main__":

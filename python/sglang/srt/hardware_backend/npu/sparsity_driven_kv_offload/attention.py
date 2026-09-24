@@ -117,6 +117,66 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     return topk_indices
 
 
+def _run_combined_decode_fia(
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    key: torch.Tensor,
+    key_rope: torch.Tensor,
+    *,
+    page_size: int,
+    scale_value: float,
+) -> torch.Tensor:
+    """FIA smoke test matching AscendAttnBackend.forward_decode_graph's MLA ABI.
+
+    The selected KV is still the result of sparse prefetch. Treat its entire
+    capacity (including padding) as valid; this is NOT accuracy-preserving DSA.
+    Only reinterpret its contiguous storage as pages -- no additional KV copy.
+    """
+    batch_size, _, num_heads, _ = query.shape
+    _, capacity, num_kv_heads, value_dim = key.shape
+    if page_size <= 0 or capacity % page_size:
+        raise ValueError(
+            f"Combined FIA KV capacity {capacity} must be divisible by "
+            f"the positive page size {page_size}."
+        )
+    blocks_per_req = capacity // page_size
+    block_table = torch.arange(
+        batch_size * blocks_per_req, dtype=torch.int32, device=query.device
+    ).view(batch_size, blocks_per_req)
+    kv_cache = key.view(-1, page_size, num_kv_heads * value_dim)
+    rope_cache = key_rope.view(-1, page_size, num_kv_heads * key_rope.shape[-1])
+    # Like ordinary MLA, pass CPU lengths, not a device Tensor or None.
+    # These lengths describe the selected buffer, NOT the full host KV context.
+    fia_kwargs = dict(
+        query_rope=query_rope,
+        key_rope=rope_cache,
+        num_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        block_table=block_table,
+        block_size=page_size,
+        input_layout="BSND",
+        scale=scale_value,
+        actual_seq_lengths_kv=[capacity] * batch_size,
+        antiquant_mode=0,
+        antiquant_scale=None,
+        sparse_mode=0,
+    )
+    workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+        query, kv_cache, kv_cache, **fia_kwargs
+    )
+    output = torch.empty_like(query, dtype=query.dtype, device=query.device)
+    softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
+    torch_npu.npu_fused_infer_attention_score.out(
+        query,
+        kv_cache,
+        kv_cache,
+        **fia_kwargs,
+        workspace=workspace,
+        out=[output, softmax_lse],
+    )
+    return output
+
+
 def _record_stream_event(stream, event) -> None:
     if hasattr(stream, "record_event"):
         stream.record_event(event)
@@ -757,14 +817,14 @@ def forward_sparsity_driven_kv_offload(
         )
     elif forward_batch.forward_mode.is_decode():
         batch_size = forward_batch.batch_size
-        selected_kv_length = 2048
+        selected_kv_length = sparse_kv_manager.sparse_context_len
         num_kv_heads = layer.tp_k_head_num
         num_query_heads = layer.tp_q_head_num
         nope_head_dim = backend.kv_lora_rank
         rope_head_dim = backend.qk_rope_head_dim
 
         assert num_kv_heads == 1, (
-            "FIA_v2 MLA selected KV path expects KV_N == 1, "
+            "MLA selected KV path expects KV_N == 1, "
             f"got num_kv_heads={num_kv_heads}"
         )
 
@@ -942,59 +1002,6 @@ def forward_sparsity_driven_kv_offload(
             [nope_head_dim, rope_head_dim], dim=-1
         )
 
-        topk_2d = topk_indices
-        if topk_2d.dim() == 3:
-            topk_2d = topk_2d[:, 0, :]
-        elif topk_2d.dim() == 4:
-            topk_2d = topk_2d[:, 0, 0, :]
-        elif topk_2d.dim() != 2:
-            raise RuntimeError(
-                "SFA BSND compact path expects topk rank 2/3/4, " f"got {topk_2d.dim()}"
-            )
-        topk_2d = topk_2d[:, :selected_kv_length].contiguous()
-        topk_length = topk_2d.shape[1]
-
-        topk_valid = topk_2d >= 0
-        if forward_batch.seq_lens is not None:
-            valid_rows = (forward_batch.seq_lens[:batch_size] > 0).view(batch_size, 1)
-            topk_valid = topk_valid & valid_rows
-
-        actual_seq_lengths_kv = (
-            topk_valid.sum(dim=1)
-            .clamp(min=1, max=topk_length)
-            .to(device=q_nope.device, dtype=torch.int32)
-            .contiguous()
-        )
-        actual_seq_lengths_query = torch.ones(
-            batch_size, dtype=torch.int32, device=q_nope.device
-        ).contiguous()
-
-        compact_indices = (
-            torch.arange(topk_length, device=q_nope.device, dtype=torch.int32)
-            .view(1, 1, 1, topk_length)
-            .expand(batch_size, 1, num_kv_heads, topk_length)
-            .clone()
-        )
-        compact_valid = topk_valid.view(batch_size, 1, 1, topk_length).expand(
-            batch_size, 1, num_kv_heads, topk_length
-        )
-        sparse_indices = torch.where(
-            compact_valid,
-            compact_indices,
-            torch.full_like(compact_indices, -1),
-        ).contiguous()
-
-        empty_rows = (topk_valid.sum(dim=1) == 0).view(batch_size, 1, 1)
-        sparse_indices[:, :, :, 0] = torch.where(
-            empty_rows.expand(batch_size, 1, num_kv_heads),
-            torch.zeros(
-                (batch_size, 1, num_kv_heads),
-                dtype=torch.int32,
-                device=q_nope.device,
-            ),
-            sparse_indices[:, :, :, 0],
-        )
-
         q_nope_sfa = q_nope.view(
             batch_size, 1, padded_query_heads, nope_head_dim
         ).contiguous()
@@ -1029,27 +1036,14 @@ def forward_sparsity_driven_kv_offload(
             rope_head_dim,
         )
 
-        # Graph-capture smoke test only: attend over the full KV capacity,
-        # including invalid/padded slots. This does not preserve DSA accuracy.
-        ret = torch_npu.npu_fused_infer_attention_score(
-            query=q_nope_sfa,
-            key=k_nope_sfa,
-            value=k_nope_sfa,
-            query_rope=q_rope_sfa,
-            key_rope=k_rope_sfa,
-            num_heads=padded_query_heads,
-            num_key_value_heads=num_kv_heads,
-            input_layout="BSND",
-            scale=layer.scaling,
-            sparse_mode=0,
-            atten_mask=None,
-            block_table=None,
-            actual_seq_lengths=None,
-            actual_seq_lengths_kv=None,
-            softmax_lse_flag=False,
+        attn_out = _run_combined_decode_fia(
+            q_nope_sfa,
+            q_rope_sfa,
+            k_nope_sfa,
+            k_rope_sfa,
+            page_size=backend.page_size,
+            scale_value=layer.scaling,
         )
-
-        attn_out = ret[0] if isinstance(ret, (tuple, list)) else ret
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(
             batch_size, num_query_heads * nope_head_dim
         )

@@ -179,8 +179,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         )
         if self._fia_update_tasks[shape_key]:
             logger.info(
-                "NPU graph %s captured %d FIA update task(s); direct replay will "
-                "update with captured lengths unchanged.",
+                "NPU graph %s captured %d FIA update task(s); replay requires "
+                "input updates.",
                 shape_key,
                 self._fia_update_tasks[shape_key],
             )
@@ -209,9 +209,9 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             route="captured_lengths" if self._fia_update_tasks[shape_key] else "direct",
         )
         if self._fia_update_tasks[shape_key]:
-            # DSA normally skips CPU length updates for SFA. The fixed-capacity
-            # FIA smoke test still needs the auto-dispatch event handshake.
-            # Do not pass full context lengths: selected KV only holds 2048 rows.
+            # Fallback for callers without explicit CPU metadata. The decode
+            # runner supplies selected-KV lengths for the combined FIA smoke
+            # test via replay_with_input_update, just like ordinary MLA.
             return self.replay_with_input_update(
                 shape_key, seq_lens=None, cpu_update_input=[{}], debug_id=debug_id
             )
