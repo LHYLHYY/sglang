@@ -198,6 +198,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     enable_show_time_cost,
     get_available_gpu_memory,
+    get_bool_env_var,
     is_host_cpu_arm64,
     is_npu,
     numa_utils,
@@ -278,6 +279,9 @@ class ModelRunner:
         # `server_args._draft_pool_config` mutation hack).
         self.memory_pool_config = memory_pool_config
         self.device = server_args.device
+        self._npu_graph_debug = self.device == "npu" and get_bool_env_var(
+            "SGLANG_NPU_GRAPH_DEBUG"
+        )
         self.gpu_id = gpu_id
         self.dcp_size = server_args.dcp_size
         self.dcp_rank = ps.tp_rank % self.dcp_size
@@ -1320,6 +1324,23 @@ class ModelRunner:
         forward_batch.split_index = next_split_index
         return ret
 
+    def _log_npu_graph_forward(self, stage, forward_batch, decode_graph=None):
+        if self._npu_graph_debug:
+            # CPU metadata only; no tensor values or extra device synchronization.
+            logger.info(
+                "[NPU_GRAPH_DEBUG] pid=%d device=%s tp_rank=%s forward=%d "
+                "stage=%s mode=%s batch=%d draft=%s decode_graph=%s",
+                os.getpid(),
+                self.gpu_id,
+                self.ps.tp_rank,
+                self.forward_pass_id,
+                stage,
+                forward_batch.forward_mode.name,
+                forward_batch.batch_size,
+                self.is_draft_worker,
+                decode_graph,
+            )
+
     def forward(
         self,
         forward_batch: ForwardBatch,
@@ -1332,6 +1353,7 @@ class ModelRunner:
         forward_batch.apply_deprecated_skip_attn_backend_init(skip_attn_backend_init)
 
         self.forward_pass_id += 1
+        self._log_npu_graph_forward("forward.enter", forward_batch)
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -1371,6 +1393,7 @@ class ModelRunner:
                 reinit_attn_backend,
                 split_forward_count,
             )
+            self._log_npu_graph_forward("forward.raw_returned", forward_batch)
             if self.enable_elastic_ep:
                 output = self._maybe_rebalance_after_rank_fault(
                     output,
@@ -1414,6 +1437,7 @@ class ModelRunner:
         if get_exec().moe.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
 
+        self._log_npu_graph_forward("forward.returned", forward_batch)
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
@@ -1485,6 +1509,9 @@ class ModelRunner:
                 mode_check()
                 and self.decode_cuda_graph_runner
                 and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+            )
+            self._log_npu_graph_forward(
+                "forward.route", forward_batch, decode_graph=can_run_graph
             )
 
             if (

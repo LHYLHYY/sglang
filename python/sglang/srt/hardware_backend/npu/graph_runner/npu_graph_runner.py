@@ -211,9 +211,19 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        debug_id = self.backend.next_debug_replay_id()
+        self.backend.debug_log(
+            "execute.enter",
+            debug_id=debug_id,
+            mode=forward_batch.forward_mode.name,
+            batch=forward_batch.batch_size,
+        )
         if forward_batch.needs_forward_metadata_init():
+            self.backend.debug_log("load_batch.begin", debug_id=debug_id)
             self.load_batch(forward_batch, pp_proxy_tensors)
+            self.backend.debug_log("load_batch.returned", debug_id=debug_id)
         else:
+            self.backend.debug_log("input_copy.begin", debug_id=debug_id)
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
@@ -232,13 +242,16 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 self.buffers.mrope_positions[:, : self.raw_num_token].copy_(
                     forward_batch.mrope_positions
                 )
+            self.backend.debug_log("input_copy.returned", debug_id=debug_id)
 
         graph_key = self._make_graph_key(self.bs)
+        self.backend.debug_log("execute.graph_selected", graph_key, debug_id)
 
         if not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
+            self.backend.debug_log("seq_lens.cpu.begin", graph_key, debug_id)
             if forward_batch.forward_mode.is_target_verify():
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + self.captured_req_width
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
@@ -246,14 +259,17 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
+            self.backend.debug_log("seq_lens.cpu.returned", graph_key, debug_id)
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,
                 attr_name=self._get_update_attr_name(),
                 attr_type=self._get_update_attr_type(),
+                debug_id=debug_id,
             )
         else:
-            output = self.backend.replay(graph_key, forward_batch)
+            output = self.backend.replay(graph_key, forward_batch, debug_id=debug_id)
+        self.backend.debug_log("execute.backend_returned", graph_key, debug_id)
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

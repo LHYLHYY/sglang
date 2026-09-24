@@ -13,7 +13,9 @@ non-NPU hosts.
 from __future__ import annotations
 
 import logging
+import os
 import threading
+import time
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -59,6 +61,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
         self._tp_group = cuda_graph_runner.model_runner.tp_group
+        self._graph_debug = get_bool_env_var("SGLANG_NPU_GRAPH_DEBUG")
+        self._debug_replay_id = 0
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -67,6 +71,34 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
         )
+        self.debug_log("backend.init", torch_compile=self._enable_torch_compile)
+
+    def next_debug_replay_id(self):
+        if not self._graph_debug:
+            return None
+        self._debug_replay_id += 1
+        return self._debug_replay_id
+
+    def debug_log(self, stage, shape_key=None, debug_id=None, **details):
+        """Host-side breadcrumbs only: never read tensor contents or synchronize.
+
+        Enable SGLANG_NPU_GRAPH_DEBUG before starting the server. A `returned`
+        marker means the host API returned, NOT that NPU work has completed.
+        """
+        if self._graph_debug:
+            logger.info(
+                "[NPU_GRAPH_DEBUG] pid=%d device=%s tp_rank=%s thread=%s "
+                "replay=%s shape=%s stage=%s host_time=%.6f %s",
+                os.getpid(),
+                self._device_id,
+                self._tp_group.rank_in_group,
+                threading.current_thread().name,
+                debug_id,
+                shape_key,
+                stage,
+                time.monotonic(),
+                " ".join(f"{key}={value}" for key, value in details.items()),
+            )
 
     @contextmanager
     def capture_session(self, stream):
@@ -166,14 +198,26 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        debug_id = kwargs.get("debug_id")
+        if debug_id is None:
+            debug_id = self.next_debug_replay_id()
+        self.debug_log(
+            "replay.route",
+            shape_key,
+            debug_id,
+            fia_tasks=self._fia_update_tasks[shape_key],
+            route="captured_lengths" if self._fia_update_tasks[shape_key] else "direct",
+        )
         if self._fia_update_tasks[shape_key]:
             # DSA normally skips CPU length updates for SFA. The fixed-capacity
             # FIA smoke test still needs the auto-dispatch event handshake.
             # Do not pass full context lengths: selected KV only holds 2048 rows.
             return self.replay_with_input_update(
-                shape_key, seq_lens=None, cpu_update_input=[{}]
+                shape_key, seq_lens=None, cpu_update_input=[{}], debug_id=debug_id
             )
+        self.debug_log("replay.begin", shape_key, debug_id)
         self._graphs[shape_key].replay()
+        self.debug_log("replay.returned", shape_key, debug_id)
         return self._outputs[shape_key]
 
     def replay_with_input_update(
@@ -183,6 +227,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         attr_name: str = None,
         attr_type: Any = None,
         cpu_update_input: list = None,
+        debug_id: Optional[int] = None,
     ) -> Any:
         """Rebind seq_lens on the recorded NPU graph in a background
         thread, then replay. Used when the model is not deepseek-nsa.
@@ -199,15 +244,61 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             cpu_update_input = [{attr_name: seq_lens}]
 
         graph = self._graphs[shape_key]
+        if debug_id is None:
+            debug_id = self.next_debug_replay_id()
+        if self._graph_debug:
+            self.debug_log(
+                "update.prepare",
+                shape_key,
+                debug_id,
+                fia_tasks=self._fia_update_tasks.get(shape_key, 0),
+                # Keys only: logging seq_lens tensors could synchronize the NPU.
+                input_keys=[list(item) for item in cpu_update_input],
+            )
 
         def _update():
-            self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+            self.debug_log("update.thread.enter", shape_key, debug_id)
+            try:
+                self.debug_log("update.set_device.begin", shape_key, debug_id)
+                self._device_module.set_device(self._device_id)
+                self.debug_log("update.set_device.returned", shape_key, debug_id)
+                self.debug_log("update.begin", shape_key, debug_id)
+                graph.update(cpu_update_input=cpu_update_input)
+                self.debug_log("update.returned", shape_key, debug_id)
+            except Exception:
+                # Keep the original failure behavior, but identify the rank and
+                # graph even if the main thread is stuck in replay or later work.
+                logger.exception(
+                    "[NPU_GRAPH_DEBUG] pid=%d device=%s tp_rank=%s "
+                    "replay=%s shape=%s stage=update.error",
+                    os.getpid(),
+                    self._device_id,
+                    self._tp_group.rank_in_group,
+                    debug_id,
+                    shape_key,
+                )
+                raise
 
         thread = threading.Thread(target=_update)
+        self.debug_log("update.thread.start", shape_key, debug_id)
         thread.start()
-        graph.replay()
+        self.debug_log("replay.begin", shape_key, debug_id)
+        try:
+            graph.replay()
+        except Exception:
+            logger.exception(
+                "[NPU_GRAPH_DEBUG] pid=%d device=%s replay=%s shape=%s "
+                "stage=replay.error",
+                os.getpid(),
+                self._device_id,
+                debug_id,
+                shape_key,
+            )
+            raise
+        self.debug_log("replay.returned", shape_key, debug_id)
+        self.debug_log("update.join.begin", shape_key, debug_id)
         thread.join()
+        self.debug_log("update.join.returned", shape_key, debug_id)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

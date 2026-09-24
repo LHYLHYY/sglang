@@ -7,8 +7,10 @@ These mocks check routing, not device-side capture or event correctness.
 
 import ast
 import logging
+import os
 import sys
 import threading
+import time
 import unittest
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -42,7 +44,9 @@ def load_backend_class():
         "contextmanager": contextmanager,
         "empty_context": nullcontext,
         "logger": logging.getLogger(__name__),
+        "os": os,
         "threading": threading,
+        "time": time,
     }
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace["NPUCudaGraphBackend"], namespace
@@ -62,6 +66,9 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         self.backend._device_module = Mock()
         self.backend._device_id = 0
         self.backend._tp_group = Mock()
+        self.backend._tp_group.rank_in_group = 3
+        self.backend._graph_debug = False
+        self.backend._debug_replay_id = 0
 
     def capture(self, key, op_names=(), has_dispatch_mode=True):
         graph = SimpleNamespace(replay=Mock(), update=Mock())
@@ -151,6 +158,145 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         self.capture(1, ["npu_fused_infer_attention_score.out"])
         self.backend.cleanup()
         self.assertEqual(self.backend._fia_update_tasks, {})
+
+    def test_debug_disabled_does_not_log_or_synchronize_replay(self):
+        graph, output = self.capture(1, ["npu_fused_infer_attention_score.out"])
+        self.backend._device_module.reset_mock()
+        with patch.dict(self.namespace, {"logger": Mock()}) as namespace:
+            self.assertIs(self.backend.replay(1, None), output)
+            namespace["logger"].info.assert_not_called()
+        self.backend._device_module.synchronize.assert_not_called()
+        self.assertEqual(self.backend._debug_replay_id, 0)
+        graph.update.assert_called_once_with(cpu_update_input=[{}])
+
+    def test_debug_records_update_replay_and_join_with_shared_id(self):
+        graph, output = self.capture(1, ["npu_fused_infer_attention_score.out"])
+        self.backend._graph_debug = True
+        self.backend._device_module.reset_mock()
+        with self.assertLogs(self.namespace["logger"], level="INFO") as logs:
+            self.assertIs(self.backend.replay(1, None), output)
+        stages = [message.split("stage=")[1].split()[0] for message in logs.output]
+        for stage in (
+            "replay.route",
+            "update.prepare",
+            "update.thread.start",
+            "update.thread.enter",
+            "update.set_device.begin",
+            "update.set_device.returned",
+            "update.begin",
+            "update.returned",
+            "replay.begin",
+            "replay.returned",
+            "update.join.begin",
+            "update.join.returned",
+        ):
+            self.assertIn(stage, stages)
+        for begin, end in (
+            ("update.begin", "update.returned"),
+            ("replay.begin", "replay.returned"),
+            ("update.returned", "update.join.returned"),
+            ("replay.returned", "update.join.begin"),
+        ):
+            self.assertLess(stages.index(begin), stages.index(end))
+        for message in logs.output:
+            self.assertIn("replay=1 ", message)
+            self.assertIn("tp_rank=3 ", message)
+            self.assertIn("shape=1 ", message)
+        self.assertTrue(any("input_keys=[[]]" in message for message in logs.output))
+        self.backend._device_module.synchronize.assert_not_called()
+        graph.update.assert_called_once_with(cpu_update_input=[{}])
+
+    def test_update_exception_is_logged_with_traceback(self):
+        graph, _ = self.capture(1, ["npu_fused_infer_attention_score.out"])
+        graph.update.side_effect = RuntimeError("mock update failure")
+        with self.assertLogs(self.namespace["logger"], level="ERROR") as logs:
+            with patch.object(threading, "excepthook") as thread_error:
+                self.backend.replay(1, None)
+        self.assertIn("stage=update.error", logs.output[0])
+        self.assertIn("tp_rank=3", logs.output[0])
+        self.assertIn("Traceback", logs.output[0])
+        self.assertIn("mock update failure", logs.output[0])
+        # Logging must not silently swallow the original thread exception.
+        thread_error.assert_called_once()
+
+    def test_replay_exception_is_logged_and_reraised(self):
+        graph, _ = self.capture(1, ["npu_fused_infer_attention_score.out"])
+        updated = threading.Event()
+        graph.update.side_effect = lambda **kwargs: updated.set()
+
+        def replay():
+            self.assertTrue(updated.wait(timeout=2))
+            raise RuntimeError("mock replay failure")
+
+        graph.replay.side_effect = replay
+        with self.assertLogs(self.namespace["logger"], level="ERROR") as logs:
+            with self.assertRaisesRegex(RuntimeError, "mock replay failure"):
+                self.backend.replay(1, None)
+        self.assertIn("stage=replay.error", logs.output[0])
+        self.assertIn("Traceback", logs.output[0])
+
+    def test_runner_traces_metadata_before_fia_replay(self):
+        graph, _ = self.capture(1, ["npu_fused_infer_attention_score.out"])
+        self.backend._graph_debug = True
+        path = NPU_ROOT / "graph_runner/npu_graph_runner.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        execute = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "execute"
+        )
+        module = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0,
+                ),
+                execute,
+            ],
+            type_ignores=[],
+        )
+        output = SimpleNamespace(
+            next_token_logits=[1], full_logits=None, hidden_states=None
+        )
+        self.backend._outputs[1] = output
+        namespace = {
+            "is_deepseek_dsa": lambda config: True,
+            "LogitsProcessorOutput": SimpleNamespace,
+        }
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        runner = SimpleNamespace(
+            backend=self.backend,
+            load_batch=Mock(),
+            _make_graph_key=lambda bs: bs,
+            bs=1,
+            raw_num_token=1,
+            is_dllm=False,
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(hf_config=object())
+            ),
+        )
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(name="DECODE"),
+            batch_size=1,
+            needs_forward_metadata_init=lambda: True,
+        )
+        with self.assertLogs(self.namespace["logger"], level="INFO") as logs:
+            result = namespace["execute"](runner, batch)
+        stages = [message.split("stage=")[1].split()[0] for message in logs.output]
+        self.assertEqual(
+            stages[:4],
+            [
+                "execute.enter",
+                "load_batch.begin",
+                "load_batch.returned",
+                "execute.graph_selected",
+            ],
+        )
+        self.assertEqual(stages[-1], "execute.backend_returned")
+        self.assertEqual(result.next_token_logits, [1])
+        self.assertEqual(self.backend._debug_replay_id, 1)
+        runner.load_batch.assert_called_once_with(batch, None)
+        graph.update.assert_called_once_with(cpu_update_input=[{}])
 
     def test_attention_accepts_tuple_list_and_tensor_results(self):
         path = NPU_ROOT / "sparsity_driven_kv_offload/attention.py"
