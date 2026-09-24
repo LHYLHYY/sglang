@@ -1049,7 +1049,7 @@ def forward_sparsity_driven_kv_offload(
             softmax_lse_flag=False,
         )
 
-        attn_out = ret[0] if isinstance(ret, tuple) else ret
+        attn_out = ret[0] if isinstance(ret, (tuple, list)) else ret
         attn_out = attn_out[:, :, :num_query_heads, :].reshape(
             batch_size, num_query_heads * nope_head_dim
         )

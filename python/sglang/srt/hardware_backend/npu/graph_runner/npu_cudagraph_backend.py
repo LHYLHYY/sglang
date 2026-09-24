@@ -12,6 +12,7 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import logging
 import threading
 from contextlib import AbstractContextManager, contextmanager
 from functools import partial
@@ -30,6 +31,8 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 )
 from sglang.srt.utils import empty_context, get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -51,6 +54,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, Any] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._fia_update_tasks: Dict[Any, int] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
@@ -125,6 +129,29 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        # Auto-dispatch can insert ExternalEvent waits for FIA (including its
+        # default overload). Even fixed-length calls need update to signal them.
+        dispatch_mode = getattr(graph, "graph_dispatch_mode", None)
+        records = getattr(dispatch_mode, "graph_dispatch_records", ())
+        fia_ops = {
+            "npu_fused_infer_attention_score",
+            "npu_fused_infer_attention_score.default",
+            "npu_fused_infer_attention_score.out",
+            "npu_fused_infer_attention_score_v2",
+            "npu_fused_infer_attention_score_v2.default",
+            "npu_fused_infer_attention_score_v2.out",
+        }
+        self._fia_update_tasks[shape_key] = sum(
+            getattr(getattr(record, "op_cache_entry", None), "__name__", "") in fia_ops
+            for record in records
+        )
+        if self._fia_update_tasks[shape_key]:
+            logger.info(
+                "NPU graph %s captured %d FIA update task(s); direct replay will "
+                "update with captured lengths unchanged.",
+                shape_key,
+                self._fia_update_tasks[shape_key],
+            )
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -139,6 +166,13 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
+        if self._fia_update_tasks[shape_key]:
+            # DSA normally skips CPU length updates for SFA. The fixed-capacity
+            # FIA smoke test still needs the auto-dispatch event handshake.
+            # Do not pass full context lengths: selected KV only holds 2048 rows.
+            return self.replay_with_input_update(
+                shape_key, seq_lens=None, cpu_update_input=[{}]
+            )
         self._graphs[shape_key].replay()
         return self._outputs[shape_key]
 
@@ -179,4 +213,5 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def cleanup(self) -> None:
         self._graphs.clear()
         self._outputs.clear()
+        self._fia_update_tasks.clear()
         self._pool = None
