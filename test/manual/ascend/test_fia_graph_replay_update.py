@@ -73,6 +73,31 @@ def load_combined_fia(torch_module, torch_npu_module):
     return namespace["_run_combined_decode_fia"]
 
 
+def load_method(path, class_name, method_name, namespace):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == class_name
+    )
+    method = next(
+        node
+        for node in cls.body
+        if isinstance(node, ast.FunctionDef) and node.name == method_name
+    )
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            method,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[method_name]
+
+
 class FakeTensor:
     def __init__(self, data):
         self.data = data
@@ -87,6 +112,12 @@ class FakeTensor:
 
     def contiguous(self):
         return FakeTensor(np.ascontiguousarray(self.data))
+
+    def new_zeros(self, shape):
+        return FakeTensor(np.zeros(shape, dtype=self.dtype))
+
+    def tolist(self):
+        return self.data.tolist()
 
     def numel(self):
         return self.data.size
@@ -461,6 +492,7 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             "is_deepseek_v4": lambda config: False,
             "LogitsProcessorOutput": SimpleNamespace,
             "SPARSE_KV_ATTN_IMPL_COMBINED": "combined",
+            "SPARSE_KV_ATTN_IMPL_NATIVE_FIA": "native_fia",
             "SPARSE_KV_ATTN_IMPL_SPLIT_EAGER": "split_eager",
         }
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
@@ -490,6 +522,7 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             ),
             batch_size=raw_bs,
             seq_lens=Mock(),
+            seq_lens_cpu=None,
             needs_forward_metadata_init=lambda: True,
         )
         return namespace["execute"], runner, batch
@@ -619,6 +652,53 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             execute(runner, batch)
         self.assertTrue(any("route=native_mla_fia" in line for line in logs.output))
 
+    def test_native_offload_updates_selected_lengths_from_cpu_metadata(self):
+        graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
+        execute, runner, batch = self.make_runner(
+            manager=SimpleNamespace(attn_impl="native_fia", sparse_context_len=2048),
+            bs=4,
+            raw_bs=3,
+        )
+        batch.seq_lens_cpu = FakeTensor(np.array([7, 2048, 10001, 9999]))
+        batch.seq_lens.cpu.side_effect = AssertionError("CPU lengths already exist")
+        execute(runner, batch)
+        graph.update.assert_called_once_with(
+            cpu_update_input=[{"actual_seq_lengths_kv": [7, 2048, 2048, 0]}]
+        )
+        graph.replay.assert_called_once_with()
+        np.testing.assert_array_equal(batch.seq_lens_cpu.data, [7, 2048, 10001, 9999])
+
+    def test_native_offload_missing_cpu_lengths_falls_back_before_replay(self):
+        graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
+        execute, runner, batch = self.make_runner(
+            manager=SimpleNamespace(attn_impl="native_fia", sparse_context_len=128),
+            bs=4,
+            raw_bs=3,
+        )
+        batch.seq_lens.cpu.return_value.tolist.return_value = [-1, 1, 10001]
+        execute(runner, batch)
+        graph.update.assert_called_once_with(
+            cpu_update_input=[{"actual_seq_lengths_kv": [0, 1, 128, 0]}]
+        )
+
+    def test_native_offload_idle_always_updates_zero_without_reading_lengths(self):
+        graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
+        execute, runner, batch = self.make_runner(
+            manager=SimpleNamespace(attn_impl="native_fia", sparse_context_len=2048),
+            mode="IDLE",
+            bs=4,
+            raw_bs=0,
+        )
+        batch.seq_lens_cpu = Mock(
+            tolist=Mock(side_effect=AssertionError("IDLE must not read stale lengths"))
+        )
+        batch.seq_lens.cpu.side_effect = AssertionError("IDLE must not copy lengths")
+        execute(runner, batch)
+        graph.update.assert_called_once_with(
+            cpu_update_input=[{"actual_seq_lengths_kv": [0, 0, 0, 0]}]
+        )
+        graph.replay.assert_called_once_with()
+
     def test_combined_fia_matches_mla_out_and_page_mapping(self):
         torch_mock = SimpleNamespace(
             int32=np.int32,
@@ -683,6 +763,119 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
                         page_size=page_size,
                         scale_value=0.125,
                     )
+
+
+class TestSharedMLAFIA(unittest.TestCase):
+    def test_stock_and_offload_share_workspace_out_padding_and_crop(self):
+        for heads, padded_heads, graph_padding in (
+            (2, 2, False),
+            (3, 4, False),
+            (3, 4, True),
+        ):
+            with self.subTest(heads=heads, graph_padding=graph_padding):
+                torch_mock = SimpleNamespace(
+                    cat=lambda tensors, dim: FakeTensor(
+                        np.concatenate([tensor.data for tensor in tensors], axis=dim)
+                    ),
+                    empty_like=lambda tensor, **kw: FakeTensor(
+                        np.empty_like(tensor.data)
+                    ),
+                    empty=lambda shape, **kw: FakeTensor(
+                        np.empty(shape, dtype=kw["dtype"])
+                    ),
+                )
+                workspace = object()
+                fia = Mock(side_effect=AssertionError("Use the explicit .out overload"))
+
+                def fill_output(*args, **kwargs):
+                    output = kwargs["out"][0].data
+                    output[...] = np.arange(output.shape[2])[None, None, :, None]
+
+                fia.out.side_effect = fill_output
+                npu_mock = SimpleNamespace(
+                    _npu_fused_infer_attention_score_get_max_workspace=Mock(
+                        return_value=workspace
+                    ),
+                    npu_fused_infer_attention_score=fia,
+                )
+                forward = load_method(
+                    NPU_ROOT / "attention/ascend_backend.py",
+                    "AscendAttnBackend",
+                    "forward_mla_fia",
+                    {"torch": torch_mock, "torch_npu": npu_mock},
+                )
+                tensor = lambda shape: FakeTensor(np.ones(shape, dtype=np.float32))
+                metadata = SimpleNamespace()
+                if graph_padding:
+                    metadata.nope_padding = FakeTensor(np.zeros((2, 1, 1, 512)))
+                    metadata.rope_padding = FakeTensor(np.zeros((2, 1, 1, 64)))
+                backend = SimpleNamespace(
+                    forward_metadata=metadata,
+                    q_head_num_padding=padded_heads,
+                    kv_lora_rank=512,
+                    qk_rope_head_dim=64,
+                    page_size=128,
+                )
+                layer = SimpleNamespace(
+                    tp_q_head_num=heads, tp_k_head_num=1, scaling=0.125
+                )
+                key, rope = tensor((4, 128, 512)), tensor((4, 128, 64))
+                page_table = FakeTensor(np.arange(4, dtype=np.int32).reshape(2, 2))
+                lengths = [7, 256]
+                result = forward(
+                    backend,
+                    tensor((2, heads, 512)),
+                    tensor((2, heads, 64)),
+                    layer,
+                    key,
+                    rope,
+                    page_table,
+                    lengths,
+                )
+                fia.assert_not_called()
+                args, kwargs = fia.out.call_args
+                self.assertIs(args[1], key)
+                self.assertIs(args[2], key)
+                self.assertIs(kwargs["key_rope"], rope)
+                self.assertIs(kwargs["block_table"], page_table)
+                self.assertIs(kwargs["actual_seq_lengths_kv"], lengths)
+                self.assertEqual(args[0].shape, (2, 1, padded_heads, 512))
+                self.assertEqual(kwargs["query_rope"].shape, (2, 1, padded_heads, 64))
+                self.assertEqual(kwargs["num_heads"], padded_heads)
+                self.assertEqual(kwargs["num_key_value_heads"], 1)
+                self.assertEqual(kwargs["block_size"], 128)
+                self.assertEqual(kwargs["input_layout"], "BSND")
+                self.assertEqual(kwargs["scale"], 0.125)
+                self.assertEqual(kwargs["sparse_mode"], 0)
+                self.assertEqual(kwargs["antiquant_mode"], 0)
+                self.assertIsNone(kwargs["antiquant_scale"])
+                self.assertIs(kwargs["workspace"], workspace)
+                self.assertEqual(kwargs["out"][1].shape, (1,))
+                (
+                    ws_args,
+                    ws_kwargs,
+                ) = (
+                    npu_mock._npu_fused_infer_attention_score_get_max_workspace.call_args
+                )
+                self.assertEqual(ws_args, args)
+                self.assertEqual(
+                    ws_kwargs,
+                    {
+                        key: value
+                        for key, value in kwargs.items()
+                        if key not in ("workspace", "out")
+                    },
+                )
+                if padded_heads > heads:
+                    self.assertTrue(np.all(args[0].data[:, :, heads:, :] == 0))
+                    self.assertTrue(
+                        np.all(kwargs["query_rope"].data[:, :, heads:, :] == 0)
+                    )
+                self.assertEqual(result.shape, (2, heads * 512))
+                np.testing.assert_array_equal(
+                    result.data.reshape(2, heads, 512),
+                    np.broadcast_to(np.arange(heads)[None, :, None], (2, heads, 512)),
+                )
 
 
 class TestDSAFIANativeConfig(unittest.TestCase):
@@ -841,6 +1034,177 @@ class TestDSAFIANativeConfig(unittest.TestCase):
             with self.subTest(env=env_name), patch.dict(os.environ, {env_name: "1"}):
                 with self.assertRaises(ValueError):
                     self.namespace["is_dsa_fia_native_enabled"](**self.config_args())
+
+
+class TestNativeFIAOffloadConfig(unittest.TestCase):
+    def setUp(self):
+        TestDSAFIANativeConfig.setUp(self)
+        self.graph = SimpleNamespace(
+            decode=SimpleNamespace(backend="full", max_bs=64, bs=[1, 8, 80]),
+            prefill=SimpleNamespace(backend="disabled"),
+        )
+        self.namespace["get_exec"] = Mock(side_effect=ValueError("not initialized"))
+        load_functions(
+            NPU_ROOT / "sparsity_driven_kv_offload/config.py",
+            {
+                "get_sparse_kv_attn_impl",
+                "_get_native_fia_offload_graph_config",
+                "get_native_fia_offload_max_batch_size",
+                "get_native_fia_offload_buffer_size",
+                "is_sparsity_driven_kv_offload_enabled",
+                "get_sparsity_driven_kv_offload_cell_size",
+            },
+            self.namespace,
+        )
+        os.environ.update(
+            SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD="1",
+            SGLANG_NPU_DSA_FIA_NATIVE="0",
+            SGLANG_NPU_SPARSE_KV_ATTN_IMPL="native_fia",
+        )
+
+    def config_args(self):
+        args = TestDSAFIANativeConfig.config_args(self)
+        vars(args["server_args"]).update(
+            max_running_requests=32,
+            cuda_graph_config=self.graph,
+            tp_size=16,
+            enable_pdmux=False,
+            enable_two_batch_overlap=False,
+            disable_radix_cache=True,
+            disaggregation_mode="null",
+        )
+        return args
+
+    def test_native_offload_keeps_only_index_pool_per_token_and_one_staging_buffer(
+        self,
+    ):
+        args = self.config_args()
+        args["model_config"].hf_config.index_topk = 2050
+        self.assertTrue(self.namespace["is_sparsity_driven_kv_offload_enabled"](**args))
+        self.assertEqual(
+            self.namespace["get_sparsity_driven_kv_offload_cell_size"](
+                **args, num_layers=61, element_size=2
+            ),
+            128 * 61 * 2,
+        )
+        # Cover the largest graph bucket, round K to complete pages, and do not
+        # multiply staging by layer count or by the full context length.
+        padded_topk, pages, batch_size = 2176, 17, 80
+        self.assertEqual(
+            self.namespace["get_native_fia_offload_buffer_size"](
+                model_config=args["model_config"],
+                server_args=args["server_args"],
+                page_size=128,
+                element_size=2,
+            ),
+            batch_size * padded_topk * 576 * 2
+            + batch_size * pages * 4
+            + padded_topk * 8,
+        )
+
+    def test_resolved_graph_capacity_overrides_server_args_and_covers_tp_padding(self):
+        args = self.config_args()["server_args"]
+        get_capacity = self.namespace["get_native_fia_offload_max_batch_size"]
+        self.assertEqual(get_capacity(args), 80)
+        published = SimpleNamespace(
+            decode=SimpleNamespace(backend="full", max_bs=97, bs=[128]),
+            prefill=SimpleNamespace(backend="disabled"),
+        )
+        self.namespace["get_exec"].side_effect = None
+        self.namespace["get_exec"].return_value = SimpleNamespace(
+            graph=SimpleNamespace(cuda_graph_config=published)
+        )
+        self.assertEqual(get_capacity(args), 128)
+        published.decode.backend = "disabled"
+        args.max_running_requests = 33
+        self.assertEqual(get_capacity(args), 48)
+
+    def test_native_only_and_legacy_modes_do_not_reserve_offload_staging(self):
+        args = self.config_args()
+        reserve = self.namespace["get_native_fia_offload_buffer_size"]
+        for environment in (
+            {"SGLANG_NPU_DSA_FIA_NATIVE": "1"},
+            {"SGLANG_NPU_SPARSE_KV_ATTN_IMPL": "combined"},
+            {"SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD": "0"},
+        ):
+            with self.subTest(environment=environment), patch.dict(
+                os.environ, environment
+            ):
+                self.assertEqual(
+                    reserve(
+                        model_config=args["model_config"],
+                        server_args=args["server_args"],
+                        page_size=128,
+                        element_size=2,
+                    ),
+                    0,
+                )
+
+    def test_unsupported_ownership_graph_and_execution_modes_fail_at_startup(self):
+        enabled = self.namespace["is_sparsity_driven_kv_offload_enabled"]
+        for field, value in (
+            ("disable_radix_cache", False),
+            ("enable_pdmux", True),
+            ("enable_two_batch_overlap", True),
+            ("disaggregation_mode", "decode"),
+            ("max_running_requests", None),
+            ("max_running_requests", 0),
+            ("enable_prefill_cp", True),
+            ("attn_cp_size", 2),
+            ("dcp_size", 2),
+            ("speculative_algorithm", "EAGLE"),
+            ("enable_torch_compile", True),
+            ("kv_cache_dtype", "fp8_e4m3"),
+        ):
+            with self.subTest(field=field, value=value):
+                args = self.config_args()
+                setattr(args["server_args"], field, value)
+                with self.assertRaises(ValueError):
+                    enabled(**args)
+        for value in (True, 0, -1, 2.5):
+            with self.subTest(index_topk=value):
+                args = self.config_args()
+                args["model_config"].hf_config.index_topk = value
+                with self.assertRaisesRegex(ValueError, "positive integer index_topk"):
+                    enabled(**args)
+        self.graph.prefill.backend = "full"
+        with self.assertRaisesRegex(ValueError, "prefill graph"):
+            enabled(**self.config_args())
+
+    def test_native_offload_requires_real_io_and_nd_fia(self):
+        for env_name in (
+            "SGLANG_NPU_USE_MLAPO",
+            "SGLANG_USE_FIA_NZ",
+            "SGLANG_NPU_SPARSE_KV_FIA_SKIP_KV_IO",
+        ):
+            with self.subTest(env=env_name), patch.dict(os.environ, {env_name: "1"}):
+                with self.assertRaises(ValueError):
+                    self.namespace["is_sparsity_driven_kv_offload_enabled"](
+                        **self.config_args()
+                    )
+
+    def test_pool_capacity_subtracts_fixed_staging_before_token_page_alignment(self):
+        calculate = load_method(
+            NPU_ROOT.parents[1] / "model_executor/pool_configurator.py",
+            "DefaultPoolConfigurator",
+            "calculate_pool_sizes",
+            {"MemoryPoolConfig": SimpleNamespace},
+        )
+        pool = SimpleNamespace(
+            _native_fia_offload_buffer_bytes=123456, _cell_size=128 * 61 * 2,
+        )
+        available = pool._native_fia_offload_buffer_bytes + pool._cell_size * 1001
+        result = calculate(pool, available, 128)
+        self.assertEqual(result.max_total_num_tokens, 896)
+        for available in (123456, 123455):
+            with self.subTest(available=available), self.assertRaisesRegex(
+                ValueError, "staging"
+            ):
+                calculate(pool, available, 128)
+        pool._native_fia_offload_buffer_bytes = 0
+        self.assertEqual(
+            calculate(pool, pool._cell_size * 1001, 128).max_total_num_tokens, 896
+        )
 
 
 class TestDSAFIANativeAttentionRouting(unittest.TestCase):
@@ -1076,6 +1440,122 @@ class TestFIASkipKVIO(unittest.TestCase):
         self.manager.offload_v2.assert_not_called()
         self.manager.prefetch.assert_called_once()
         self.call_fia.assert_called_once()
+
+
+class TestNativeFIAOffloadAttention(unittest.TestCase):
+    def setUp(self):
+        TestFIASkipKVIO.setUp(self)
+
+    def make_case(self, *, prefill=False, graph_mode=True, cpu_tensor=False):
+        case = TestFIASkipKVIO.make_case(self, prefill=prefill, graph_mode=graph_mode)
+        self.manager.attn_impl = "native_fia"
+        self.manager.sparse_context_len = 2048
+        tensor = lambda shape: FakeTensor(np.ones(shape, dtype=np.float32))
+        self.pages = tensor((32, 128, 512))
+        self.rope_pages = tensor((32, 128, 64))
+        self.selected_table = FakeTensor(np.arange(32, dtype=np.int32).reshape(2, 16))
+        self.manager.prefetch_native_fia = Mock(
+            return_value=(self.pages, self.rope_pages, self.selected_table)
+        )
+        metadata = case["backend"].forward_metadata
+        metadata.seq_lens_cpu_int = (
+            FakeTensor(np.array([7, 10001])) if cpu_tensor else None
+        )
+        metadata.seq_lens_cpu_list = [7, 10001]
+        metadata.block_tables = object()
+        case["backend"].forward_mla_fia = Mock(return_value="native_attention_output")
+        return case
+
+    def test_decode_orders_real_io_then_shared_fia_and_preserves_full_metadata(self):
+        for graph_mode in (False, True):
+            for cpu_tensor in (False, True):
+                with self.subTest(graph_mode=graph_mode, cpu_tensor=cpu_tensor):
+                    case = self.make_case(graph_mode=graph_mode, cpu_tensor=cpu_tensor)
+                    metadata = case["backend"].forward_metadata
+                    metadata_before = vars(metadata).copy()
+                    ordered = Mock()
+                    ordered.attach_mock(self.manager.offload_v2, "offload")
+                    ordered.attach_mock(self.manager.prefetch_native_fia, "gather")
+                    ordered.attach_mock(case["backend"].forward_mla_fia, "fia")
+                    output = self.forward(**case)
+                    self.assertEqual(output, "native_attention_output")
+                    self.assertEqual(
+                        [call[0] for call in ordered.mock_calls],
+                        ["offload", "gather", "fia"],
+                    )
+                    self.manager.offload_v2.assert_called_once()
+                    self.assertEqual(
+                        self.manager.offload_v2.call_args.args[-1], "main_stream"
+                    )
+                    self.manager.prefetch_native_fia.assert_called_once_with(
+                        case["layer"], case["forward_batch"], case["topk_indices"]
+                    )
+                    args = case["backend"].forward_mla_fia.call_args.args
+                    self.assertIs(args[0], case["q"])
+                    self.assertIs(args[1], case["q_rope"])
+                    self.assertIs(args[2], case["layer"])
+                    self.assertIs(args[3], self.pages)
+                    self.assertIs(args[4], self.rope_pages)
+                    self.assertIs(args[5], self.selected_table)
+                    self.assertEqual(args[6], [7, 2048])
+                    for name, value in metadata_before.items():
+                        self.assertIs(getattr(metadata, name), value)
+                    self.assertEqual(metadata.seq_lens_cpu_list, [7, 10001])
+                    if cpu_tensor:
+                        np.testing.assert_array_equal(
+                            metadata.seq_lens_cpu_int.data, [7, 10001]
+                        )
+                    self.manager.prefetch.assert_not_called()
+                    self.manager.get_forward_kv.assert_not_called()
+                    self.call_fia.assert_not_called()
+                    self.npu_mock.npu_sparse_flash_attention.assert_not_called()
+
+    def test_decode_without_new_kv_still_gathers_selected_host_pages(self):
+        case = self.make_case()
+        self.forward(**case, save_kv_cache=False)
+        self.manager.offload_v2.assert_not_called()
+        self.manager.prefetch_native_fia.assert_called_once()
+        case["backend"].forward_mla_fia.assert_called_once()
+
+    def test_eager_dp_padding_extends_local_cpu_lengths_with_zero(self):
+        for length in (7, 10001):
+            with self.subTest(length=length):
+                case = self.make_case(graph_mode=False, cpu_tensor=True)
+                metadata = case["backend"].forward_metadata
+                metadata.seq_lens_cpu_int = FakeTensor(np.array([length]))
+                metadata.seq_lens_cpu_list = [length]
+                original_cpu_lengths = metadata.seq_lens_cpu_int
+                original_block_tables = metadata.block_tables
+                # Eager attention DP pads Q and device metadata to another
+                # rank's batch size after creating the local CPU metadata.
+                batch = case["forward_batch"]
+                batch.seq_lens = FakeTensor(np.array([length, 0]))
+                batch.req_pool_indices = FakeTensor(np.array([1, 0]))
+                self.assertEqual(case["q"].shape[0], 2)
+                self.assertEqual(self.selected_table.shape[0], 2)
+                self.forward(**case)
+                fia_args = case["backend"].forward_mla_fia.call_args.args
+                self.assertEqual(fia_args[-1], [min(length, 2048), 0])
+                self.assertIs(metadata.seq_lens_cpu_int, original_cpu_lengths)
+                self.assertEqual(metadata.seq_lens_cpu_int.tolist(), [length])
+                self.assertEqual(metadata.seq_lens_cpu_list, [length])
+                self.assertIs(metadata.block_tables, original_block_tables)
+
+    def test_metadata_longer_than_selected_batch_is_rejected_before_fia(self):
+        case = self.make_case(graph_mode=False)
+        case["backend"].forward_metadata.seq_lens_cpu_list = [7, 10001, 99]
+        with self.assertRaises(ValueError):
+            self.forward(**case)
+        case["backend"].forward_mla_fia.assert_not_called()
+
+    def test_prefill_keeps_real_offload_and_original_dsa_sfa(self):
+        case = self.make_case(prefill=True, graph_mode=False)
+        self.forward(**case)
+        self.manager.offload_v2.assert_called_once()
+        self.manager.get_forward_kv.assert_called_once()
+        self.manager.prefetch_native_fia.assert_not_called()
+        case["backend"].forward_mla_fia.assert_not_called()
+        self.npu_mock.npu_sparse_flash_attention.assert_called_once()
 
 
 if __name__ == "__main__":

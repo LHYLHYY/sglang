@@ -24,6 +24,7 @@ else:
     )
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
@@ -771,6 +772,43 @@ def forward_sparsity_driven_kv_offload(
     )
     if save_kv_cache and not skip_decode_kv_io:
         sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
+
+    if (
+        sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_NATIVE_FIA
+        and forward_batch.forward_mode.is_decode()
+    ):
+        if layer.tp_k_head_num != 1:
+            raise ValueError("Native FIA offload requires one MLA KV head.")
+        c_kv_cache, k_rope_cache, block_table = (
+            sparse_kv_manager.prefetch_native_fia(layer, forward_batch, topk_indices)
+        )
+        # Capture uses the already prepared CPU list; replay updates this FIA
+        # input explicitly. The indexer keeps its original full-context lengths.
+        metadata = backend.forward_metadata
+        seq_lens = (
+            metadata.seq_lens_cpu_list
+            if metadata.seq_lens_cpu_int is None
+            else metadata.seq_lens_cpu_int.tolist()
+        )
+        selected_lengths = [
+            min(max(int(length), 0), sparse_kv_manager.sparse_context_len)
+            for length in seq_lens
+        ]
+        # Eager metadata is prepared before DP pads the query/request rows.
+        # Preserve local lengths and explicitly mask the extra FIA batch rows.
+        batch_size = block_table.shape[0]
+        if len(selected_lengths) > batch_size:
+            raise ValueError("Native FIA CPU lengths exceed the selected-KV batch.")
+        selected_lengths += [0] * (batch_size - len(selected_lengths))
+        return backend.forward_mla_fia(
+            q_nope,
+            q_pe,
+            layer,
+            c_kv_cache,
+            k_rope_cache,
+            block_table,
+            selected_lengths,
+        )
 
     if is_prefill:
         if backend.forward_metadata.actual_seq_lengths_q is not None:

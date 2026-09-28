@@ -20,9 +20,11 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
+    get_native_fia_offload_max_batch_size,
     get_sparse_kv_attn_impl,
     is_dsa_fia_native_enabled,
     is_sparsity_driven_kv_offload_enabled,
@@ -376,16 +378,48 @@ class AscendAttnBackend(AttentionBackend):
                 register_sparse_kv_manager,
             )
 
-            self.sparse_kv_manager = SparseKVCacheManager(
-                model_runner.req_to_token_pool,
-                model_runner.token_to_kv_pool_allocator,
-            )
+            if get_sparse_kv_attn_impl() == SPARSE_KV_ATTN_IMPL_NATIVE_FIA:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.native_fia_manager import (
+                    NativeFIAOffloadManager,
+                )
+
+                self.sparse_kv_manager = NativeFIAOffloadManager(
+                    model_runner.req_to_token_pool,
+                    model_runner.token_to_kv_pool_allocator,
+                    topk=model_runner.model_config.hf_config.index_topk,
+                    max_batch_size=get_native_fia_offload_max_batch_size(
+                        model_runner.server_args
+                    ),
+                    page_size=self.page_size,
+                )
+            else:
+                self.sparse_kv_manager = SparseKVCacheManager(
+                    model_runner.req_to_token_pool,
+                    model_runner.token_to_kv_pool_allocator,
+                )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",
                 self.sparse_kv_manager,
             )
-        self.use_fia = self.dsa_fia_native or get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.native_fia_offload = (
+            self.sparse_kv_manager is not None
+            and self.sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_NATIVE_FIA
+        )
+        self.use_fia = (
+            self.dsa_fia_native
+            or self.native_fia_offload
+            or get_bool_env_var("ASCEND_USE_FIA", "False")
+        )
+        if self.native_fia_offload:
+            self.use_fa = False
+            logger.info(
+                "NPU DSA native FIA offload: indexer enabled, full KV on host; "
+                "selected KV gather + stock MLA FIA on the current stream. "
+                "topk=%s, page_size=%s; no hot-cache or host callbacks.",
+                self.sparse_kv_manager.sparse_context_len,
+                self.page_size,
+            )
         if self.dsa_fia_native:
             logger.warning(
                 "NPU DSA native FIA diagnostic: stock MHA prefill + MLA decode, "
@@ -691,7 +725,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
-        if self.enable_sparsity_driven_kv_offload:
+        if self.enable_sparsity_driven_kv_offload and not self.native_fia_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
             )
@@ -2540,27 +2574,6 @@ class AscendAttnBackend(AttentionBackend):
                     -1, self.page_size, layer.tp_k_head_num * self.kv_lora_rank
                 )
 
-            q_nope = q.view(-1, 1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
-            q_rope = q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
-
-            assert (
-                self.q_head_num_padding is None
-                or self.q_head_num_padding >= layer.tp_q_head_num
-            )
-
-            if (
-                self.q_head_num_padding is not None
-                and self.q_head_num_padding > layer.tp_q_head_num
-            ):
-                # The FIA kernel only supports head counts that are powers of 2.
-                # Therefore, we pad the head dimension when it is not a power of 2.
-                q_nope = torch.cat(
-                    [q_nope, self.forward_metadata.nope_padding], dim=2
-                ).contiguous()
-                q_rope = torch.cat(
-                    [q_rope, self.forward_metadata.rope_padding], dim=2
-                ).contiguous()
-
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_len_kv = self.forward_metadata.seq_lens_cpu_list
             else:
@@ -2568,48 +2581,100 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
 
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                q_nope,
+            return self.forward_mla_fia(
+                q,
+                q_rope,
+                layer,
                 c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
-                num_key_value_heads=layer.tp_k_head_num,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                input_layout="BSND",
-                scale=layer.scaling,
-                actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                sparse_mode=0,
-            )
-            output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
-            softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-
-            torch_npu.npu_fused_infer_attention_score.out(
-                q_nope,
-                c_kv_cache,
-                c_kv_cache,
-                query_rope=q_rope,
-                key_rope=k_rope_cache,
-                num_heads=self.q_head_num_padding,
-                num_key_value_heads=layer.tp_k_head_num,
-                block_table=self.forward_metadata.block_tables,
-                block_size=self.page_size,
-                input_layout="BSND",
-                scale=layer.scaling,
-                actual_seq_lengths_kv=actual_seq_len_kv,
-                antiquant_mode=0,
-                antiquant_scale=None,
-                sparse_mode=0,
-                workspace=workspace,
-                out=[output, softmax_lse],
+                k_rope_cache,
+                self.forward_metadata.block_tables,
+                actual_seq_len_kv,
             )
 
-            output = output[:, :, : layer.tp_q_head_num, :]
-            return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
+    def forward_mla_fia(
+        self,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        layer: RadixAttention,
+        c_kv_cache: torch.Tensor,
+        k_rope_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        actual_seq_len_kv: List[int],
+    ) -> torch.Tensor:
+        """Stock MLA FIA ABI, shared by native KV and host-gathered DSA KV.
+
+        Only the KV pages, page table and CPU lengths differ between callers.
+        Never replace full-context indexer metadata with selected-KV metadata.
+        """
+        q_nope = q.view(-1, 1, layer.tp_q_head_num, self.kv_lora_rank).contiguous()
+        q_rope = q_rope.view(-1, 1, layer.tp_q_head_num, self.qk_rope_head_dim)
+
+        assert (
+            self.q_head_num_padding is None
+            or self.q_head_num_padding >= layer.tp_q_head_num
+        )
+
+        if (
+            self.q_head_num_padding is not None
+            and self.q_head_num_padding > layer.tp_q_head_num
+        ):
+            # The FIA kernel only supports head counts that are powers of 2.
+            # Therefore, we pad the head dimension when it is not a power of 2.
+            nope_padding = getattr(self.forward_metadata, "nope_padding", None)
+            rope_padding = getattr(self.forward_metadata, "rope_padding", None)
+            if nope_padding is None:
+                padding_heads = self.q_head_num_padding - layer.tp_q_head_num
+                nope_padding = q_nope.new_zeros(
+                    (q_nope.shape[0], 1, padding_heads, self.kv_lora_rank)
+                )
+                rope_padding = q_rope.new_zeros(
+                    (q_rope.shape[0], 1, padding_heads, self.qk_rope_head_dim)
+                )
+            q_nope = torch.cat([q_nope, nope_padding], dim=2).contiguous()
+            q_rope = torch.cat([q_rope, rope_padding], dim=2).contiguous()
+
+        workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            query_rope=q_rope,
+            key_rope=k_rope_cache,
+            num_heads=self.q_head_num_padding,
+            num_key_value_heads=layer.tp_k_head_num,
+            block_table=block_table,
+            block_size=self.page_size,
+            input_layout="BSND",
+            scale=layer.scaling,
+            actual_seq_lengths_kv=actual_seq_len_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
+        )
+        output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
+        softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
+
+        torch_npu.npu_fused_infer_attention_score.out(
+            q_nope,
+            c_kv_cache,
+            c_kv_cache,
+            query_rope=q_rope,
+            key_rope=k_rope_cache,
+            num_heads=self.q_head_num_padding,
+            num_key_value_heads=layer.tp_k_head_num,
+            block_table=block_table,
+            block_size=self.page_size,
+            input_layout="BSND",
+            scale=layer.scaling,
+            actual_seq_lengths_kv=actual_seq_len_kv,
+            antiquant_mode=0,
+            antiquant_scale=None,
+            sparse_mode=0,
+            workspace=workspace,
+            out=[output, softmax_lse],
+        )
+
+        output = output[:, :, : layer.tp_q_head_num, :]
+        return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
 
     def forward_decode(
         self,

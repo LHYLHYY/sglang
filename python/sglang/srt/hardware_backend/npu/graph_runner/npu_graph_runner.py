@@ -44,6 +44,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_COMBINED,
+    SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
 )
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
@@ -262,11 +263,38 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             in (SPARSE_KV_ATTN_IMPL_COMBINED, SPARSE_KV_ATTN_IMPL_SPLIT_EAGER)
         )
         native_fia = getattr(self.attn_backend, "dsa_fia_native", False)
-        if native_fia or sparse_fia or not (
+        native_fia_offload = (
+            sparse_kv_manager is not None
+            and sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_NATIVE_FIA
+        )
+        if native_fia or native_fia_offload or sparse_fia or not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
-            if sparse_fia:
+            if native_fia_offload:
+                # IDLE ranks replay a decode graph too. Update all lengths to
+                # zero, including padding, instead of retaining capture values.
+                capacity = sparse_kv_manager.sparse_context_len
+                if forward_batch.forward_mode.is_idle():
+                    seq_lens = [0] * self.bs
+                else:
+                    cpu_lens = forward_batch.seq_lens_cpu
+                    if cpu_lens is None:
+                        cpu_lens = forward_batch.seq_lens.cpu()
+                    seq_lens = [
+                        min(max(int(length), 0), capacity)
+                        for length in cpu_lens.tolist()[: self.raw_bs]
+                    ] + [0] * (self.bs - self.raw_bs)
+                self.backend.debug_log(
+                    "seq_lens.selected_kv",
+                    graph_key,
+                    debug_id,
+                    capacity=capacity,
+                    raw_bs=self.raw_bs,
+                    padded_bs=self.bs,
+                    route="native_fia_offload",
+                )
+            elif sparse_fia:
                 # Match ordinary MLA's explicit CPU-length update, but describe
                 # the selected KV pages rather than the full host KV context.
                 # Padded graph requests use zero lengths, as in ordinary MLA.
@@ -306,10 +334,14 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens=seq_lens,
                 attr_name=(
                     "actual_seq_lengths_kv"
-                    if sparse_fia
+                    if sparse_fia or native_fia_offload
                     else self._get_update_attr_name()
                 ),
-                attr_type=[] if sparse_fia else self._get_update_attr_type(),
+                attr_type=(
+                    []
+                    if sparse_fia or native_fia_offload
+                    else self._get_update_attr_type()
+                ),
                 debug_id=debug_id,
             )
         else:
