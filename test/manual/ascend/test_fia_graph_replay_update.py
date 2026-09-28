@@ -15,7 +15,7 @@ import unittest
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
 
@@ -498,6 +498,7 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
         runner = SimpleNamespace(
             backend=self.backend,
+            buffers=SimpleNamespace(seq_lens=MagicMock()),
             attn_backend=SimpleNamespace(
                 sparse_kv_manager=manager, dsa_fia_native=native
             ),
@@ -652,36 +653,46 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             execute(runner, batch)
         self.assertTrue(any("route=native_mla_fia" in line for line in logs.output))
 
-    def test_native_offload_updates_selected_lengths_from_cpu_metadata(self):
+    def test_native_offload_reads_loaded_graph_lengths_even_when_cpu_metadata_exists(
+        self,
+    ):
         graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
         execute, runner, batch = self.make_runner(
             manager=SimpleNamespace(attn_impl="native_fia", sparse_context_len=2048),
             bs=4,
             raw_bs=3,
         )
-        batch.seq_lens_cpu = FakeTensor(np.array([7, 2048, 10001, 9999]))
-        batch.seq_lens.cpu.side_effect = AssertionError("CPU lengths already exist")
+        # A cached host copy must not remove the device-to-host ordering point
+        # inherited from the working stock MLA replay sequence.
+        batch.seq_lens_cpu = FakeTensor(np.array([1, 2, 3, 4]))
+        batch.seq_lens.cpu.side_effect = AssertionError("Read the loaded graph buffer")
+        graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+        graph_lens.cpu.return_value.tolist.return_value = [7, 2048, 10001, 9999]
         execute(runner, batch)
+        runner.buffers.seq_lens.__getitem__.assert_called_once_with(slice(None, 4))
+        graph_lens.cpu.assert_called_once_with()
         graph.update.assert_called_once_with(
             cpu_update_input=[{"actual_seq_lengths_kv": [7, 2048, 2048, 0]}]
         )
         graph.replay.assert_called_once_with()
-        np.testing.assert_array_equal(batch.seq_lens_cpu.data, [7, 2048, 10001, 9999])
+        np.testing.assert_array_equal(batch.seq_lens_cpu.data, [1, 2, 3, 4])
 
-    def test_native_offload_missing_cpu_lengths_falls_back_before_replay(self):
+    def test_native_offload_loaded_graph_lengths_are_clamped_before_replay(self):
         graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
         execute, runner, batch = self.make_runner(
             manager=SimpleNamespace(attn_impl="native_fia", sparse_context_len=128),
             bs=4,
             raw_bs=3,
         )
-        batch.seq_lens.cpu.return_value.tolist.return_value = [-1, 1, 10001]
+        graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+        graph_lens.cpu.return_value.tolist.return_value = [-1, 1, 10001, 9999]
         execute(runner, batch)
+        graph_lens.cpu.assert_called_once_with()
         graph.update.assert_called_once_with(
             cpu_update_input=[{"actual_seq_lengths_kv": [0, 1, 128, 0]}]
         )
 
-    def test_native_offload_idle_always_updates_zero_without_reading_lengths(self):
+    def test_native_offload_idle_reads_nonempty_graph_buffer_then_updates_zeros(self):
         graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
         execute, runner, batch = self.make_runner(
             manager=SimpleNamespace(attn_impl="native_fia", sparse_context_len=2048),
@@ -692,12 +703,89 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         batch.seq_lens_cpu = Mock(
             tolist=Mock(side_effect=AssertionError("IDLE must not read stale lengths"))
         )
-        batch.seq_lens.cpu.side_effect = AssertionError("IDLE must not copy lengths")
+        batch.seq_lens.cpu.return_value.tolist.return_value = []
+        graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+        graph_lens.cpu.return_value.tolist.return_value = [10001, 2048, 99, 98]
         execute(runner, batch)
+        runner.buffers.seq_lens.__getitem__.assert_called_once_with(slice(None, 4))
+        graph_lens.cpu.assert_called_once_with()
+        batch.seq_lens.cpu.assert_not_called()
         graph.update.assert_called_once_with(
             cpu_update_input=[{"actual_seq_lengths_kv": [0, 0, 0, 0]}]
         )
         graph.replay.assert_called_once_with()
+
+    def test_native_offload_waits_for_device_snapshot_before_update_and_replay(self):
+        for mode in ("DECODE", "IDLE"):
+            with self.subTest(mode=mode):
+                graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
+                self.backend._graph_debug = True
+                execute, runner, batch = self.make_runner(
+                    manager=SimpleNamespace(
+                        attn_impl="native_fia", sparse_context_len=2048
+                    ),
+                    mode=mode,
+                    bs=2,
+                    raw_bs=1 if mode == "DECODE" else 0,
+                )
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+
+                def device_snapshot():
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise RuntimeError("Test did not release the device snapshot")
+                    return FakeTensor(np.array([10001, 999]))
+
+                def run():
+                    try:
+                        execute(runner, batch)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+                graph_lens.cpu.side_effect = device_snapshot
+                batch.seq_lens.cpu.side_effect = AssertionError(
+                    "Read the loaded graph buffer"
+                )
+                batch.seq_lens_cpu = FakeTensor(np.array([10001]))
+                worker = threading.Thread(target=run, daemon=True)
+                with self.assertLogs(self.namespace["logger"], level="INFO") as logs:
+                    worker.start()
+                    try:
+                        self.assertTrue(
+                            entered.wait(timeout=2), "Device snapshot was skipped"
+                        )
+                        graph.update.assert_not_called()
+                        graph.replay.assert_not_called()
+                    finally:
+                        release.set()
+                        worker.join(timeout=2)
+                    self.assertFalse(
+                        worker.is_alive(), "Replay did not finish after snapshot"
+                    )
+                self.assertEqual(errors, [])
+                graph.update.assert_called_once_with(
+                    cpu_update_input=[
+                        {
+                            "actual_seq_lengths_kv": [2048, 0]
+                            if mode == "DECODE"
+                            else [0, 0]
+                        }
+                    ]
+                )
+                graph.replay.assert_called_once_with()
+                stages = [
+                    message.split("stage=")[1].split()[0] for message in logs.output
+                ]
+                self.assertLess(
+                    stages.index("seq_lens.cpu.begin"),
+                    stages.index("seq_lens.cpu.returned"),
+                )
+                for stage in ("update.begin", "replay.begin"):
+                    self.assertLess(
+                        stages.index("seq_lens.cpu.returned"), stages.index(stage)
+                    )
 
     def test_combined_fia_matches_mla_out_and_page_mapping(self):
         torch_mock = SimpleNamespace(

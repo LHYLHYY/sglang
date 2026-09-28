@@ -272,18 +272,25 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
             if native_fia_offload:
+                # Preserve the working native MLA replay sequence. This is a
+                # blocking device-to-host read, not just a way to obtain the
+                # lengths. Reusing seq_lens_cpu removes that ordering point
+                # before the background NPUGraph.update / graph.replay pair.
+                # Read the loaded graph buffer: even an IDLE rank has a
+                # nonempty graph bucket, whereas its raw seq_lens can be empty
+                # and an empty .cpu() copy would not provide this wait.
+                self.backend.debug_log("seq_lens.cpu.begin", graph_key, debug_id)
+                cpu_lens = self.buffers.seq_lens[: self.bs].cpu().tolist()
+                self.backend.debug_log("seq_lens.cpu.returned", graph_key, debug_id)
                 # IDLE ranks replay a decode graph too. Update all lengths to
                 # zero, including padding, instead of retaining capture values.
                 capacity = sparse_kv_manager.sparse_context_len
                 if forward_batch.forward_mode.is_idle():
                     seq_lens = [0] * self.bs
                 else:
-                    cpu_lens = forward_batch.seq_lens_cpu
-                    if cpu_lens is None:
-                        cpu_lens = forward_batch.seq_lens.cpu()
                     seq_lens = [
                         min(max(int(length), 0), capacity)
-                        for length in cpu_lens.tolist()[: self.raw_bs]
+                        for length in cpu_lens[: self.raw_bs]
                     ] + [0] * (self.bs - self.raw_bs)
                 self.backend.debug_log(
                     "seq_lens.selected_kv",

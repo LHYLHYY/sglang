@@ -140,6 +140,35 @@ establish device completion.
 Disable the diagnostic by unsetting `SGLANG_NPU_DSA_FIA_NATIVE` and restarting
 the server. The existing DSA/offload switches then take effect again.
 
+## If eager offload succeeds but decode graph replay stalls
+
+Keep the full model, offload mode, TP/DP and benchmark unchanged and restart
+with `--cuda-graph-backend-decode full` and `SGLANG_NPU_GRAPH_DEBUG=1`.
+Keep prefill graphs disabled. Check any `--cuda-graph-config` JSON too: its
+decode setting overrides the convenience flag.
+
+The replay path now reads `self.buffers.seq_lens[:self.bs].cpu().tolist()`
+from the loaded graph buffer before starting FIA's background `graph.update`
+and `graph.replay`. This device-to-host snapshot restores the ordering point
+present in the working native MLA baseline that cached CPU lengths omit.
+The graph bucket is nonempty even on IDLE ranks; reading an empty raw batch
+would not provide that wait. IDLE ranks still pass zero lengths to FIA. The
+change is a targeted alignment with the baseline; it does not establish the
+cause of the device stall.
+
+For each rank, inspect the debug stages in this order:
+
+1. `seq_lens.cpu.begin`, then `seq_lens.cpu.returned`.
+2. `seq_lens.selected_kv` with `route=native_fia_offload`.
+3. `update.begin` / `replay.begin`, followed by their return and join stages.
+
+If the benchmark still stalls, retain each rank's final stages and the earliest
+Ascend runtime error. A stall before `seq_lens.cpu.returned` locates the host
+wait before graph update; a later stall needs investigation in the subsequent
+update, replay or device work. Neither the CPU mocks nor host return messages
+prove successful NPU execution. Confirm the benchmark finishes and produces
+its final measurements.
+
 ## Local regression checks
 
 ```bash
@@ -149,6 +178,7 @@ python test/manual/ascend/test_native_fia_offload_manager.py -v
 
 These CPU mocks check configuration, staging memory accounting, shared FIA
 arguments and head padding, real offload routing, and selected/full-context
-graph updates including idle/padded batches. They do not validate NPU kernels,
-multi-rank completion or numerical accuracy. Use the full-model run above for
-device validation.
+graph updates including idle/padded batches. They also verify that update and
+replay wait for the device-length snapshot to return. They do not validate NPU
+kernels, multi-rank completion or numerical accuracy. Use the full-model run
+above for device validation.
