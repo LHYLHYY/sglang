@@ -1,5 +1,45 @@
 # Run native MLA FIA with a full DSA checkpoint
 
+## Original DSA offload with hot-cache prefetch
+
+The replay ordering fix also applies to the original `combined` route and to
+`split_eager` when it falls back to combined FIA under decode graphs. These
+modes keep `SparseKVCacheManager`, host KV storage, hot-cache prefetch, request
+reset hooks and callback streams. They do not select `NativeFIAOffloadManager`.
+
+To return from the working `native_fia` integration to the original path, set
+these variables in the **server** shell and restart the same full-model server:
+
+```bash
+export SGLANG_NPU_DSA_FIA_NATIVE=0
+export SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD=1
+export SGLANG_NPU_SPARSE_KV_ATTN_IMPL=combined
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_GRAPH_DEBUG=1
+unset SGLANG_NPU_SPARSE_KV_FIA_SKIP_KV_IO
+```
+
+Keep the working model, TP/DP, memory settings and launch arguments, including
+`--cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled`.
+Run the unchanged full-model benchmark below. Replay logs should contain
+`seq_lens.cpu.begin`, `seq_lens.cpu.returned`, then `seq_lens.selected_kv`
+with `route=sparse_fia_mla` and `skip_kv_io=False` before update/replay starts.
+
+Every DECODE and IDLE replay now reads the nonempty loaded graph length buffer
+before starting FIA task updates, even when lengths are available on the CPU.
+The original combined FIA continues to use selected-buffer capacity for real
+requests; graph padding and IDLE ranks explicitly use zero. The device readback
+provides ordering and must not substitute full-context lengths for selected-KV
+lengths. This preserves the existing combined FIA diagnostic's treatment of
+selected-buffer padding and does not establish numerical accuracy.
+
+`split_eager` uses this same fix for its graph-mode FIA fallback; its eager
+split-SFA path is unchanged. `split_graph`, `split_graph_dual`,
+`split_graph_dual_v2` and `pa_graph` retain their SFA replay paths without this
+FIA CPU update. Full-model completion has been reported for `native_fia` after
+the ordering fix; the port to the original hot-cache route still needs Ascend
+device validation.
+
 ## DSA with real KV offload
 
 `SGLANG_NPU_SPARSE_KV_ATTN_IMPL=native_fia` restores the real DSA indexer
@@ -147,10 +187,12 @@ with `--cuda-graph-backend-decode full` and `SGLANG_NPU_GRAPH_DEBUG=1`.
 Keep prefill graphs disabled. Check any `--cuda-graph-config` JSON too: its
 decode setting overrides the convenience flag.
 
-The replay path now reads `self.buffers.seq_lens[:self.bs].cpu().tolist()`
+The `native_fia`, `combined` and graph-mode `split_eager` replay paths read
+`self.buffers.seq_lens[:self.bs].cpu().tolist()`
 from the loaded graph buffer before starting FIA's background `graph.update`
 and `graph.replay`. This device-to-host snapshot restores the ordering point
-present in the working native MLA baseline that cached CPU lengths omit.
+present in the working native MLA baseline that cached CPU lengths or fixed
+selected-KV capacity omit.
 The graph bucket is nonempty even on IDLE ranks; reading an empty raw batch
 would not provide that wait. IDLE ranks still pass zero lengths to FIA. The
 change is a targeted alignment with the baseline; it does not establish the
@@ -159,7 +201,8 @@ cause of the device stall.
 For each rank, inspect the debug stages in this order:
 
 1. `seq_lens.cpu.begin`, then `seq_lens.cpu.returned`.
-2. `seq_lens.selected_kv` with `route=native_fia_offload`.
+2. `seq_lens.selected_kv` with `route=native_fia_offload` for `native_fia`, or
+   `route=sparse_fia_mla` for `combined` / graph-mode `split_eager`.
 3. `update.begin` / `replay.begin`, followed by their return and join stages.
 
 If the benchmark still stalls, retain each rank's final stages and the earliest
@@ -178,7 +221,8 @@ python test/manual/ascend/test_native_fia_offload_manager.py -v
 
 These CPU mocks check configuration, staging memory accounting, shared FIA
 arguments and head padding, real offload routing, and selected/full-context
-graph updates including idle/padded batches. They also verify that update and
-replay wait for the device-length snapshot to return. They do not validate NPU
+graph updates including idle/padded batches. They also verify that native and
+original combined FIA update/replay wait for each device-length snapshot to
+return, while SFA graph routes remain unchanged. They do not validate NPU
 kernels, multi-rank completion or numerical accuracy. Use the full-model run
 above for device validation.
