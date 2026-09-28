@@ -202,6 +202,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -1761,6 +1762,8 @@ class DeepseekV2AttentionMLA(
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
         self.use_dsa = is_deepseek_dsa(config)
+        # Preserve DSA modules/weights while reusing stock NPU attention at runtime.
+        self.dsa_fia_native = _is_npu and get_bool_env_var("SGLANG_NPU_DSA_FIA_NATIVE")
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
         if self.dsa_enable_prefill_cp:
@@ -2711,7 +2714,10 @@ class DeepseekV2Model(nn.Module):
             return False
         backend = get_attn_backend()
         backend = getattr(backend, "primary", backend)
-        return not getattr(backend, "use_mha", False)
+        return not (
+            getattr(backend, "use_mha", False)
+            or getattr(backend, "dsa_fia_native", False)
+        )
 
     def forward(
         self,
@@ -2965,7 +2971,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.cp_rank = self.cp_size = None
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-        get_attn_tp_context().init_context(q_lora_rank, is_deepseek_dsa(config))
+        get_attn_tp_context().init_context(
+            q_lora_rank,
+            is_deepseek_dsa(config)
+            and not (_is_npu and get_bool_env_var("SGLANG_NPU_DSA_FIA_NATIVE")),
+        )
 
     @property
     def routed_experts_weights_of_layer(self):

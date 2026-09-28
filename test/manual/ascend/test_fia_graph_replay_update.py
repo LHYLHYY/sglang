@@ -24,6 +24,32 @@ NPU_ROOT = (
 )
 
 
+def load_functions(path, names, namespace, *, constants=False):
+    """Execute production function bodies with explicit CPU test dependencies."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    nodes = [
+        node
+        for node in tree.body
+        if (isinstance(node, ast.FunctionDef) and node.name in names)
+        or (constants and isinstance(node, (ast.Assign, ast.AnnAssign)))
+    ]
+    found = {node.name for node in nodes if isinstance(node, ast.FunctionDef)}
+    missing = set(names) - found
+    if missing:
+        raise AssertionError(f"Missing production functions in {path}: {missing}")
+    module = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0,
+            ),
+            *nodes,
+        ],
+        type_ignores=[],
+    )
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace
+
+
 def load_combined_fia(torch_module, torch_npu_module):
     """Load only the production FIA helper, without importing custom KV ops."""
     path = NPU_ROOT / "sparsity_driven_kv_offload/attention.py"
@@ -70,6 +96,9 @@ class FakeTensor:
 
     def unsqueeze(self, dim):
         return FakeTensor(np.expand_dims(self.data, axis=dim))
+
+    def transpose(self, dim0, dim1):
+        return FakeTensor(np.swapaxes(self.data, dim0, dim1))
 
     def split(self, sizes, dim):
         return [
@@ -403,7 +432,9 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         self.assertIn("stage=replay.error", logs.output[0])
         self.assertIn("Traceback", logs.output[0])
 
-    def make_runner(self, *, manager=None, bs=1, raw_bs=1, is_dsa=True):
+    def make_runner(
+        self, *, manager=None, bs=1, raw_bs=1, is_dsa=True, native=False, mode="DECODE",
+    ):
         path = NPU_ROOT / "graph_runner/npu_graph_runner.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
         cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
@@ -435,7 +466,9 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
         runner = SimpleNamespace(
             backend=self.backend,
-            attn_backend=SimpleNamespace(sparse_kv_manager=manager),
+            attn_backend=SimpleNamespace(
+                sparse_kv_manager=manager, dsa_fia_native=native
+            ),
             load_batch=Mock(),
             _make_graph_key=lambda bs: bs,
             _get_update_attr_name=lambda: "actual_seq_lengths_kv",
@@ -450,7 +483,10 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         )
         batch = SimpleNamespace(
             forward_mode=SimpleNamespace(
-                name="DECODE", is_decode=lambda: True, is_target_verify=lambda: False
+                name=mode,
+                is_decode=lambda: mode == "DECODE",
+                is_idle=lambda: mode == "IDLE",
+                is_target_verify=lambda: False,
             ),
             batch_size=raw_bs,
             seq_lens=Mock(),
@@ -546,6 +582,43 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             cpu_update_input=[{"actual_seq_lengths_kv": [32768, 0]}]
         )
 
+    def test_native_dsa_runner_updates_full_context_lengths_and_padding(self):
+        for lengths in ([10001], [10001, 32768]):
+            with self.subTest(lengths=lengths):
+                graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
+                execute, runner, batch = self.make_runner(
+                    native=True, bs=4, raw_bs=len(lengths)
+                )
+                batch.seq_lens.cpu.return_value.tolist.return_value = lengths
+                execute(runner, batch)
+                graph.update.assert_called_once_with(
+                    cpu_update_input=[
+                        {"actual_seq_lengths_kv": lengths + [0] * (4 - len(lengths))}
+                    ]
+                )
+                graph.replay.assert_called_once_with()
+
+    def test_native_dsa_idle_runner_updates_zero_lengths(self):
+        graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
+        execute, runner, batch = self.make_runner(
+            native=True, mode="IDLE", bs=2, raw_bs=0
+        )
+        batch.seq_lens.cpu.return_value.tolist.return_value = []
+        execute(runner, batch)
+        graph.update.assert_called_once_with(
+            cpu_update_input=[{"actual_seq_lengths_kv": [0, 0]}]
+        )
+        graph.replay.assert_called_once_with()
+
+    def test_native_dsa_runner_logs_native_route(self):
+        self.capture(2, ["npu_fused_infer_attention_score.out"])
+        self.backend._graph_debug = True
+        execute, runner, batch = self.make_runner(native=True, bs=2, raw_bs=1)
+        batch.seq_lens.cpu.return_value.tolist.return_value = [10001]
+        with self.assertLogs(self.namespace["logger"], level="INFO") as logs:
+            execute(runner, batch)
+        self.assertTrue(any("route=native_mla_fia" in line for line in logs.output))
+
     def test_combined_fia_matches_mla_out_and_page_mapping(self):
         torch_mock = SimpleNamespace(
             int32=np.int32,
@@ -610,6 +683,271 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
                         page_size=page_size,
                         scale_value=0.125,
                     )
+
+
+class TestDSAFIANativeConfig(unittest.TestCase):
+    def setUp(self):
+        self.namespace = {
+            "os": os,
+            "logger": logging.getLogger(__name__),
+            "_warned_bool_env_var_keys": set(),
+            "is_npu": Mock(return_value=True),
+            "is_deepseek_dsa": lambda config: config.index_topk is not None,
+        }
+        load_functions(
+            NPU_ROOT.parents[1] / "utils/common.py",
+            {"get_bool_env_var"},
+            self.namespace,
+        )
+        load_functions(
+            NPU_ROOT / "sparsity_driven_kv_offload/config.py",
+            {
+                "is_dsa_fia_native_requested",
+                "is_dsa_fia_native_enabled",
+                "get_dsa_fia_native_cell_size",
+                "is_sparsity_driven_kv_offload_requested",
+            },
+            self.namespace,
+            constants=True,
+        )
+        self.env = patch.dict(os.environ, {}, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def config_args(self):
+        return dict(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["DeepseekV32ForCausalLM"], index_topk=2048,
+                ),
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                index_head_dim=128,
+            ),
+            server_args=SimpleNamespace(
+                attention_backend="ascend",
+                kv_cache_dtype="auto",
+                enable_prefill_cp=False,
+                enable_dsa_prefill_cp=False,
+                attn_cp_size=1,
+                dcp_size=1,
+                speculative_algorithm=None,
+                enable_torch_compile=False,
+            ),
+            use_mla_backend=True,
+        )
+
+    def test_native_is_opt_in_and_never_overrides_offload_on_non_npu(self):
+        requested = self.namespace["is_dsa_fia_native_requested"]
+        offload = self.namespace["is_sparsity_driven_kv_offload_requested"]
+        self.assertFalse(requested())
+        self.assertFalse(offload())
+        os.environ["SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD"] = "1"
+        self.assertTrue(offload())
+        for value in ("1", "true"):
+            with self.subTest(value=value):
+                os.environ["SGLANG_NPU_DSA_FIA_NATIVE"] = value
+                self.assertTrue(requested())
+                self.assertFalse(offload())
+        self.namespace["is_npu"].return_value = False
+        self.assertFalse(requested())
+        self.assertTrue(offload())
+        self.namespace["is_npu"].return_value = True
+        os.environ["SGLANG_NPU_DSA_FIA_NATIVE"] = "0"
+        self.assertFalse(requested())
+        self.assertTrue(offload())
+
+    def test_disabled_native_does_not_change_pool_sizing(self):
+        args = self.config_args()
+        self.assertFalse(self.namespace["is_dsa_fia_native_enabled"](**args))
+        self.assertIsNone(
+            self.namespace["get_dsa_fia_native_cell_size"](
+                **args, num_layers=61, element_size=2
+            )
+        )
+
+    def test_native_full_cache_sizing_includes_unused_index_pool(self):
+        os.environ["SGLANG_NPU_DSA_FIA_NATIVE"] = "1"
+        args = self.config_args()
+        for architecture in ("DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM"):
+            with self.subTest(architecture=architecture):
+                args["model_config"].hf_config.architectures = [architecture]
+                self.assertTrue(self.namespace["is_dsa_fia_native_enabled"](**args))
+                self.assertEqual(
+                    self.namespace["get_dsa_fia_native_cell_size"](
+                        **args, num_layers=61, element_size=2
+                    ),
+                    (512 + 64 + 128) * 61 * 2,
+                )
+
+    def test_native_rejects_non_dsa_wrong_model_and_backend(self):
+        os.environ["SGLANG_NPU_DSA_FIA_NATIVE"] = "1"
+        changes = (
+            (
+                "non_dsa",
+                lambda a: setattr(a["model_config"].hf_config, "index_topk", None),
+            ),
+            (
+                "other_architecture",
+                lambda a: setattr(
+                    a["model_config"].hf_config,
+                    "architectures",
+                    ["GlmMoeDsaForCausalLM"],
+                ),
+            ),
+            (
+                "other_backend",
+                lambda a: setattr(a["server_args"], "attention_backend", "dsa"),
+            ),
+            ("non_mla", lambda a: a.update(use_mla_backend=False)),
+        )
+        for name, change in changes:
+            with self.subTest(case=name):
+                args = self.config_args()
+                change(args)
+                with self.assertRaises(ValueError):
+                    self.namespace["is_dsa_fia_native_enabled"](**args)
+
+    def test_native_accepts_unquantized_kv_and_accounts_for_dtype_size(self):
+        os.environ["SGLANG_NPU_DSA_FIA_NATIVE"] = "1"
+        for dtype in ("auto", "bf16", "bfloat16"):
+            for num_layers, element_size in ((61, 2), (3, 4)):
+                with self.subTest(dtype=dtype, layers=num_layers, bytes=element_size):
+                    args = self.config_args()
+                    args["server_args"].kv_cache_dtype = dtype
+                    self.assertEqual(
+                        self.namespace["get_dsa_fia_native_cell_size"](
+                            **args, num_layers=num_layers, element_size=element_size
+                        ),
+                        704 * num_layers * element_size,
+                    )
+
+    def test_native_rejects_incompatible_runtime_features(self):
+        os.environ["SGLANG_NPU_DSA_FIA_NATIVE"] = "1"
+        for field, value in (
+            ("enable_prefill_cp", True),
+            ("attn_cp_size", 2),
+            ("dcp_size", 2),
+            ("speculative_algorithm", "EAGLE"),
+            ("enable_torch_compile", True),
+            ("kv_cache_dtype", "fp8_e4m3"),
+        ):
+            with self.subTest(field=field):
+                args = self.config_args()
+                setattr(args["server_args"], field, value)
+                with self.assertRaises(ValueError):
+                    self.namespace["is_dsa_fia_native_enabled"](**args)
+        for env_name in ("SGLANG_NPU_USE_MLAPO", "SGLANG_USE_FIA_NZ"):
+            with self.subTest(env=env_name), patch.dict(os.environ, {env_name: "1"}):
+                with self.assertRaises(ValueError):
+                    self.namespace["is_dsa_fia_native_enabled"](**self.config_args())
+
+
+class TestDSAFIANativeAttentionRouting(unittest.TestCase):
+    def test_native_prefill_and_decode_reuse_ordinary_attention_routes(self):
+        methods = SimpleNamespace(MHA_NPU="mha", MLA_NPU="mla", DSA_NPU="dsa")
+        namespace = load_functions(
+            NPU_ROOT.parents[1] / "models/deepseek_common/attention_backend_handler.py",
+            {"handle_attention_ascend"},
+            {"AttnForwardMethod": methods},
+        )
+        handler = namespace["handle_attention_ascend"]
+        for mode in ("EXTEND", "DECODE", "IDLE", "TARGET_VERIFY", "DRAFT_EXTEND_V2"):
+            batch = SimpleNamespace(
+                forward_mode=SimpleNamespace(
+                    is_extend=lambda: mode
+                    in ("EXTEND", "TARGET_VERIFY", "DRAFT_EXTEND_V2"),
+                    is_target_verify=lambda: mode == "TARGET_VERIFY",
+                    is_draft_extend_v2=lambda: mode == "DRAFT_EXTEND_V2",
+                )
+            )
+            for use_dsa, native in ((True, True), (True, False), (False, False)):
+                with self.subTest(mode=mode, use_dsa=use_dsa, native=native):
+                    attn = SimpleNamespace(use_dsa=use_dsa, dsa_fia_native=native)
+                    expected = (
+                        "dsa"
+                        if use_dsa and not native
+                        else ("mha" if mode == "EXTEND" else "mla")
+                    )
+                    self.assertEqual(handler(attn, batch), expected)
+            # Existing models do not have to define the diagnostic attribute.
+            self.assertEqual(handler(SimpleNamespace(use_dsa=True), batch), "dsa")
+
+    def prepare_case(self):
+        tensor = lambda shape: FakeTensor(np.ones(shape, dtype=np.float32))
+        context = SimpleNamespace(fetch_qkv_latent=lambda: tensor((2, 8)))
+        model = SimpleNamespace(
+            use_dsa=True,
+            dsa_fia_native=True,
+            q_lora_rank=2,
+            kv_lora_rank=4,
+            qk_rope_head_dim=2,
+            qk_nope_head_dim=2,
+            qk_head_dim=4,
+            num_local_heads=2,
+            q_a_layernorm=Mock(side_effect=lambda value: value, variance_epsilon=1e-6),
+            kv_a_layernorm=lambda value: value,
+            q_b_proj=lambda value: (tensor((2, 8)),),
+            w_kc=tensor((2, 2, 4)),
+            rotary_emb=lambda positions, q, k: (q, k),
+            use_deepseek_yarn_rope=False,
+            layer_id=3,
+            indexer=Mock(return_value="selected_indices"),
+        )
+        namespace = {
+            "get_attn_tp_context": lambda: context,
+            "_use_ag_after_qlora": False,
+            "is_mla_preprocess_enabled": lambda: False,
+            "dsa_use_prefill_cp": lambda batch: False,
+            "fused_split_qk_norm": lambda *args, **kwargs: (
+                tensor((2, 2)),
+                tensor((2, 1, 4)),
+                tensor((2, 1, 2)),
+            ),
+            "torch": SimpleNamespace(
+                bmm=lambda a, b: FakeTensor(np.matmul(a.data, b.data))
+            ),
+        }
+        load_functions(
+            NPU_ROOT / "modules/deepseek_v2_attention_mla_npu.py",
+            {"forward_mha_prepare_npu", "forward_mla_prepare_npu"},
+            namespace,
+        )
+        return model, namespace
+
+    def test_native_mla_prepare_skips_indexer_and_returns_no_topk(self):
+        for native in (False, True):
+            with self.subTest(native=native):
+                model, namespace = self.prepare_case()
+                model.dsa_fia_native = native
+                result = namespace["forward_mla_prepare_npu"](
+                    model, object(), object(), object(), object(), object()
+                )
+                if native:
+                    model.indexer.assert_not_called()
+                    self.assertIsNone(result[-1])
+                else:
+                    model.indexer.assert_called_once()
+                    self.assertEqual(result[-1], "selected_indices")
+
+    def test_native_mha_prepare_skips_indexer_before_writing_paged_kv(self):
+        class ReachedKVNormalization(Exception):
+            pass
+
+        for native in (False, True):
+            with self.subTest(native=native):
+                model, namespace = self.prepare_case()
+                model.dsa_fia_native = native
+                model.kv_a_layernorm = Mock(side_effect=ReachedKVNormalization)
+                with self.assertRaises(ReachedKVNormalization):
+                    namespace["forward_mha_prepare_npu"](
+                        model, object(), object(), object(), object(), object()
+                    )
+                if native:
+                    model.indexer.assert_not_called()
+                else:
+                    model.indexer.assert_called_once()
+                    self.assertFalse(model.indexer.call_args.kwargs["return_indices"])
 
 
 class TestFIASkipKVIO(unittest.TestCase):

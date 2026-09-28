@@ -24,6 +24,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     get_sparse_kv_attn_impl,
+    is_dsa_fia_native_enabled,
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -341,7 +342,14 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.graph_mode = False
         self.enable_pdmux = bool(model_runner.server_args.enable_pdmux)
-        self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
+        self.dsa_fia_native = is_dsa_fia_native_enabled(
+            model_config=model_runner.model_config,
+            server_args=model_runner.server_args,
+            use_mla_backend=model_runner.use_mla_backend,
+        )
+        self.use_fa = not self.dsa_fia_native and get_bool_env_var(
+            "ASCEND_USE_FA", "False"
+        )
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
             model_config=model_runner.model_config,
             server_args=model_runner.server_args,
@@ -377,7 +385,15 @@ class AscendAttnBackend(AttentionBackend):
                 "Sparsity-driven KV offload is enabled with manager %s.",
                 self.sparse_kv_manager,
             )
-        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fia = self.dsa_fia_native or get_bool_env_var("ASCEND_USE_FIA", "False")
+        if self.dsa_fia_native:
+            logger.warning(
+                "NPU DSA native FIA diagnostic: stock MHA prefill + MLA decode, "
+                "native paged HBM KV, real context lengths; indexer and sparse "
+                "KV offload disabled (including request hooks/host callbacks). "
+                "page_size=%s. DSA accuracy is not preserved; restart to change modes.",
+                self.page_size,
+            )
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.ascend_attn_mask_builder = AscendAttnMaskBuilder(

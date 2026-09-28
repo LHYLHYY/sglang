@@ -114,7 +114,10 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
         self.update_attr_type = None
         self.model_runner = model_runner
         self._init_arch_map()
-        self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.use_fia = (
+            getattr(self.attn_backend, "dsa_fia_native", False)
+            or get_bool_env_var("ASCEND_USE_FIA", "False")
+        )
         self.if_use_v2 = any(
             arch
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
@@ -258,7 +261,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             and sparse_kv_manager.attn_impl
             in (SPARSE_KV_ATTN_IMPL_COMBINED, SPARSE_KV_ATTN_IMPL_SPLIT_EAGER)
         )
-        if sparse_fia or not (
+        native_fia = getattr(self.attn_backend, "dsa_fia_native", False)
+        if native_fia or sparse_fia or not (
             is_deepseek_dsa(self.model_runner.model_config.hf_config)
             or is_deepseek_v4(self.model_runner.model_config.hf_config)
         ):
@@ -288,6 +292,15 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                         self.bs - self.raw_bs
                     )
                 self.backend.debug_log("seq_lens.cpu.returned", graph_key, debug_id)
+                if native_fia:
+                    self.backend.debug_log(
+                        "seq_lens.native_mla",
+                        graph_key,
+                        debug_id,
+                        route="native_mla_fia",
+                        raw_bs=self.raw_bs,
+                        padded_bs=self.bs,
+                    )
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

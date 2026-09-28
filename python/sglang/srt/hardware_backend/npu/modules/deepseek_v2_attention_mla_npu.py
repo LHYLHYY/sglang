@@ -46,7 +46,7 @@ def forward_mha_prepare_npu(
 
         # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
-        if m.use_dsa:
+        if m.use_dsa and not m.dsa_fia_native:
             q_lora = m.q_a_layernorm(q)
             q = m.q_b_proj(q_lora)[0].view(-1, m.num_local_heads, m.qk_head_dim)
             _ = m.indexer(
@@ -228,7 +228,7 @@ def forward_mla_prepare_npu(
                     k_pe = latent_cache[..., m.kv_lora_rank :].unsqueeze(1)
 
             # q_lora needed by indexer
-            if m.use_dsa:
+            if m.use_dsa and not m.dsa_fia_native:
                 q_lora = q
 
             q = m.q_b_proj(q)[0].view(-1, m.num_local_heads, m.qk_head_dim)

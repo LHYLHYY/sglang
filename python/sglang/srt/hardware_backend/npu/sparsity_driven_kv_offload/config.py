@@ -34,6 +34,9 @@ SPARSE_KV_ATTN_IMPL_CHOICES = (
 # Diagnostic experiment A: keep FIA but remove real decode KV traffic.
 SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR = "SGLANG_NPU_SPARSE_KV_FIA_SKIP_KV_IO"
 
+# Full-model diagnostic: reuse stock Ascend attention without changing index_topk.
+DSA_FIA_NATIVE_ENV_VAR = "SGLANG_NPU_DSA_FIA_NATIVE"
+
 SPARSE_KV_MERGE_IMPL_ENV_VAR = "SGLANG_NPU_SPARSE_KV_MERGE_IMPL"
 SPARSE_KV_MERGE_IMPL_AUTO = "auto"
 SPARSE_KV_MERGE_IMPL_PYTHON = "python"
@@ -45,8 +48,85 @@ SPARSE_KV_MERGE_IMPL_CHOICES = (
 )
 
 
+def is_dsa_fia_native_requested() -> bool:
+    return is_npu() and get_bool_env_var(DSA_FIA_NATIVE_ENV_VAR)
+
+
+def is_dsa_fia_native_enabled(
+    *, model_config: ModelConfig, server_args: ServerArgs, use_mla_backend: bool,
+) -> bool:
+    """Validate the startup-only, full-model native FIA diagnostic.
+
+    Keep the DSA config and checkpoint, but use dense attention and native HBM
+    KV throughout prefill/decode. This overrides offload, including allocation
+    hooks and host callbacks; it is not an accuracy-preserving DSA backend.
+    """
+    if not is_dsa_fia_native_requested():
+        return False
+    if not (
+        server_args.attention_backend == "ascend"
+        and use_mla_backend
+        and is_deepseek_dsa(model_config.hf_config)
+        and model_config.hf_config.architectures[0]
+        in ("DeepseekV3ForCausalLM", "DeepseekV32ForCausalLM")
+    ):
+        raise ValueError(
+            f"{DSA_FIA_NATIVE_ENV_VAR}=1 requires a DeepSeek V3/V3.2 DSA "
+            "model with --attention-backend ascend and MLA enabled. "
+            "Keep index_topk in the model config."
+        )
+    if server_args.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+        raise ValueError(
+            f"{DSA_FIA_NATIVE_ENV_VAR}=1 requires unquantized native MLA KV; "
+            "use --kv-cache-dtype auto or bfloat16."
+        )
+    if (
+        server_args.enable_prefill_cp
+        or (server_args.attn_cp_size or 1) > 1
+        or server_args.dcp_size > 1
+        or server_args.speculative_algorithm is not None
+        or server_args.enable_torch_compile
+        or get_bool_env_var("SGLANG_NPU_USE_MLAPO")
+        or get_bool_env_var("SGLANG_USE_FIA_NZ")
+    ):
+        raise ValueError(
+            f"{DSA_FIA_NATIVE_ENV_VAR}=1 uses the stock non-speculative ND "
+            "MLA/FIA path. Disable context parallelism, speculative decoding, "
+            "torch.compile, MLAPO and FIA_NZ for this diagnostic."
+        )
+    return True
+
+
+def get_dsa_fia_native_cell_size(
+    *,
+    model_config: ModelConfig,
+    server_args: ServerArgs,
+    use_mla_backend: bool,
+    num_layers: int,
+    element_size: int,
+) -> Optional[int]:
+    if not is_dsa_fia_native_enabled(
+        model_config=model_config,
+        server_args=server_args,
+        use_mla_backend=use_mla_backend,
+    ):
+        return None
+    # NPUMLATokenToKVPool retains its index buffer, even though this diagnostic
+    # never runs the indexer. Unlike the GPU DSA pool, all three NPU buffers use
+    # the KV dtype; account for them before deciding the available token count.
+    return (
+        (
+            model_config.kv_lora_rank
+            + model_config.qk_rope_head_dim
+            + model_config.index_head_dim
+        )
+        * num_layers
+        * element_size
+    )
+
+
 def is_sparsity_driven_kv_offload_requested() -> bool:
-    return get_bool_env_var(_ENABLE_ENV_VAR)
+    return get_bool_env_var(_ENABLE_ENV_VAR) and not is_dsa_fia_native_requested()
 
 
 def get_sparse_kv_attn_impl() -> str:
@@ -104,10 +184,7 @@ def get_sparse_kv_merge_impl() -> str:
 
 
 def is_sparsity_driven_kv_offload_enabled(
-    *,
-    model_config: ModelConfig,
-    server_args: ServerArgs,
-    use_mla_backend: bool,
+    *, model_config: ModelConfig, server_args: ServerArgs, use_mla_backend: bool,
 ) -> bool:
     if not is_sparsity_driven_kv_offload_requested():
         return False

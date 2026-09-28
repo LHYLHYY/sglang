@@ -198,8 +198,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if kvc.use_mla_backend:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_dsa_fia_native_cell_size,
                 get_sparsity_driven_kv_offload_cell_size,
             )
+
+            native_fia_cell_size = get_dsa_fia_native_cell_size(
+                model_config=model_config,
+                server_args=kvc.server_args,
+                use_mla_backend=kvc.use_mla_backend,
+                num_layers=num_layers,
+                element_size=kv_size,
+            )
+            if native_fia_cell_size is not None:
+                if kv_cache_dtype not in (torch.float16, torch.bfloat16):
+                    raise ValueError(
+                        "SGLANG_NPU_DSA_FIA_NATIVE requires FP16 or BF16 KV, "
+                        f"got {kv_cache_dtype}."
+                    )
+                return native_fia_cell_size
 
             offload_cell_size = get_sparsity_driven_kv_offload_cell_size(
                 model_config=model_config,
