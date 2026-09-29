@@ -494,6 +494,7 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             "SPARSE_KV_ATTN_IMPL_COMBINED": "combined",
             "SPARSE_KV_ATTN_IMPL_NATIVE_FIA": "native_fia",
             "SPARSE_KV_ATTN_IMPL_SPLIT_EAGER": "split_eager",
+            "SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA": "split_graph_dual_fia",
         }
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
         runner = SimpleNamespace(
@@ -601,6 +602,62 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
                     batch.seq_lens.cpu.assert_not_called()
                     graph.update.assert_not_called()
                     graph.replay.assert_called_once_with()
+
+    def test_dual_fia_updates_both_partitions_in_every_layer_and_masks_idle(self):
+        # NPUGraph.update broadcasts a one-element input list to all captured
+        # dispatch records. Both partitions use the same physical capacity;
+        # their device masks retain the different runtime hit/miss lengths.
+        for layers in (1, 3):
+            for mode, raw_bs in (
+                ("DECODE", 1), ("DECODE", 2), ("IDLE", 0), ("IDLE", 2)
+            ):
+                with self.subTest(layers=layers, mode=mode, raw_bs=raw_bs):
+                    graph, _ = self.capture(
+                        4, ["npu_fused_infer_attention_score_v2.out"] * (2 * layers)
+                    )
+                    self.backend._graph_debug = True
+                    execute, runner, batch = self.make_runner(
+                        manager=SimpleNamespace(
+                            attn_impl="split_graph_dual_fia", sparse_context_len=2048
+                        ),
+                        mode=mode,
+                        bs=4,
+                        raw_bs=raw_bs,
+                    )
+                    batch.seq_lens_cpu = FakeTensor(np.array([1, 2, 3, 4]))
+                    batch.seq_lens.cpu.side_effect = AssertionError(
+                        "Dual FIA must read the nonempty loaded graph buffer"
+                    )
+                    graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+                    expected_lengths = (
+                        [2048] * raw_bs + [0] * (4 - raw_bs)
+                        if mode == "DECODE"
+                        else [0] * 4
+                    )
+                    for replay_id, length in enumerate((7, 10001), start=1):
+                        graph_lens.cpu.return_value.tolist.return_value = [
+                            length, 2048, 99, 98
+                        ]
+                        with self.assertLogs(
+                            self.namespace["logger"], level="INFO"
+                        ) as logs:
+                            execute(runner, batch)
+                        self.assertTrue(
+                            any("route=sparse_fia_dual" in line for line in logs.output)
+                        )
+                        runner.buffers.seq_lens.__getitem__.assert_called_with(
+                            slice(None, 4)
+                        )
+                        self.assertEqual(graph_lens.cpu.call_count, replay_id)
+                        self.assertEqual(graph.update.call_count, replay_id)
+                        self.assertEqual(graph.replay.call_count, replay_id)
+                        # FIA v2's update attribute differs from FIA v1.
+                        graph.update.assert_called_with(
+                            cpu_update_input=[{"actual_seq_kvlen": expected_lengths}]
+                        )
+                    self.assertEqual(self.backend._fia_update_tasks[4], 2 * layers)
+                    batch.seq_lens.cpu.assert_not_called()
+                    np.testing.assert_array_equal(batch.seq_lens_cpu.data, [1, 2, 3, 4])
 
     def test_skip_kv_io_runner_keeps_fia_update_and_replay(self):
         graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
@@ -755,11 +812,18 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             ("native_fia", False),
             ("combined", False),
             ("split_eager", False),
+            ("split_graph_dual_fia", False),
             ("combined", True),
         ):
             for mode in ("DECODE", "IDLE"):
                 with self.subTest(impl=impl, mode=mode, skip_kv_io=skip_kv_io):
-                    graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
+                    dual_fia = impl == "split_graph_dual_fia"
+                    graph, _ = self.capture(
+                        2,
+                        ["npu_fused_infer_attention_score_v2.out"] * 2
+                        if dual_fia
+                        else ["npu_fused_infer_attention_score.out"],
+                    )
                     self.backend._graph_debug = True
                     execute, runner, batch = self.make_runner(
                         manager=SimpleNamespace(
@@ -810,10 +874,13 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
                             worker.is_alive(), "Replay did not finish after snapshot"
                         )
                     self.assertEqual(errors, [])
+                    attr_name = (
+                        "actual_seq_kvlen" if dual_fia else "actual_seq_lengths_kv"
+                    )
                     graph.update.assert_called_once_with(
                         cpu_update_input=[
                             {
-                                "actual_seq_lengths_kv": [2048, 0]
+                                attr_name: [2048, 0]
                                 if mode == "DECODE"
                                 else [0, 0]
                             }
@@ -1076,7 +1143,7 @@ class TestDSAFIANativeConfig(unittest.TestCase):
                 attention_backend="ascend",
                 kv_cache_dtype="auto",
                 enable_prefill_cp=False,
-                enable_dsa_prefill_cp=False,
+                enable_dsa_prefill_context_parallel=False,
                 attn_cp_size=1,
                 dcp_size=1,
                 speculative_algorithm=None,
@@ -1362,6 +1429,130 @@ class TestNativeFIAOffloadConfig(unittest.TestCase):
         )
 
 
+class TestDualFIAOffloadConfig(unittest.TestCase):
+    def setUp(self):
+        TestNativeFIAOffloadConfig.setUp(self)
+        os.environ["SGLANG_NPU_SPARSE_KV_ATTN_IMPL"] = "split_graph_dual_fia"
+        load_functions(
+            NPU_ROOT / "sparsity_driven_kv_offload/config.py",
+            {"is_sparse_kv_decode_graph_enabled"},
+            self.namespace,
+        )
+
+    def config_args(self):
+        args = TestNativeFIAOffloadConfig.config_args(self)
+        args["server_args"].page_size = 128
+        return args
+
+    def test_dual_fia_opt_in_keeps_hot_cache_pool_accounting(self):
+        self.assertEqual(
+            self.namespace["get_sparse_kv_attn_impl"](), "split_graph_dual_fia"
+        )
+        for graph_backend in ("disabled", "full"):
+            for page_size in (16, 128, 1024):
+                for dtype in ("auto", "bf16", "bfloat16"):
+                    with self.subTest(graph=graph_backend, page=page_size, dtype=dtype):
+                        self.graph.decode.backend = graph_backend
+                        args = self.config_args()
+                        args["server_args"].page_size = page_size
+                        args["server_args"].kv_cache_dtype = dtype
+                        self.assertTrue(
+                            self.namespace["is_sparsity_driven_kv_offload_enabled"](
+                                **args
+                            )
+                        )
+                        self.assertEqual(
+                            self.namespace["get_sparsity_driven_kv_offload_cell_size"](
+                                **args, num_layers=61, element_size=2
+                            ),
+                            128 * 61 * 2,
+                        )
+                        self.assertEqual(
+                            self.namespace["get_native_fia_offload_buffer_size"](
+                                model_config=args["model_config"],
+                                server_args=args["server_args"],
+                                page_size=page_size,
+                                element_size=2,
+                            ),
+                            0,
+                        )
+
+    def test_dual_fia_rejects_unsupported_partition_dimensions_and_pages(self):
+        enabled = self.namespace["is_sparsity_driven_kv_offload_enabled"]
+        for field, value in (("kv_lora_rank", 256), ("qk_rope_head_dim", 32)):
+            with self.subTest(field=field):
+                args = self.config_args()
+                setattr(args["model_config"], field, value)
+                with self.assertRaisesRegex(ValueError, "512.*64"):
+                    enabled(**args)
+        for topk in (None, True, 0, -1, 2.5, 1024, 2050):
+            with self.subTest(topk=topk):
+                args = self.config_args()
+                args["model_config"].hf_config.index_topk = topk
+                with self.assertRaises(ValueError):
+                    enabled(**args)
+        for page_size in (None, True, 0, -16, 8, 15, 48, 2048, 128.0):
+            with self.subTest(page_size=page_size):
+                args = self.config_args()
+                args["server_args"].page_size = page_size
+                with self.assertRaisesRegex(ValueError, "page size"):
+                    enabled(**args)
+
+    def test_dual_fia_rejects_unsupported_runtime_and_ownership_modes(self):
+        enabled = self.namespace["is_sparsity_driven_kv_offload_enabled"]
+        for field, value in (
+            ("max_running_requests", None),
+            ("max_running_requests", 0),
+            ("max_running_requests", -1),
+            ("attention_backend", "dsa"),
+            ("kv_cache_dtype", "fp8_e4m3"),
+            ("enable_prefill_cp", True),
+            ("enable_dsa_prefill_context_parallel", True),
+            ("attn_cp_size", 2),
+            ("dcp_size", 2),
+            ("speculative_algorithm", "EAGLE"),
+            ("enable_torch_compile", True),
+            ("enable_pdmux", True),
+            ("enable_two_batch_overlap", True),
+            ("disable_radix_cache", False),
+            ("disaggregation_mode", "decode"),
+        ):
+            with self.subTest(field=field, value=value):
+                args = self.config_args()
+                setattr(args["server_args"], field, value)
+                with self.assertRaises(ValueError):
+                    enabled(**args)
+        for env_name in (
+            "SGLANG_NPU_USE_MLAPO",
+            "SGLANG_USE_FIA_NZ",
+            "SGLANG_NPU_SPARSE_KV_FIA_SKIP_KV_IO",
+        ):
+            with self.subTest(environment=env_name), patch.dict(
+                os.environ, {env_name: "1"}
+            ):
+                with self.assertRaises(ValueError):
+                    enabled(**self.config_args())
+        self.graph.prefill.backend = "full"
+        with self.assertRaisesRegex(ValueError, "prefill graph"):
+            enabled(**self.config_args())
+
+    def test_decode_graph_detection_uses_resolved_execution_config(self):
+        detect = self.namespace["is_sparse_kv_decode_graph_enabled"]
+        args = self.config_args()["server_args"]
+        self.assertTrue(detect(args))
+        self.graph.decode.backend = "disabled"
+        self.assertFalse(detect(args))
+        published = SimpleNamespace(
+            decode=SimpleNamespace(backend="full"),
+            prefill=SimpleNamespace(backend="disabled"),
+        )
+        self.namespace["get_exec"].side_effect = None
+        self.namespace["get_exec"].return_value = SimpleNamespace(
+            graph=SimpleNamespace(cuda_graph_config=published)
+        )
+        self.assertTrue(detect(args))
+
+
 class TestDSAFIANativeAttentionRouting(unittest.TestCase):
     def test_native_prefill_and_decode_reuse_ordinary_attention_routes(self):
         methods = SimpleNamespace(MHA_NPU="mha", MLA_NPU="mla", DSA_NPU="dsa")
@@ -1595,6 +1786,107 @@ class TestFIASkipKVIO(unittest.TestCase):
         self.manager.offload_v2.assert_not_called()
         self.manager.prefetch.assert_called_once()
         self.call_fia.assert_called_once()
+
+
+class TestDualFIAOffloadAttentionRouting(unittest.TestCase):
+    def setUp(self):
+        TestFIASkipKVIO.setUp(self)
+
+    def make_case(self, *, impl="split_graph_dual_fia", graph_mode=True, prefill=False):
+        case = TestFIASkipKVIO.make_case(self, graph_mode=graph_mode, prefill=prefill)
+        self.manager.attn_impl = impl
+        self.manager.merge_impl = "python"
+        self.manager._split_graph_dual_logged = True
+        self.manager.prefetch_partitions_graph_dual = Mock(return_value=object())
+        self.manager.prefetch_partitions = Mock(return_value=object())
+        self.graph_attention = Mock(return_value=case["q"].view(2, 1, 2, 512))
+        self.eager_attention = Mock(return_value=case["q"].view(2, 1, 2, 512))
+        self.namespace["_run_split_decode_attention_graph_dual"] = self.graph_attention
+        self.namespace["_run_split_decode_attention"] = self.eager_attention
+        return case
+
+    def test_selector_adds_dual_fia_without_rerouting_existing_modes(self):
+        select = self.namespace["_select_split_decode_mode"]
+        expected = {
+            "combined": (None, None),
+            "native_fia": (None, None),
+            "split_eager": (None, "parallel"),
+            "split_graph": ("single_stream", "parallel"),
+            "split_graph_dual": ("dual_stream", "parallel"),
+            "split_graph_dual_fia": ("dual_stream", "parallel"),
+            "split_graph_dual_v2": ("dual_stream_v2", "parallel"),
+            "pa_graph": ("pa_hot_cache", "pa_hot_cache"),
+        }
+        self.assertEqual(
+            set(expected), set(self.namespace["SPARSE_KV_ATTN_IMPL_CHOICES"])
+        )
+        for impl, (graph, eager) in expected.items():
+            with self.subTest(impl=impl):
+                self.assertEqual(select(impl, True), graph)
+                self.assertEqual(select(impl, False), eager)
+
+    def test_dual_fia_keeps_prefetch_tickets_and_both_stream_execution_routes(self):
+        for impl in ("split_graph_dual_fia", "split_graph_dual"):
+            for graph_mode in (False, True):
+                with self.subTest(impl=impl, graph_mode=graph_mode):
+                    case = self.make_case(impl=impl, graph_mode=graph_mode)
+                    self.call_fia.reset_mock()
+                    self.npu_mock.npu_sparse_flash_attention.reset_mock()
+                    ordered = Mock()
+                    ordered.attach_mock(self.manager.offload_v2, "offload")
+                    prefetch = (
+                        self.manager.prefetch_partitions_graph_dual
+                        if graph_mode
+                        else self.manager.prefetch_partitions
+                    )
+                    other_prefetch = (
+                        self.manager.prefetch_partitions
+                        if graph_mode
+                        else self.manager.prefetch_partitions_graph_dual
+                    )
+                    attention = (
+                        self.graph_attention if graph_mode else self.eager_attention
+                    )
+                    other_attention = (
+                        self.eager_attention if graph_mode else self.graph_attention
+                    )
+                    ordered.attach_mock(prefetch, "prefetch")
+                    ordered.attach_mock(attention, "attention")
+                    output = self.forward(**case)
+                    self.assertEqual(output.shape, (2, 1024))
+                    self.assertEqual(
+                        [call[0] for call in ordered.mock_calls],
+                        ["offload", "prefetch", "attention"],
+                    )
+                    prefetch.assert_called_once_with(
+                        case["layer"], case["forward_batch"], case["topk_indices"],
+                        "main_stream", dtype=case["k"].dtype,
+                    )
+                    self.assertIs(attention.call_args.args[0], prefetch.return_value)
+                    if graph_mode:
+                        self.assertIs(attention.call_args.args[1], self.manager)
+                    kwargs = attention.call_args.kwargs
+                    self.assertEqual(kwargs["use_fia"], impl == "split_graph_dual_fia")
+                    self.assertEqual(kwargs["page_size"], case["backend"].page_size)
+                    self.assertEqual(kwargs["stream"], "main_stream")
+                    self.assertEqual(kwargs["query"].shape, (2, 1, 2, 512))
+                    self.assertEqual(kwargs["query_rope"].shape, (2, 1, 2, 64))
+                    other_prefetch.assert_not_called()
+                    other_attention.assert_not_called()
+                    self.manager.prefetch.assert_not_called()
+                    self.call_fia.assert_not_called()
+                    self.npu_mock.npu_sparse_flash_attention.assert_not_called()
+
+    def test_dual_fia_prefill_keeps_original_offload_and_sfa(self):
+        case = self.make_case(prefill=True, graph_mode=False)
+        self.forward(**case)
+        self.manager.offload_v2.assert_called_once()
+        self.manager.get_forward_kv.assert_called_once()
+        self.manager.prefetch_partitions_graph_dual.assert_not_called()
+        self.manager.prefetch_partitions.assert_not_called()
+        self.graph_attention.assert_not_called()
+        self.eager_attention.assert_not_called()
+        self.npu_mock.npu_sparse_flash_attention.assert_called_once()
 
 
 class TestNativeFIAOffloadAttention(unittest.TestCase):

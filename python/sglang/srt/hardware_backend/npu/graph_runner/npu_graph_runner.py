@@ -46,6 +46,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_COMBINED,
     SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
 )
 from sglang.srt.model_executor.runner import DecodeCudaGraphRunner
 from sglang.srt.utils import (
@@ -263,9 +264,17 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             )
             and sparse_kv_manager is not None
             and sparse_kv_manager.attn_impl
-            in (SPARSE_KV_ATTN_IMPL_COMBINED, SPARSE_KV_ATTN_IMPL_SPLIT_EAGER)
+            in (
+                SPARSE_KV_ATTN_IMPL_COMBINED,
+                SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
+            )
         )
         native_fia = getattr(self.attn_backend, "dsa_fia_native", False)
+        dual_fia = (
+            sparse_kv_manager is not None
+            and sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA
+        )
         native_fia_offload = (
             sparse_kv_manager is not None
             and sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_NATIVE_FIA
@@ -308,6 +317,8 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             elif sparse_fia:
                 # Keep the combined buffer's existing capacity semantics; the
                 # device snapshot above provides ordering, not FIA KV lengths.
+                # Dual FIA also uses capacity for both partitions; its device
+                # masks select per-layer hit/miss counts computed inside replay.
                 # IDLE ranks replay the same decode graph and must replace its
                 # capture-time lengths with zeros, as do padded request rows.
                 capacity = sparse_kv_manager.sparse_context_len
@@ -322,7 +333,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                     capacity=sparse_kv_manager.sparse_context_len,
                     raw_bs=self.raw_bs,
                     padded_bs=self.bs,
-                    route="sparse_fia_mla",
+                    route="sparse_fia_dual" if dual_fia else "sparse_fia_mla",
                     skip_kv_io=getattr(sparse_kv_manager, "fia_skip_kv_io", False),
                 )
             else:
@@ -348,7 +359,9 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 graph_key,
                 seq_lens=seq_lens,
                 attr_name=(
-                    "actual_seq_lengths_kv"
+                    "actual_seq_kvlen"
+                    if dual_fia
+                    else "actual_seq_lengths_kv"
                     if sparse_fia or native_fia_offload
                     else self._get_update_attr_name()
                 ),

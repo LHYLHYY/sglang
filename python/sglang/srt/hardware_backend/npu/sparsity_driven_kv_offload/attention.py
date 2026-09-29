@@ -29,6 +29,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     SPARSE_KV_MERGE_IMPL_AUTO,
     SPARSE_KV_MERGE_IMPL_FUSED,
@@ -80,7 +81,10 @@ def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> Optional[str]
     if graph_mode:
         if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH:
             return _SPLIT_MODE_SINGLE_STREAM
-        if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL:
+        if attn_impl in (
+            SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+            SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
+        ):
             return _SPLIT_MODE_DUAL_STREAM
         if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2:
             return _SPLIT_MODE_DUAL_STREAM_V2
@@ -89,6 +93,7 @@ def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> Optional[str]
         SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
         SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
         SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
         SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     ):
         return _SPLIT_MODE_PARALLEL
@@ -116,6 +121,155 @@ def _expand_dsa_sparse_indices(topk_indices: torch.Tensor) -> torch.Tensor:
     if topk_indices.dim() == 2:
         return topk_indices.unsqueeze(-2)
     return topk_indices
+
+
+def validate_split_fia_support(*, graph_enabled: bool) -> None:
+    """Reject runtimes missing the MLA LSE / graph API before allocating KV."""
+    fia = getattr(torch_npu, "npu_fused_infer_attention_score_v2", None)
+    workspace = getattr(
+        torch_npu, "_npu_fused_infer_attention_score_v2_get_max_workspace", None
+    )
+    if fia is None or not hasattr(fia, "out") or not callable(workspace):
+        raise RuntimeError(
+            "split_graph_dual_fia requires FIA v2 .out and its max-workspace API. "
+            "Install matching torch_npu/CANN with MLA D=512 mask and LSE support; "
+            "the legacy FIA interface cannot supply MLA partition LSE."
+        )
+    device_name = torch.npu.get_device_name()
+    if "950" in device_name:
+        raise RuntimeError(
+            "split_graph_dual_fia uses a dynamic MLA decode mask supported on "
+            "Atlas A2/A3; the Ascend 950 MLA decode mask is not supported."
+        )
+    if graph_enabled:
+        try:
+            from torch_npu.npu._npugraph_handlers.npugraph_handler import (
+                _NPU_GRAPH_OP_HANDLERS,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "split_graph_dual_fia requires torch_npu's FIA v2 NPUGraph "
+                "auto-dispatch handler registry. Upgrade the matching NPU runtime."
+            ) from exc
+        if "npu_fused_infer_attention_score_v2.out" not in _NPU_GRAPH_OP_HANDLERS:
+            raise RuntimeError(
+                "split_graph_dual_fia requires the FIA v2 .out graph-update handler."
+            )
+    logger.info(
+        "Sparse KV dual FIA: FIA v2 with device partition masks and FP32 LSE; "
+        "full-model warmup will validate MLA mask/LSE support in the installed CANN."
+    )
+
+
+def _run_decode_fia_partition(
+    partition: SparseKVPartition,
+    *,
+    query: torch.Tensor,
+    query_rope: torch.Tensor,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    scale_value: float,
+    page_size: int,
+    record_stream: bool = True,
+) -> _SfaPartitionState:
+    """Run FIA v2 on an independent compact partition without host count reads.
+
+    Per-layer hit/miss counts are computed inside the graph. Keep CPU lengths
+    at physical capacity and use a device mask for the actual partition. LSE
+    represents the same softmax mass as the existing max/sum merge with sum=1.
+    """
+    batch_size, query_length, num_heads, value_dim = query.shape
+    capacity = partition.kv.shape[1]
+    if (
+        query_length != 1
+        or nope_head_dim != 512
+        or rope_head_dim != 64
+        or value_dim != nope_head_dim
+        or num_heads not in (1, 2, 4, 8, 16, 32, 64, 128)
+        or tuple(query_rope.shape) != (batch_size, 1, num_heads, rope_head_dim)
+        or tuple(partition.kv.shape)
+        != (batch_size, capacity, 1, nope_head_dim + rope_head_dim)
+        or tuple(partition.true_counts.shape) != (batch_size,)
+    ):
+        raise ValueError(
+            "Dual FIA requires MLA decode Q=[B,1,N,512], RoPE=64, KV_N=1."
+        )
+    if page_size <= 0 or page_size % 16 or page_size > 1024 or capacity % page_size:
+        raise ValueError(
+            "Dual FIA capacity must be divisible by a 16-aligned page <=1024."
+        )
+    if query.dtype != partition.kv.dtype or query_rope.dtype != query.dtype:
+        raise ValueError("Dual FIA query and unquantized KV must have the same dtype.")
+    if record_stream:
+        for tensor in (partition.kv, partition.true_counts, query, query_rope):
+            tensor.record_stream(partition.stream)
+
+    positions = torch.arange(capacity, device=query.device, dtype=torch.int32)
+    counts = partition.true_counts.view(batch_size, 1)
+    valid = positions.view(1, capacity) < counts
+    # Fixed-capacity FIA can read masked V rows. Remove uninitialized/old NaNs
+    # without writing the source buffer (eager refill may read it concurrently).
+    kv = torch.where(valid.view(batch_size, capacity, 1, 1), partition.kv, 0.0)
+    key, key_rope = kv.split([nope_head_dim, rope_head_dim], dim=-1)
+    key = key.contiguous().view(-1, page_size, nope_head_dim)
+    key_rope = key_rope.contiguous().view(-1, page_size, rope_head_dim)
+    # Empty partitions attend to one finite zero dummy; neutralize their output
+    # below. This avoids relying on all-masked-row softmax behavior.
+    atten_mask = (
+        positions.view(1, capacity) >= counts.clamp(min=1)
+    ).view(batch_size, 1, 1, capacity).contiguous()
+    blocks_per_req = capacity // page_size
+    block_table = torch.arange(
+        batch_size * blocks_per_req, device=query.device, dtype=torch.int32
+    ).view(batch_size, blocks_per_req)
+    kwargs = dict(
+        query_rope=query_rope,
+        key_rope=key_rope,
+        atten_mask=atten_mask,
+        actual_seq_kvlen=[capacity] * batch_size,
+        block_table=block_table,
+        block_size=page_size,
+        num_query_heads=num_heads,
+        num_key_value_heads=1,
+        softmax_scale=scale_value,
+        input_layout="BSND",
+        sparse_mode=0,
+        return_softmax_lse=True,
+    )
+    output = torch.empty_like(query)
+    lse = torch.empty(
+        (batch_size, num_heads, query_length, 1),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    try:
+        workspace = torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(
+            query, key, key, **kwargs
+        )
+        torch_npu.npu_fused_infer_attention_score_v2.out(
+            query, key, key, **kwargs, workspace=workspace, out=[output, lse]
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Dual FIA requires CANN support for FIA v2 BSND MLA D=512 with "
+            "a device attention mask and return_softmax_lse=True."
+        ) from exc
+    if (
+        tuple(output.shape) != tuple(query.shape)
+        or output.dtype != query.dtype
+        or tuple(lse.shape) != (batch_size, num_heads, query_length, 1)
+        or lse.dtype != torch.float32
+    ):
+        raise RuntimeError("Unexpected dual FIA output or FP32 [B,N,1,1] LSE contract.")
+    nonempty = (partition.true_counts > 0).view(batch_size, 1, 1, 1)
+    output = torch.where(nonempty, output, 0.0)
+    lse = torch.where(nonempty, lse, 0.0).permute(0, 3, 2, 1).contiguous()
+    return _SfaPartitionState(
+        output=output,
+        softmax_max=lse,
+        softmax_sum=torch.ones_like(lse),
+        true_counts=partition.true_counts,
+    )
 
 
 def _run_combined_decode_fia(
@@ -451,31 +605,39 @@ def _run_split_decode_attention(
     scale_value: float,
     merge_impl: str,
     stream,
+    use_fia: bool = False,
+    page_size: int = 128,
 ) -> torch.Tensor:
+    partition_attention = (
+        _run_decode_fia_partition if use_fia else _run_decode_sfa_partition
+    )
+    extra_kwargs = {"page_size": page_size} if use_fia else {}
     hit_attention_done = torch.npu.Event()
     miss_attention_done = torch.npu.Event()
 
     with torch.profiler.record_function("sparse_kv_split.hit_attention"):
         with torch.npu.stream(ticket.hit.stream):
-            hit_state = _run_decode_sfa_partition(
+            hit_state = partition_attention(
                 ticket.hit,
                 query=query,
                 query_rope=query_rope,
                 nope_head_dim=nope_head_dim,
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
+                **extra_kwargs,
             )
             _record_stream_event(ticket.hit.stream, hit_attention_done)
 
     with torch.profiler.record_function("sparse_kv_split.miss_attention"):
         with torch.npu.stream(ticket.miss.stream):
-            miss_state = _run_decode_sfa_partition(
+            miss_state = partition_attention(
                 ticket.miss,
                 query=query,
                 query_rope=query_rope,
                 nope_head_dim=nope_head_dim,
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
+                **extra_kwargs,
             )
             _record_stream_event(ticket.miss.stream, miss_attention_done)
 
@@ -544,12 +706,18 @@ def _run_split_decode_attention_graph_dual(
     rope_head_dim: int,
     scale_value: float,
     stream,
+    use_fia: bool = False,
+    page_size: int = 128,
 ) -> torch.Tensor:
     """Run hit attention on the graph stream and miss attention/refill in parallel."""
 
+    partition_attention = (
+        _run_decode_fia_partition if use_fia else _run_decode_sfa_partition
+    )
+    extra_kwargs = {"page_size": page_size} if use_fia else {}
     with torch.profiler.record_function("sparse_kv_split_graph_dual.hit_attention"):
         with torch.npu.stream(stream):
-            hit_state = _run_decode_sfa_partition(
+            hit_state = partition_attention(
                 ticket.hit,
                 query=query,
                 query_rope=query_rope,
@@ -557,11 +725,12 @@ def _run_split_decode_attention_graph_dual(
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
                 record_stream=False,
+                **extra_kwargs,
             )
 
     with torch.profiler.record_function("sparse_kv_split_graph_dual.miss_attention"):
         with torch.npu.stream(ticket.miss.stream):
-            miss_state = _run_decode_sfa_partition(
+            miss_state = partition_attention(
                 ticket.miss,
                 query=query,
                 query_rope=query_rope,
@@ -569,6 +738,7 @@ def _run_split_decode_attention_graph_dual(
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
                 record_stream=False,
+                **extra_kwargs,
             )
             _record_stream_event(ticket.miss.stream, ticket.events.miss_attention_done)
             # Refill runs after miss attention on the same worker stream.  The
@@ -882,6 +1052,9 @@ def forward_sparsity_driven_kv_offload(
         split_mode = _select_split_decode_mode(
             sparse_kv_manager.attn_impl, backend.graph_mode
         )
+        use_split_fia = (
+            sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA
+        )
         if (
             sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_EAGER
             and backend.graph_mode
@@ -907,9 +1080,12 @@ def forward_sparsity_driven_kv_offload(
             and not sparse_kv_manager._split_graph_dual_logged
         ):
             logger.warning(
-                "Sparse KV split_graph_dual is experimental: hit attention runs "
+                "Sparse KV %s is experimental: hit attention runs "
                 "on the graph stream while host misses, miss attention, and "
-                "hot-cache refill run on a persistent worker stream."
+                "hot-cache refill run on a persistent worker stream. "
+                "Partition attention: %s.",
+                sparse_kv_manager.attn_impl,
+                "FIA v2 with device masks and LSE merge" if use_split_fia else "SFA",
             )
             sparse_kv_manager._split_graph_dual_logged = True
         if (
@@ -974,6 +1150,8 @@ def forward_sparsity_driven_kv_offload(
                     rope_head_dim=rope_head_dim,
                     scale_value=layer.scaling,
                     stream=stream,
+                    use_fia=use_split_fia,
+                    page_size=backend.page_size,
                 )
             elif split_mode == _SPLIT_MODE_DUAL_STREAM_V2:
                 ticket = sparse_kv_manager.prefetch_partitions_graph_dual_v2(
@@ -1024,6 +1202,8 @@ def forward_sparsity_driven_kv_offload(
                     scale_value=layer.scaling,
                     merge_impl=sparse_kv_manager.merge_impl,
                     stream=stream,
+                    use_fia=use_split_fia,
+                    page_size=backend.page_size,
                 )
             return decode_output[:, :, :num_query_heads, :].reshape(
                 batch_size, num_query_heads * nope_head_dim

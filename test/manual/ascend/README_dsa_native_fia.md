@@ -1,5 +1,69 @@
 # Run native MLA FIA with a full DSA checkpoint
 
+## Dual-stream FIA with hot-cache overlap
+
+Select `split_graph_dual_fia` to use FIA for both hit and miss attention while
+retaining the original compact dual-stream prefetch and hot-cache refill:
+
+```bash
+export SGLANG_NPU_DSA_FIA_NATIVE=0
+export SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD=1
+export SGLANG_NPU_SPARSE_KV_ATTN_IMPL=split_graph_dual_fia
+export ASCEND_USE_FIA=1
+export SGLANG_NPU_GRAPH_DEBUG=1
+unset SGLANG_NPU_SPARSE_KV_FIA_SKIP_KV_IO
+unset SGLANG_NPU_USE_MLAPO
+unset SGLANG_USE_FIA_NZ
+```
+
+Keep the complete model and benchmark from the successful `combined` run. Use
+`--attention-backend ascend --kv-cache-dtype auto`,
+`--cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled`,
+`--disable-radix-cache` and the original explicit `--max-running-requests`.
+An explicit `--cuda-graph-config` overrides the convenience graph flags.
+The current hot-cache manager requires `index_topk=2048`; MLA dimensions must
+be 512 + 64. Page size must divide 2048, be a multiple of 16 and be <=1024
+(for example 128). CP, speculative decoding, torch.compile, MLAPO, FIA_NZ,
+PDMux, two-batch overlap and PD disaggregation are rejected in this mode.
+
+This mode requires a matching **torch_npu/CANN with FIA v2 MLA decode mask and
+LSE support on Atlas A2/A3**. The legacy FIA API used by `combined` does not
+support LSE for MLA D=512, so a successful combined test alone does not establish
+this capability. See the [legacy FIA restrictions](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score.md)
+and [FIA v2 contract](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score_v2.md).
+Startup checks the v2 `.out`, maximum-workspace API and graph handler. Full-model
+warmup then exercises the actual masked MLA/LSE combination; older CANN versions
+can still reject it. Ascend 950 MLA decode does not support the mask used here
+and is rejected. The mode never silently falls back to SFA or combined FIA.
+
+During graph decode, the main stream runs the HBM hit copy and hit FIA while
+the worker stream runs the host miss copy, miss FIA and refill. Merge waits
+for miss attention; the layer joins refill before reusing the shared workspace.
+The hit/miss KV buffers are independent. This reuses the compact
+`split_graph_dual` implementation, rather than the shared noncompact workspace
+of `split_graph_dual_v2`.
+
+Per-layer hit/miss counts stay on the device. Each partition passes fixed
+selected-buffer capacity as `actual_seq_kvlen` and uses a `[B,1,1,K]` device mask
+to exclude its unused rows. Invalid KV rows are zeroed in a separate tensor so
+masked V cannot contain stale NaNs and concurrent refill can read the source.
+Empty partitions get one zero dummy token and are neutralized before merge.
+FIA v2 returns FP32 LSE; passing `max=LSE, sum=1` to the existing stable merge
+weights both outputs by their softmax mass. Eager decode uses the original
+parallel prefetch with these same FIA partitions; prefill remains SFA.
+
+Every graph replay retains the blocking nonempty graph-buffer read before
+update/replay. The update uses **`actual_seq_kvlen`**, broadcast to every layer's
+two FIA tasks; padding and IDLE lengths are zero. Expected replay logs include
+`seq_lens.cpu.returned`, then `seq_lens.selected_kv route=sparse_fia_dual` and
+`update.prepare input_keys=[['actual_seq_kvlen']]`. Capture should report two
+FIA update tasks per attention layer in the captured graph.
+
+The CPU checks cover partition masking/merge and stream dependency scheduling.
+Use the unchanged full-model benchmark below to validate device completion,
+accuracy and performance. The additional mask and partition work means an actual
+speedup must be measured; CPU tests cannot establish device overlap or throughput.
+
 ## Original DSA offload with hot-cache prefetch
 
 The replay ordering fix also applies to the original `combined` route and to
@@ -36,9 +100,8 @@ selected-buffer padding and does not establish numerical accuracy.
 `split_eager` uses this same fix for its graph-mode FIA fallback; its eager
 split-SFA path is unchanged. `split_graph`, `split_graph_dual`,
 `split_graph_dual_v2` and `pa_graph` retain their SFA replay paths without this
-FIA CPU update. Full-model completion has been reported for `native_fia` after
-the ordering fix; the port to the original hot-cache route still needs Ascend
-device validation.
+FIA CPU update. Full-model completion has been reported for both `native_fia`
+and `combined` after the ordering fix.
 
 ## DSA with real KV offload
 
@@ -187,7 +250,8 @@ with `--cuda-graph-backend-decode full` and `SGLANG_NPU_GRAPH_DEBUG=1`.
 Keep prefill graphs disabled. Check any `--cuda-graph-config` JSON too: its
 decode setting overrides the convenience flag.
 
-The `native_fia`, `combined` and graph-mode `split_eager` replay paths read
+The `native_fia`, `combined`, `split_graph_dual_fia` and graph-mode `split_eager`
+replay paths read
 `self.buffers.seq_lens[:self.bs].cpu().tolist()`
 from the loaded graph buffer before starting FIA's background `graph.update`
 and `graph.replay`. This device-to-host snapshot restores the ordering point
@@ -202,7 +266,8 @@ For each rank, inspect the debug stages in this order:
 
 1. `seq_lens.cpu.begin`, then `seq_lens.cpu.returned`.
 2. `seq_lens.selected_kv` with `route=native_fia_offload` for `native_fia`, or
-   `route=sparse_fia_mla` for `combined` / graph-mode `split_eager`.
+   `route=sparse_fia_mla` for `combined` / graph-mode `split_eager`, or
+   `route=sparse_fia_dual` for `split_graph_dual_fia`.
 3. `update.begin` / `replay.begin`, followed by their return and join stages.
 
 If the benchmark still stalls, retain each rank's final stages and the earliest
@@ -217,6 +282,7 @@ its final measurements.
 ```bash
 python test/manual/ascend/test_fia_graph_replay_update.py -v
 python test/manual/ascend/test_native_fia_offload_manager.py -v
+python test/manual/ascend/test_split_fia_attention.py -v
 ```
 
 These CPU mocks check configuration, staging memory accounting, shared FIA

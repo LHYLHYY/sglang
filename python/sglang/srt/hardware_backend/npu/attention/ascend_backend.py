@@ -23,10 +23,12 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     get_native_fia_offload_max_batch_size,
     get_sparse_kv_attn_impl,
     is_dsa_fia_native_enabled,
+    is_sparse_kv_decode_graph_enabled,
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -363,6 +365,7 @@ class AscendAttnBackend(AttentionBackend):
             and get_sparse_kv_attn_impl()
             in (
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
                 SPARSE_KV_ATTN_IMPL_PA_GRAPH,
             )
@@ -373,6 +376,18 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
+            if get_sparse_kv_attn_impl() == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA:
+                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                    validate_split_fia_support,
+                )
+
+                # Fail before allocating host KV or graph workspaces if this
+                # torch_npu build cannot return MLA LSE or capture FIA v2.
+                validate_split_fia_support(
+                    graph_enabled=is_sparse_kv_decode_graph_enabled(
+                        model_runner.server_args
+                    )
+                )
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 SparseKVCacheManager,
                 register_sparse_kv_manager,
@@ -649,6 +664,7 @@ class AscendAttnBackend(AttentionBackend):
             and self.sparse_kv_manager.attn_impl
             in (
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
                 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
                 SPARSE_KV_ATTN_IMPL_PA_GRAPH,
             )
@@ -738,6 +754,7 @@ class AscendAttnBackend(AttentionBackend):
                 and self.sparse_kv_manager.attn_impl
                 in (
                     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+                    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
                     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
                     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
                 )

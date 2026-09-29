@@ -22,6 +22,7 @@ SPARSE_KV_ATTN_IMPL_NATIVE_FIA = "native_fia"
 SPARSE_KV_ATTN_IMPL_SPLIT_EAGER = "split_eager"
 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH = "split_graph"
 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL = "split_graph_dual"
+SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA = "split_graph_dual_fia"
 SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2 = "split_graph_dual_v2"
 SPARSE_KV_ATTN_IMPL_PA_GRAPH = "pa_graph"
 SPARSE_KV_ATTN_IMPL_CHOICES = (
@@ -30,6 +31,7 @@ SPARSE_KV_ATTN_IMPL_CHOICES = (
     SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
 )
@@ -141,6 +143,11 @@ def _get_native_fia_offload_graph_config(server_args: ServerArgs):
     return config if config is not None else server_args.cuda_graph_config
 
 
+def is_sparse_kv_decode_graph_enabled(server_args: ServerArgs) -> bool:
+    """Read the resolved decode setting before validating FIA graph support."""
+    return _get_native_fia_offload_graph_config(server_args).decode.backend != "disabled"
+
+
 def get_native_fia_offload_max_batch_size(server_args: ServerArgs) -> int:
     """Conservative per-rank bound shared by staging allocation and budgeting."""
     if (
@@ -220,7 +227,7 @@ def get_sparse_kv_fia_skip_kv_io(attn_impl: str) -> bool:
         raise ValueError(
             f"{SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR}=1 requires "
             f"{SPARSE_KV_ATTN_IMPL_ENV_VAR}={SPARSE_KV_ATTN_IMPL_COMBINED}; "
-            f"got {attn_impl!r}. This diagnostic is not supported for SFA modes."
+            f"got {attn_impl!r}. This diagnostic is only supported for combined."
         )
     return enabled
 
@@ -269,22 +276,26 @@ def is_sparsity_driven_kv_offload_enabled(
             f"{_ENABLE_ENV_VAR} requires an explicit "
             "--max-running-requests to bound the per-process host KV allocation."
         )
-    if get_sparse_kv_attn_impl() == SPARSE_KV_ATTN_IMPL_NATIVE_FIA:
+    attn_impl = get_sparse_kv_attn_impl()
+    if attn_impl in (
+        SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
+        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
+    ):
         if model_config.hf_config.architectures[0] not in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
         ):
             raise ValueError(
-                "native_fia offload requires a DeepSeek V3/V3.2 DSA model."
+                f"{attn_impl} offload requires a DeepSeek V3/V3.2 DSA model."
             )
         topk = model_config.hf_config.index_topk
         if not isinstance(topk, int) or isinstance(topk, bool) or topk <= 0:
             raise ValueError(
-                "native_fia offload requires a positive integer index_topk."
+                f"{attn_impl} offload requires a positive integer index_topk."
             )
         if server_args.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
             raise ValueError(
-                "native_fia offload requires unquantized KV; "
+                f"{attn_impl} offload requires unquantized KV; "
                 "use --kv-cache-dtype auto or bfloat16."
             )
         if (
@@ -297,13 +308,13 @@ def is_sparsity_driven_kv_offload_enabled(
             or get_bool_env_var("SGLANG_USE_FIA_NZ")
         ):
             raise ValueError(
-                "native_fia offload requires the non-speculative ND MLA/FIA path. "
+                f"{attn_impl} offload requires the non-speculative ND MLA/FIA path. "
                 "Disable context parallelism, speculative decoding, torch.compile, "
                 "MLAPO and FIA_NZ."
             )
         if server_args.enable_pdmux or server_args.enable_two_batch_overlap:
             raise ValueError(
-                "native_fia offload shares selected-KV staging across layers; "
+                f"{attn_impl} offload shares selected-KV staging across layers; "
                 "disable PDMux and two-batch overlap."
             )
         if (
@@ -311,20 +322,52 @@ def is_sparsity_driven_kv_offload_enabled(
             != "disabled"
         ):
             raise ValueError(
-                "native_fia offload requires the prefill graph backend disabled."
+                f"{attn_impl} offload requires the prefill graph backend disabled."
             )
         if not server_args.disable_radix_cache:
             raise ValueError(
-                "native_fia offload requires --disable-radix-cache: "
+                f"{attn_impl} offload requires --disable-radix-cache: "
                 "host KV is owned by individual requests and cannot share prefixes."
             )
         if server_args.disaggregation_mode != "null":
-            raise ValueError("native_fia offload does not support PD disaggregation.")
+            raise ValueError(f"{attn_impl} offload does not support PD disaggregation.")
         if get_bool_env_var(SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR):
             raise ValueError(
-                "native_fia offload requires real KV IO; disable FIA_SKIP_KV_IO."
+                f"{attn_impl} offload requires real KV IO; disable FIA_SKIP_KV_IO."
             )
-        get_native_fia_offload_max_batch_size(server_args)
+        if attn_impl == SPARSE_KV_ATTN_IMPL_NATIVE_FIA:
+            get_native_fia_offload_max_batch_size(server_args)
+        else:
+            if server_args.max_running_requests <= 0:
+                raise ValueError(
+                    "split_graph_dual_fia requires a positive --max-running-requests."
+                )
+            if model_config.kv_lora_rank != 512 or model_config.qk_rope_head_dim != 64:
+                raise ValueError(
+                    "split_graph_dual_fia requires MLA KV dimensions 512 + 64."
+                )
+            # The existing hot-cache manager and its compact partition buffers
+            # use this fixed capacity. Do not accept a model whose indexer would
+            # generate a different number of selected rows.
+            if topk != 2048:
+                raise ValueError("split_graph_dual_fia requires index_topk=2048.")
+            page_size = server_args.page_size
+            if (
+                not isinstance(page_size, int)
+                or isinstance(page_size, bool)
+                or page_size <= 0
+                or page_size > 1024
+                or page_size % 16
+                or topk % page_size
+            ):
+                raise ValueError(
+                    "split_graph_dual_fia requires a page size divisible by 16, "
+                    "at most 1024, and dividing the selected-KV capacity 2048."
+                )
+            if server_args.enable_dsa_prefill_context_parallel:
+                raise ValueError(
+                    "split_graph_dual_fia does not support DSA prefill context parallelism."
+                )
     return True
 
 
