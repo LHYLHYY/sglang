@@ -71,6 +71,7 @@ class Tensor(np.ndarray):
     def record_stream(self, stream):
         if self.runtime is not None:
             self.runtime.log.append(("tensor.record_stream", stream.name))
+            self.runtime.recorded_tensors.append((self.data_ptr(), stream.name))
 
     def cpu(self):
         raise AssertionError("Split attention must not copy counts to CPU")
@@ -101,6 +102,7 @@ class Stream:
 class Runtime:
     def __init__(self):
         self.log = []
+        self.recorded_tensors = []
         self.main = Stream(self, "main")
         self.hit = Stream(self, "hit")
         self.miss = Stream(self, "miss")
@@ -370,13 +372,20 @@ class TestSplitFIA(unittest.TestCase):
         for row, (nhit, nmiss) in enumerate(zip(hit_counts, miss_counts)):
             hit[row, :nhit] = rng.normal(0, 0.1, (nhit, 1, 576))
             miss[row, :nmiss] = rng.normal(0, 0.1, (nmiss, 1, 576))
-        make_partition = lambda kv, counts, stream: SimpleNamespace(
-            kv=kv,
-            true_counts=tensor(counts, np.int32),
-            sparse_indices=tensor(np.zeros((batch, 1, 1, capacity)), np.int32),
-            actual_seq_lengths_kv=tensor(np.maximum(counts, 1), np.int32),
-            stream=stream,
-        )
+        def make_partition(kv, counts, stream):
+            buffer = tensor(np.empty(batch * capacity * 576), np.float16)
+            key_size = batch * capacity * 512
+            partition = SimpleNamespace(
+                kv=kv,
+                buffer=buffer,
+                key=buffer[:key_size].view(batch, capacity, 1, 512),
+                key_rope=buffer[key_size:].view(batch, capacity, 1, 64),
+                true_counts=tensor(counts, np.int32),
+                stream=stream,
+            )
+            self.prepare_partition(partition)
+            return partition
+
         return SimpleNamespace(
             query=query,
             query_rope=rope,
@@ -385,6 +394,15 @@ class TestSplitFIA(unittest.TestCase):
             capacity=capacity,
             scale=0.37,
         )
+
+    @staticmethod
+    def prepare_partition(partition):
+        # Model the producer's zero + fused gather/split. The refill snapshot
+        # deliberately keeps NaN tails so attention must use prepared storage.
+        partition.buffer.fill(0)
+        for row, count in enumerate(partition.true_counts):
+            partition.key[row, :count] = partition.kv[row, :count, :, :512]
+            partition.key_rope[row, :count] = partition.kv[row, :count, :, 512:]
 
     def run_partition(self, case, partition, **kwargs):
         return self.helpers["_run_decode_fia_partition"](
@@ -442,6 +460,10 @@ class TestSplitFIA(unittest.TestCase):
         q, key, value, kwargs = self.fia.calls[-1]
         self.assertIs(q, case.query)
         self.assertIs(key, value)
+        self.assertEqual(key.data_ptr(), case.hit.key.data_ptr())
+        self.assertEqual(kwargs["key_rope"].data_ptr(), case.hit.key_rope.data_ptr())
+        self.assertTrue(np.shares_memory(key, case.hit.buffer))
+        self.assertTrue(np.shares_memory(kwargs["key_rope"], case.hit.buffer))
         self.assertIs(kwargs["workspace"], self.fia.workspace)
         self.assertEqual(kwargs["actual_seq_kvlen"], [16, 16])
         self.assertTrue(kwargs["return_softmax_lse"])
@@ -482,6 +504,8 @@ class TestSplitFIA(unittest.TestCase):
         case.miss.kv[:, :2] = 0
         case.hit.kv[:, :2, :, 0] = 5
         case.miss.kv[:, :2, :, 0] = -5
+        self.prepare_partition(case.hit)
+        self.prepare_partition(case.miss)
         hit = self.run_partition(case, case.hit)
         miss = self.run_partition(case, case.miss)
         merged = self.helpers["_merge_decode_sfa_partitions_python"](hit, miss)
@@ -508,6 +532,7 @@ class TestSplitFIA(unittest.TestCase):
         first = self.run_partition(case, case.hit)
         case.hit.true_counts[...] = 3
         case.hit.kv[:, 3:] = np.nan
+        self.prepare_partition(case.hit)
         second = self.run_partition(case, case.hit)
         self.assertEqual(
             self.fia.calls[0][3]["actual_seq_kvlen"],
@@ -528,9 +553,96 @@ class TestSplitFIA(unittest.TestCase):
         np.testing.assert_array_equal(
             self.fia.calls[0][3]["block_table"], [[0, 1], [2, 3]]
         )
-        # Refill may read the original source on another stream. Clearing the
-        # unused tail must therefore write a new temporary, not that source.
+        # Refill may read its combined snapshot on another stream. Attention
+        # consumes the prepared split buffers without modifying that snapshot.
         np.testing.assert_array_equal(case.hit.kv, original_hit)
+
+    def test_prepared_kv_needs_no_sfa_metadata_or_layout_copies(self):
+        case = self.make_case(hit_counts=(17, 0), miss_counts=(15, 32), capacity=32)
+        expected = self.reference(case)
+        # Refill storage is not an attention input. Removing it also catches
+        # accidental fallback to splitting/sanitizing the combined KV tensor.
+        del case.hit.kv
+        del case.miss.kv
+        hit = self.run_partition(case, case.hit)
+        miss = self.run_partition(case, case.miss)
+        output = self.helpers["_merge_decode_sfa_partitions_python"](hit, miss)
+        np.testing.assert_allclose(output, expected, atol=8e-5, rtol=2e-3)
+        for partition, (_, key, value, kwargs) in zip(
+            (case.hit, case.miss), self.fia.calls
+        ):
+            self.assertEqual(key.data_ptr(), partition.key.data_ptr())
+            self.assertEqual(
+                kwargs["key_rope"].data_ptr(), partition.key_rope.data_ptr()
+            )
+            self.assertIs(key, value)
+            self.assertTrue(np.shares_memory(key, partition.buffer))
+            self.assertTrue(np.shares_memory(kwargs["key_rope"], partition.buffer))
+
+    def test_prepared_buffers_are_recorded_on_consumer_stream(self):
+        case = self.make_case(hit_counts=(3,), miss_counts=(13,))
+        self.run_partition(case, case.hit)
+        for prepared in (
+            case.hit.buffer,
+            case.hit.key,
+            case.hit.key_rope,
+            case.hit.true_counts,
+            case.query,
+            case.query_rope,
+        ):
+            self.assertIn(
+                (prepared.data_ptr(), "hit"), self.runtime.recorded_tensors
+            )
+
+    def test_malformed_prepared_shapes_dtypes_and_strides_are_rejected(self):
+        def bad_key_shape(partition):
+            partition.key = partition.key[..., :256]
+
+        def bad_rope_shape(partition):
+            partition.key_rope = partition.key_rope[..., :32]
+
+        def bad_counts_shape(partition):
+            partition.true_counts = partition.true_counts.view(1, 1)
+
+        def bad_buffer_shape(partition):
+            partition.buffer = partition.buffer.view(16, 576)
+
+        def bad_buffer_size(partition):
+            partition.buffer = partition.buffer[:-1]
+
+        def bad_key_stride(partition):
+            partition.key = partition.key[..., ::-1]
+
+        def bad_rope_stride(partition):
+            partition.key_rope = partition.key_rope[..., ::-1]
+
+        def bad_key_dtype(partition):
+            partition.key = partition.key.astype(np.float32)
+
+        def bad_rope_dtype(partition):
+            partition.key_rope = partition.key_rope.astype(np.float32)
+
+        def bad_buffer_dtype(partition):
+            partition.buffer = partition.buffer.astype(np.float32)
+
+        for mutate, message in (
+            (bad_key_shape, "MLA decode"),
+            (bad_rope_shape, "MLA decode"),
+            (bad_counts_shape, "MLA decode"),
+            (bad_buffer_shape, "contiguous NoPE/RoPE"),
+            (bad_buffer_size, "contiguous NoPE/RoPE"),
+            (bad_key_stride, "contiguous NoPE/RoPE"),
+            (bad_rope_stride, "contiguous NoPE/RoPE"),
+            (bad_key_dtype, "same dtype"),
+            (bad_rope_dtype, "same dtype"),
+            (bad_buffer_dtype, "same dtype"),
+        ):
+            with self.subTest(mutate=mutate.__name__):
+                case = self.make_case(hit_counts=(3,), miss_counts=(13,))
+                mutate(case.hit)
+                with self.assertRaisesRegex(ValueError, message):
+                    self.run_partition(case, case.hit)
+        self.assertEqual(self.fia.calls, [])
 
     def test_invalid_layout_and_page_fail_before_calling_fia(self):
         for page_size in (0, 8, 48, 2048):

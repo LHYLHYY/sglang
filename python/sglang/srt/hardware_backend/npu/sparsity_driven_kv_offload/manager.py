@@ -17,6 +17,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SPARSE_KV_ATTN_IMPL_PA_GRAPH,
+    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
     get_sparse_kv_attn_impl,
     get_sparse_kv_fia_skip_kv_io,
     get_sparse_kv_merge_impl,
@@ -80,9 +81,23 @@ class SparseKVPartition:
 
 
 @dataclass
+class SparseKVFiaPartition:
+    # Combined rows are retained only as the snapshot for hot-cache refill.
+    kv: torch.Tensor
+    key: torch.Tensor
+    key_rope: torch.Tensor
+    buffer: torch.Tensor
+    true_counts: torch.Tensor
+    stream: torch.npu.Stream
+
+
+SparseKVAttentionPartition = Union[SparseKVPartition, SparseKVFiaPartition]
+
+
+@dataclass
 class SparseKVPrefetchTicket:
-    hit: SparseKVPartition
-    miss: SparseKVPartition
+    hit: SparseKVAttentionPartition
+    miss: SparseKVAttentionPartition
     refill_done: torch.npu.Event
 
 
@@ -107,12 +122,14 @@ class SparseKVGraphDualState:
     miss_kv: torch.Tensor
     miss_stream: torch.npu.Stream
     layer_events: list[SparseKVGraphDualLayerEvents]
+    hit_fia_buffer: Optional[torch.Tensor] = None
+    miss_fia_buffer: Optional[torch.Tensor] = None
 
 
 @dataclass
 class SparseKVGraphDualPrefetch:
-    hit: SparseKVPartition
-    miss: SparseKVPartition
+    hit: SparseKVAttentionPartition
+    miss: SparseKVAttentionPartition
     layer_idx: int
     hit_compact_indices: torch.Tensor
     miss_compact_indices: torch.Tensor
@@ -285,6 +302,16 @@ class SparseKVCacheManager:
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
         self.attn_impl = get_sparse_kv_attn_impl()
+        if self.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA:
+            if not callable(
+                getattr(sparse_kv_ops, "unidex_split_copy_promote_inplace", None)
+            ) or not hasattr(torch.ops.npu, "unidex_split_copy_promote"):
+                raise RuntimeError(
+                    "split_graph_dual_fia requires sgl_kernel_npu with "
+                    "unidex_split_copy_promote_inplace and the registered "
+                    "unidex_split_copy_promote NPU kernel. Rebuild/install the "
+                    "matching sgl-kernel-npu package."
+                )
         self.merge_impl = get_sparse_kv_merge_impl()
         self.fia_skip_kv_io = get_sparse_kv_fia_skip_kv_io(self.attn_impl)
         logger.info(
@@ -516,6 +543,13 @@ class SparseKVCacheManager:
                 partition_shape, dtype=self.store_dtype, device=self.device
             )
             miss_kv = torch.empty_like(hit_kv)
+            hit_fia_buffer = None
+            miss_fia_buffer = None
+            if self.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA:
+                hit_fia_buffer = torch.empty(
+                    hit_kv.numel(), dtype=self.store_dtype, device=self.device
+                )
+                miss_fia_buffer = torch.empty_like(hit_fia_buffer)
             miss_stream = torch.npu.Stream()
             layer_events = [
                 SparseKVGraphDualLayerEvents(
@@ -538,10 +572,18 @@ class SparseKVCacheManager:
             miss_kv=miss_kv,
             miss_stream=miss_stream,
             layer_events=layer_events,
+            hit_fia_buffer=hit_fia_buffer,
+            miss_fia_buffer=miss_fia_buffer,
         )
         workspace_gib = (
             (hit_kv.numel() + miss_kv.numel()) * hit_kv.element_size() / GB
         )
+        if hit_fia_buffer is not None:
+            workspace_gib += (
+                (hit_fia_buffer.numel() + miss_fia_buffer.numel())
+                * hit_fia_buffer.element_size()
+                / GB
+            )
         logger.info(
             "Prepared sparse KV graph-dual workspace with shape %s (%.3f GiB).",
             partition_shape,
@@ -1585,6 +1627,96 @@ class SparseKVCacheManager:
             ),
         )
 
+    def _make_attention_partition(
+        self,
+        kv: torch.Tensor,
+        counts: torch.Tensor,
+        stream: torch.npu.Stream,
+        fia_buffer: Optional[torch.Tensor] = None,
+    ) -> SparseKVAttentionPartition:
+        """Prepare only the layout and metadata consumed by the selected op."""
+        if self.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA:
+            if fia_buffer is None:
+                fia_buffer = torch.empty(
+                    kv.numel(), dtype=kv.dtype, device=kv.device
+                )
+            # Each graph bucket uses a prefix of the persistent allocation.
+            # Split the flat storage, not the last dimension of combined KV:
+            # both views must already be contiguous when FIA sees them.
+            buffer = fia_buffer[: kv.numel()]
+            batch_size, capacity, heads, _ = kv.shape
+            nope_elements = batch_size * capacity * heads * self.kv_lora_rank
+            return SparseKVFiaPartition(
+                kv=kv,
+                key=buffer[:nope_elements].view(
+                    batch_size, capacity, heads, self.kv_lora_rank
+                ),
+                key_rope=buffer[nope_elements:].view(
+                    batch_size, capacity, heads, self.qk_rope_head_dim
+                ),
+                buffer=buffer,
+                true_counts=counts,
+                stream=stream,
+            )
+
+        # SFA reads a zero dummy at index zero for an empty partition.
+        kv[:, :1].zero_()
+        sparse_indices, actual_lengths = _build_partition_sparse_indices(
+            counts, kv.shape[1]
+        )
+        return SparseKVPartition(
+            kv=kv,
+            sparse_indices=sparse_indices,
+            actual_seq_lengths_kv=actual_lengths,
+            true_counts=counts,
+            stream=stream,
+        )
+
+    def _copy_attention_partition(
+        self,
+        src: torch.Tensor,
+        partition: SparseKVAttentionPartition,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+        valid_mask: torch.Tensor,
+        src_ptr: Optional[int] = None,
+    ) -> None:
+        """Gather KV and, for FIA, split its layout in the same copy kernel."""
+        if isinstance(partition, SparseKVFiaPartition):
+            # The indexed copy skips invalid descriptors. Clear FIA storage
+            # once on its producer stream so every masked V row (including
+            # the empty partition's dummy) is finite, even after counts shrink.
+            partition.buffer.zero_()
+            sparse_kv_ops.unidex_split_copy_promote_inplace(
+                src,
+                partition.key,
+                partition.key_rope,
+                partition.kv,
+                src_indices,
+                dst_indices,
+                dst_indices,
+                valid_mask,
+                2,
+                2,
+                2,
+                block_dim=24,
+                src_ptr=src_ptr,
+            )
+            # Here the "promotion" destination is a compact snapshot, NOT
+            # the hot cache. Refill must still wait for all old hits to be read.
+        else:
+            unidex_copy_inplace(
+                src,
+                partition.kv,
+                src_indices,
+                dst_indices,
+                valid_mask,
+                2,
+                2,
+                block_dim=24,
+                src_ptr=src_ptr,
+            )
+
     def prefetch_partitions_graph_dual(
         self,
         layer: RadixAttention,
@@ -1746,13 +1878,11 @@ class SparseKVCacheManager:
             miss_valid_flat = miss_valid.reshape(-1).contiguous()
             hit_kv = state.hit_kv[:batch_size]
             miss_kv = state.miss_kv[:batch_size]
-            hit_kv[:, :1].zero_()
-            miss_kv[:, :1].zero_()
-            hit_sparse_indices, hit_actual_lengths = _build_partition_sparse_indices(
-                hit_counts, topk_len
+            hit_partition = self._make_attention_partition(
+                hit_kv, hit_counts, stream, state.hit_fia_buffer
             )
-            miss_sparse_indices, miss_actual_lengths = _build_partition_sparse_indices(
-                miss_counts, topk_len
+            miss_partition = self._make_attention_partition(
+                miss_kv, miss_counts, state.miss_stream, state.miss_fia_buffer
             )
 
             cache_slot_ids = self._device_cache_slot_ids[:topk_len].view(1, -1)
@@ -1785,15 +1915,12 @@ class SparseKVCacheManager:
         )
         with torch.npu.stream(state.miss_stream):
             _wait_stream_event(state.miss_stream, events.inputs_ready)
-            unidex_copy_inplace(
+            self._copy_attention_partition(
                 self.host_kv_buffer[layer_idx],
-                miss_kv,
+                miss_partition,
                 miss_src_indices,
                 miss_compact_indices,
                 miss_valid_flat,
-                2,
-                2,
-                block_dim=24,
                 src_ptr=self.dev_ptr_list[layer_idx],
             )
         _profile_pop(miss_copy_range)
@@ -1802,35 +1929,20 @@ class SparseKVCacheManager:
             "sparse_kv_prefetch_partitions_graph_dual.d2d_hit_copy"
         )
         with torch.npu.stream(stream):
-            unidex_copy_inplace(
+            self._copy_attention_partition(
                 self.device_kv_buffer[layer_idx],
-                hit_kv,
+                hit_partition,
                 hit_src_indices,
                 hit_compact_indices,
                 hit_valid_flat,
-                2,
-                2,
-                block_dim=24,
             )
             _record_stream_event(stream, events.hit_copy_done)
         _profile_pop(hit_copy_range)
         _profile_pop(profile_range)
 
         return SparseKVGraphDualPrefetch(
-            hit=SparseKVPartition(
-                kv=hit_kv,
-                sparse_indices=hit_sparse_indices,
-                actual_seq_lengths_kv=hit_actual_lengths,
-                true_counts=hit_counts,
-                stream=stream,
-            ),
-            miss=SparseKVPartition(
-                kv=miss_kv,
-                sparse_indices=miss_sparse_indices,
-                actual_seq_lengths_kv=miss_actual_lengths,
-                true_counts=miss_counts,
-                stream=state.miss_stream,
-            ),
+            hit=hit_partition,
+            miss=miss_partition,
             layer_idx=layer_idx,
             hit_compact_indices=hit_compact_indices,
             miss_compact_indices=miss_compact_indices,
@@ -2495,16 +2607,11 @@ class SparseKVCacheManager:
             )
             hit_kv = torch.empty(partition_shape, dtype=dtype, device=self.device)
             miss_kv = torch.empty(partition_shape, dtype=dtype, device=self.device)
-            # Empty rows use slot zero as a dummy.  Valid rows overwrite it with
-            # their first compacted token after copy_ready is recorded.
-            hit_kv[:, :1].zero_()
-            miss_kv[:, :1].zero_()
-
-            hit_sparse_indices, hit_actual_lengths = _build_partition_sparse_indices(
-                hit_counts, topk_len
+            hit_partition = self._make_attention_partition(
+                hit_kv, hit_counts, self._prefetch_d2d_hit_stream
             )
-            miss_sparse_indices, miss_actual_lengths = _build_partition_sparse_indices(
-                miss_counts, topk_len
+            miss_partition = self._make_attention_partition(
+                miss_kv, miss_counts, self._prefetch_h2d_miss_stream
             )
 
             topk_positions = torch.arange(
@@ -2539,15 +2646,12 @@ class SparseKVCacheManager:
         profile_range = _profile_push("sparse_kv_prefetch_partitions.d2d_hit_copy")
         with torch.npu.stream(self._prefetch_d2d_hit_stream):
             _wait_stream_event(self._prefetch_d2d_hit_stream, copy_ready)
-            unidex_copy_inplace(
+            self._copy_attention_partition(
                 self.device_kv_buffer[layer_idx],
-                hit_kv,
+                hit_partition,
                 hit_src_indices,
                 hit_compact_indices,
                 hit_valid_flat,
-                2,
-                2,
-                block_dim=24,
             )
             _record_stream_event(self._prefetch_d2d_hit_stream, hit_copy_done)
         _profile_pop(profile_range)
@@ -2555,15 +2659,12 @@ class SparseKVCacheManager:
         profile_range = _profile_push("sparse_kv_prefetch_partitions.h2d_miss_copy")
         with torch.npu.stream(self._prefetch_h2d_miss_stream):
             _wait_stream_event(self._prefetch_h2d_miss_stream, copy_ready)
-            unidex_copy_inplace(
+            self._copy_attention_partition(
                 self.host_kv_buffer[layer_idx],
-                miss_kv,
+                miss_partition,
                 miss_src_indices,
                 miss_compact_indices,
                 miss_valid_flat,
-                2,
-                2,
-                block_dim=24,
                 src_ptr=self.dev_ptr_list[layer_idx],
             )
             _record_stream_event(self._prefetch_h2d_miss_stream, miss_copy_done)
@@ -2606,20 +2707,8 @@ class SparseKVCacheManager:
         _profile_pop(prefetch_profile_range)
 
         return SparseKVPrefetchTicket(
-            hit=SparseKVPartition(
-                kv=hit_kv,
-                sparse_indices=hit_sparse_indices,
-                actual_seq_lengths_kv=hit_actual_lengths,
-                true_counts=hit_counts,
-                stream=self._prefetch_d2d_hit_stream,
-            ),
-            miss=SparseKVPartition(
-                kv=miss_kv,
-                sparse_indices=miss_sparse_indices,
-                actual_seq_lengths_kv=miss_actual_lengths,
-                true_counts=miss_counts,
-                stream=self._prefetch_h2d_miss_stream,
-            ),
+            hit=hit_partition,
+            miss=miss_partition,
             refill_done=refill_done,
         )
 

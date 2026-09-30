@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
         SparseKVCacheManager,
+        SparseKVFiaPartition,
         SparseKVGraphDualPrefetch,
         SparseKVGraphDualV2Prefetch,
         SparseKVIndexedPartition,
@@ -162,7 +163,7 @@ def validate_split_fia_support(*, graph_enabled: bool) -> None:
 
 
 def _run_decode_fia_partition(
-    partition: SparseKVPartition,
+    partition: SparseKVFiaPartition,
     *,
     query: torch.Tensor,
     query_rope: torch.Tensor,
@@ -178,8 +179,12 @@ def _run_decode_fia_partition(
     at physical capacity and use a device mask for the actual partition. LSE
     represents the same softmax mass as the existing max/sum merge with sum=1.
     """
+    if query.dim() != 4 or partition.key.dim() != 4:
+        raise ValueError(
+            "Dual FIA requires MLA decode Q=[B,1,N,512], RoPE=64, KV_N=1."
+        )
     batch_size, query_length, num_heads, value_dim = query.shape
-    capacity = partition.kv.shape[1]
+    capacity = partition.key.shape[1]
     if (
         query_length != 1
         or nope_head_dim != 512
@@ -187,8 +192,10 @@ def _run_decode_fia_partition(
         or value_dim != nope_head_dim
         or num_heads not in (1, 2, 4, 8, 16, 32, 64, 128)
         or tuple(query_rope.shape) != (batch_size, 1, num_heads, rope_head_dim)
-        or tuple(partition.kv.shape)
-        != (batch_size, capacity, 1, nope_head_dim + rope_head_dim)
+        or capacity <= 0
+        or tuple(partition.key.shape) != (batch_size, capacity, 1, nope_head_dim)
+        or tuple(partition.key_rope.shape)
+        != (batch_size, capacity, 1, rope_head_dim)
         or tuple(partition.true_counts.shape) != (batch_size,)
     ):
         raise ValueError(
@@ -198,21 +205,49 @@ def _run_decode_fia_partition(
         raise ValueError(
             "Dual FIA capacity must be divisible by a 16-aligned page <=1024."
         )
-    if query.dtype != partition.kv.dtype or query_rope.dtype != query.dtype:
+    if (
+        partition.buffer.dim() != 1
+        or partition.buffer.numel()
+        != batch_size * capacity * (nope_head_dim + rope_head_dim)
+        or not partition.buffer.is_contiguous()
+        or not partition.key.is_contiguous()
+        or not partition.key_rope.is_contiguous()
+    ):
+        raise ValueError("Dual FIA requires prepared contiguous NoPE/RoPE buffers.")
+    if any(
+        tensor.dtype != query.dtype
+        for tensor in (partition.buffer, partition.key, partition.key_rope, query_rope)
+    ):
         raise ValueError("Dual FIA query and unquantized KV must have the same dtype.")
+    if any(
+        tensor.device != query.device
+        for tensor in (
+            partition.buffer,
+            partition.key,
+            partition.key_rope,
+            partition.true_counts,
+            query_rope,
+        )
+    ):
+        raise ValueError("Dual FIA query and prepared KV must be on the same device.")
     if record_stream:
-        for tensor in (partition.kv, partition.true_counts, query, query_rope):
+        for tensor in (
+            partition.buffer,
+            partition.key,
+            partition.key_rope,
+            partition.true_counts,
+            query,
+            query_rope,
+        ):
             tensor.record_stream(partition.stream)
 
     positions = torch.arange(capacity, device=query.device, dtype=torch.int32)
     counts = partition.true_counts.view(batch_size, 1)
-    valid = positions.view(1, capacity) < counts
-    # Fixed-capacity FIA can read masked V rows. Remove uninitialized/old NaNs
-    # without writing the source buffer (eager refill may read it concurrently).
-    kv = torch.where(valid.view(batch_size, capacity, 1, 1), partition.kv, 0.0)
-    key, key_rope = kv.split([nope_head_dim, rope_head_dim], dim=-1)
-    key = key.contiguous().view(-1, page_size, nope_head_dim)
-    key_rope = key_rope.contiguous().view(-1, page_size, rope_head_dim)
+    # The producer clears these buffers before the fused gather/split copy.
+    # Fixed-capacity FIA can read masked V rows, so zero tails and the empty
+    # partition dummy must already be finite. Paging only reinterprets storage.
+    key = partition.key.view(-1, page_size, nope_head_dim)
+    key_rope = partition.key_rope.view(-1, page_size, rope_head_dim)
     # Empty partitions attend to one finite zero dummy; neutralize their output
     # below. This avoids relying on all-masked-row softmax behavior.
     atten_mask = (

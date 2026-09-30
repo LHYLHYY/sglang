@@ -35,18 +35,32 @@ Startup checks the v2 `.out`, maximum-workspace API and graph handler. Full-mode
 warmup then exercises the actual masked MLA/LSE combination; older CANN versions
 can still reject it. Ascend 950 MLA decode does not support the mask used here
 and is rejected. The mode never silently falls back to SFA or combined FIA.
+The installed `sgl_kernel_npu` must also provide both the Python wrapper
+`unidex_split_copy_promote_inplace` and its registered NPU kernel
+`unidex_split_copy_promote`; startup reports a missing dependency explicitly.
 
 During graph decode, the main stream runs the HBM hit copy and hit FIA while
 the worker stream runs the host miss copy, miss FIA and refill. Merge waits
 for miss attention; the layer joins refill before reusing the shared workspace.
 The hit/miss KV buffers are independent. This reuses the compact
 `split_graph_dual` implementation, rather than the shared noncompact workspace
-of `split_graph_dual_v2`.
+of `split_graph_dual_v2`. Both graph and eager decode use the existing split-copy
+promotion kernel to read each valid source KV row once and write contiguous
+NoPE/RoPE plus a combined compact snapshot for refill. Here the promotion output
+is the snapshot, not the live hot cache: refill still waits for hit gathering
+before replacing cache slots.
 
 Per-layer hit/miss counts stay on the device. Each partition passes fixed
 selected-buffer capacity as `actual_seq_kvlen` and uses a `[B,1,1,K]` device mask
-to exclude its unused rows. Invalid KV rows are zeroed in a separate tensor so
-masked V cannot contain stale NaNs and concurrent refill can read the source.
+to exclude its unused rows. FIA partitions do not build SFA `sparse_indices` or
+`actual_seq_lengths_kv`. Each producer stream clears one flat FIA buffer before
+the fused gather; its NoPE/RoPE views then contain zero tails even when counts
+shrink. The copy kernel skips invalid descriptors, so this one clear is needed
+to prevent masked V from containing stale NaNs. The former combined-KV dummy
+clear, whole-KV `where` and two contiguous layout copies are removed. FIA only
+views the prepared storage as pages; concurrent refill reads the separate
+combined snapshot. Graph capture preallocates and shares these buffers across
+layers, joining refill before reuse.
 Empty partitions get one zero dummy token and are neutralized before merge.
 FIA v2 returns FP32 LSE; passing `max=LSE, sum=1` to the existing stable merge
 weights both outputs by their softmax mass. Eager decode uses the original
@@ -283,6 +297,7 @@ its final measurements.
 python test/manual/ascend/test_fia_graph_replay_update.py -v
 python test/manual/ascend/test_native_fia_offload_manager.py -v
 python test/manual/ascend/test_split_fia_attention.py -v
+python test/manual/ascend/test_dual_fia_prefetch.py -v
 ```
 
 These CPU mocks check configuration, staging memory accounting, shared FIA
