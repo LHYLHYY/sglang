@@ -173,11 +173,12 @@ def _run_decode_fia_partition(
     page_size: int,
     record_stream: bool = True,
 ) -> _SfaPartitionState:
-    """Run FIA v2 on an independent compact partition without host count reads.
+    """Run FIA v2 on an independent partition without host count reads.
 
     Per-layer hit/miss counts are computed inside the graph. Keep CPU lengths
-    at physical capacity and use a device mask for the actual partition. LSE
-    represents the same softmax mass as the existing max/sum merge with sum=1.
+    at physical capacity and use a device mask for the actual partition. Graph
+    partitions retain Top-K positions; eager partitions use compact prefixes.
+    LSE represents the same softmax mass as the existing max/sum merge with sum=1.
     """
     if query.dim() != 4 or partition.key.dim() != 4:
         raise ValueError(
@@ -204,6 +205,16 @@ def _run_decode_fia_partition(
     if page_size <= 0 or page_size % 16 or page_size > 1024 or capacity % page_size:
         raise ValueError(
             "Dual FIA capacity must be divisible by a 16-aligned page <=1024."
+        )
+    valid_mask = partition.valid_mask
+    if valid_mask is not None and (
+        tuple(valid_mask.shape) != (batch_size, capacity)
+        or valid_mask.dtype != torch.bool
+        or valid_mask.device != query.device
+        or not valid_mask.is_contiguous()
+    ):
+        raise ValueError(
+            "Dual FIA requires a contiguous device bool [B,K] validity mask."
         )
     if (
         partition.buffer.dim() != 1
@@ -240,9 +251,10 @@ def _run_decode_fia_partition(
             query_rope,
         ):
             tensor.record_stream(partition.stream)
+        if valid_mask is not None:
+            valid_mask.record_stream(partition.stream)
 
-    positions = torch.arange(capacity, device=query.device, dtype=torch.int32)
-    counts = partition.true_counts.view(batch_size, 1)
+    nonempty = (partition.true_counts > 0).view(batch_size, 1, 1, 1)
     # The producer clears these buffers before the fused gather/split copy.
     # Fixed-capacity FIA can read masked V rows, so zero tails and the empty
     # partition dummy must already be finite. Paging only reinterprets storage.
@@ -250,9 +262,17 @@ def _run_decode_fia_partition(
     key_rope = partition.key_rope.view(-1, page_size, rope_head_dim)
     # Empty partitions attend to one finite zero dummy; neutralize their output
     # below. This avoids relying on all-masked-row softmax behavior.
-    atten_mask = (
-        positions.view(1, capacity) >= counts.clamp(min=1)
-    ).view(batch_size, 1, 1, capacity).contiguous()
+    if valid_mask is None:
+        # Eager prefetch still packs valid KV into a contiguous prefix.
+        positions = torch.arange(capacity, device=query.device, dtype=torch.int32)
+        counts = partition.true_counts.view(batch_size, 1)
+        atten_mask = positions.view(1, capacity) >= counts.clamp(min=1)
+    else:
+        # Preserve holes in the Top-K layout. Do not modify the producer's
+        # validity mask: it also controls which snapshot rows are refilled.
+        atten_mask = ~valid_mask
+        atten_mask[:, 0] = atten_mask[:, 0] & nonempty.view(batch_size)
+    atten_mask = atten_mask.view(batch_size, 1, 1, capacity).contiguous()
     blocks_per_req = capacity // page_size
     block_table = torch.arange(
         batch_size * blocks_per_req, device=query.device, dtype=torch.int32
@@ -296,7 +316,6 @@ def _run_decode_fia_partition(
         or lse.dtype != torch.float32
     ):
         raise RuntimeError("Unexpected dual FIA output or FP32 [B,N,1,1] LSE contract.")
-    nonempty = (partition.true_counts > 0).view(batch_size, 1, 1, 1)
     output = torch.where(nonempty, output, 0.0)
     lse = torch.where(nonempty, lse, 0.0).permute(0, 3, 2, 1).contiguous()
     return _SfaPartitionState(

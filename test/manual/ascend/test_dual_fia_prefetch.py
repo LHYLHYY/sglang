@@ -1,4 +1,4 @@
-"""CPU regressions for fused split-FIA partition preparation and cache refill.
+"""CPU regressions for original-position graph FIA prefetch and cache refill.
 
 Execute production manager methods from their AST with NumPy tensor and kernel
 stand-ins. These checks cover values, persistent buffers, and host enqueue order;
@@ -8,6 +8,7 @@ Run: python test/manual/ascend/test_dual_fia_prefetch.py -v
 """
 
 import ast
+import importlib.util
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -48,6 +49,9 @@ class Tensor(np.ndarray):
 
     def contiguous(self):
         return tensor(np.ascontiguousarray(self))
+
+    def permute(self, *dims):
+        return tensor(np.transpose(self, dims))
 
     def is_contiguous(self):
         return self.flags.c_contiguous
@@ -119,6 +123,9 @@ class Runtime:
         self.refill = Stream(self, "refill")
         self.current = self.main
         self.event_count = 0
+        self.allocations = []
+        self.cumsum_calls = 0
+        self.arange_calls = 0
         Tensor.runtime = self
 
     @contextmanager
@@ -198,30 +205,43 @@ class CopyOps:
 
 def load_manager(runtime):
     ops = CopyOps(runtime)
+
+    def empty(shape, dtype, device=None):
+        runtime.allocations.append((shape, dtype))
+        return tensor(np.full(shape, np.nan, dtype=dtype))
+
+    def arange(end, dtype=None, device=None):
+        runtime.arange_calls += 1
+        return tensor(np.arange(end, dtype=dtype))
+
+    def cumsum(value, dim):
+        runtime.cumsum_calls += 1
+        return tensor(np.cumsum(value, axis=dim))
+
     torch = SimpleNamespace(
         Tensor=Tensor,
         int32=np.int32,
         int64=np.int64,
         long=np.int64,
         bool=np.bool_,
-        empty=lambda shape, dtype, device=None: tensor(
-            np.full(shape, np.nan, dtype=dtype)
-        ),
+        empty=empty,
+        empty_like=lambda value: empty(value.shape, value.dtype),
         full=lambda shape, fill, dtype, device=None: tensor(
             np.full(shape, fill, dtype=dtype)
         ),
         zeros=lambda shape, dtype, device=None: tensor(np.zeros(shape, dtype=dtype)),
-        arange=lambda end, dtype=None, device=None: tensor(np.arange(end, dtype=dtype)),
+        arange=arange,
         where=lambda condition, x, y: tensor(np.where(condition, x, y)),
         full_like=lambda value, fill, dtype=None: tensor(
             np.full_like(value, fill, dtype=dtype)
         ),
         zeros_like=lambda value: tensor(np.zeros_like(value)),
-        cumsum=lambda value, dim: tensor(np.cumsum(value, axis=dim)),
+        cumsum=cumsum,
         npu=SimpleNamespace(
             stream=runtime.stream,
             current_stream=lambda: runtime.current,
             Event=runtime.event,
+            Stream=lambda: runtime.miss,
         ),
     )
 
@@ -234,6 +254,7 @@ def load_manager(runtime):
         return tensor(positions >= 0, np.int32), tensor(positions)
 
     method_names = {
+        "prepare_graph_dual_state",
         "_make_attention_partition",
         "_copy_attention_partition",
         "prefetch_partitions_graph_dual",
@@ -251,6 +272,8 @@ def load_manager(runtime):
         "SparseKVFiaPartition",
         "SparseKVGraphDualPrefetch",
         "SparseKVPrefetchTicket",
+        "SparseKVGraphDualLayerEvents",
+        "SparseKVGraphDualState",
     }
     tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
     manager_cls = next(
@@ -294,6 +317,8 @@ def load_manager(runtime):
         "SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA": FIA_MODE,
         "_profile_push": lambda name: None,
         "_profile_pop": lambda token: None,
+        "GB": 1024 ** 3,
+        "logger": SimpleNamespace(info=lambda *args: None),
     }
     exec(compile(ast.fix_missing_locations(module), str(SOURCE), "exec"), namespace)
     return namespace["SparseKVCacheManager"], namespace, ops
@@ -332,7 +357,7 @@ class TestDualFiaPrefetch(unittest.TestCase):
             tensor(np.full((4, 4, 1, 576), np.nan, np.float16))
         ]
         self.manager.device_slot_map = [tensor(np.full((5, 16), -1, np.int32))]
-        # Nontrivial old slots ensure compaction cannot accidentally use Top-K order.
+        # Old cache slots differ from both compact and original Top-K positions.
         for req, slots in ((1, {2: 3, 5: 0}), (2, {1: 2})):
             for token, slot in slots.items():
                 self.manager.device_slot_map[0][req, token] = slot
@@ -346,6 +371,7 @@ class TestDualFiaPrefetch(unittest.TestCase):
             miss_kv=tensor(np.full(shape, np.nan, np.float16)),
             hit_fia_buffer=tensor(np.full(np.prod(shape), np.nan, np.float16)),
             miss_fia_buffer=tensor(np.full(np.prod(shape), np.nan, np.float16)),
+            fia_dst_indices=tensor(np.arange(3 * 4), np.int64),
             miss_stream=self.runtime.miss,
             layer_events=[
                 SimpleNamespace(
@@ -377,14 +403,16 @@ class TestDualFiaPrefetch(unittest.TestCase):
             if graph
             else self.manager.prefetch_partitions
         )
-        with patch.dict(
-            self.namespace,
+        overrides = (
             {
                 "_build_partition_sparse_indices": lambda *args: self.fail(
                     "FIA built SFA metadata"
                 )
-            },
-        ):
+            }
+            if self.manager.attn_impl == FIA_MODE
+            else {}
+        )
+        with patch.dict(self.namespace, overrides):
             return fn(
                 self.layer, batch, tensor(topk, np.int32), self.runtime.main, np.float16
             )
@@ -396,16 +424,29 @@ class TestDualFiaPrefetch(unittest.TestCase):
         self.assertTrue(part.key.is_contiguous())
         self.assertTrue(part.key_rope.is_contiguous())
         for row, tokens in enumerate(selected):
+            original_positions = isinstance(tokens, dict)
+            if not original_positions:
+                tokens = dict(enumerate(tokens))
             self.assertEqual(int(part.true_counts[row]), len(tokens))
-            for col, (req, token) in enumerate(tokens):
+            if original_positions:
+                self.assertIsNotNone(part.valid_mask)
+                self.assertEqual(part.valid_mask.dtype, np.bool_)
+                np.testing.assert_array_equal(
+                    part.valid_mask[row],
+                    [col in tokens for col in range(part.kv.shape[1])],
+                )
+            else:
+                self.assertIsNone(part.valid_mask)
+            for col, (req, token) in tokens.items():
                 expected = self.manager.host_kv_buffer[0][req, token]
                 np.testing.assert_array_equal(part.kv[row, col], expected)
                 np.testing.assert_array_equal(part.key[row, col], expected[:, :512])
                 np.testing.assert_array_equal(
                     part.key_rope[row, col], expected[:, 512:]
                 )
-            np.testing.assert_array_equal(part.key[row, len(tokens) :], 0)
-            np.testing.assert_array_equal(part.key_rope[row, len(tokens) :], 0)
+            invalid_cols = [col for col in range(part.kv.shape[1]) if col not in tokens]
+            np.testing.assert_array_equal(part.key[row, invalid_cols], 0)
+            np.testing.assert_array_equal(part.key_rope[row, invalid_cols], 0)
 
     def assert_refill(self):
         cache, slot_map = (
@@ -440,13 +481,53 @@ class TestDualFiaPrefetch(unittest.TestCase):
         self.assertFalse(np.shares_memory(part.key, part.key_rope))
         self.assertTrue(np.isnan(part.buffer).all())
         self.assertTrue(np.isnan(kv).all())
+        self.assertIsNone(part.valid_mask)
         self.assertFalse(self.runtime.log)
+
+    def test_make_original_position_partition_preserves_valid_mask(self):
+        kv = tensor(np.full((2, 4, 1, 576), np.nan, np.float16))
+        valid = tensor([[False, True, False, True], [False] * 4], np.bool_)
+        part = self.manager._make_attention_partition(
+            kv, tensor([2, 0], np.int32), self.runtime.main, valid_mask=valid
+        )
+        self.assertIs(part.valid_mask, valid)
+        self.assertTrue(np.isnan(part.buffer).all())
+        self.assertFalse(self.runtime.log)
+
+    def test_prepare_fia_state_precomputes_one_shared_destination_prefix(self):
+        self.manager._graph_dual_state = None
+        self.manager.prepare_graph_dual_state(3)
+        state = self.manager._graph_dual_state
+        self.assertEqual(state.fia_dst_indices.dtype, np.int64)
+        np.testing.assert_array_equal(state.fia_dst_indices, np.arange(12))
+        self.assertEqual(self.runtime.arange_calls, 1)
+        self.assertEqual(len(self.runtime.allocations), 4)
+        self.manager.prepare_graph_dual_state(1)
+        self.assertIs(self.manager._graph_dual_state, state)
+        self.assertEqual(self.runtime.arange_calls, 1)
+        self.assertEqual(len(self.runtime.allocations), 4)
+        with self.assertRaisesRegex(RuntimeError, "cannot grow"):
+            self.manager.prepare_graph_dual_state(4)
 
     def test_graph_mixed_partitions_fused_copy_and_delayed_refill(self):
         old_cache = self.manager.device_kv_buffer[0].copy()
-        ticket = self.run_prefetch()
-        self.assert_partition(ticket.hit, [[(1, 2), (1, 5)], [(2, 1)], []])
-        self.assert_partition(ticket.miss, [[(1, 6)], [(2, 4), (2, 3)], []])
+        with patch.object(
+            self.namespace["torch"],
+            "cumsum",
+            side_effect=AssertionError("Graph FIA must not compact partitions"),
+        ):
+            ticket = self.run_prefetch()
+        self.assert_partition(ticket.hit, [{1: (1, 2), 3: (1, 5)}, {0: (2, 1)}, {}])
+        self.assert_partition(ticket.miss, [{0: (1, 6)}, {1: (2, 4), 2: (2, 3)}, {}])
+        np.testing.assert_array_equal(ticket.hit_partition_indices, np.arange(12))
+        self.assertIs(ticket.hit_partition_indices, ticket.miss_partition_indices)
+        self.assertTrue(
+            np.shares_memory(
+                ticket.hit_partition_indices,
+                self.manager._graph_dual_state.fia_dst_indices,
+            )
+        )
+        self.assertEqual(self.runtime.arange_calls, 0)
         np.testing.assert_array_equal(self.manager.device_kv_buffer[0], old_cache)
         self.assertEqual([name for name, _ in self.ops.calls], ["split_promote"] * 2)
         self.assertEqual(self.ops.calls[0][1].get("src_ptr"), 123456)
@@ -473,36 +554,183 @@ class TestDualFiaPrefetch(unittest.TestCase):
         )
         self.assertEqual(log[-1], ("record", "miss", "refill_done"))
 
-    def test_reuse_shrinking_and_empty_partitions_clears_stale_nan_tails(self):
+    def test_reuse_changed_columns_and_empty_partitions_clears_stale_values(self):
         first = self.run_prefetch()
         self.manager.commit_graph_dual_refill(first)
+        # A graph buffer can retain finite data or NaN from earlier uses; both
+        # must be cleared at holes, including columns that previously held KV.
         first.hit.buffer.fill(np.nan)
-        first.miss.buffer.fill(np.nan)
-        second = self.run_prefetch(topk=[[2, -1, -1, -1], [-1] * 4, [0, 1, 2, 3]])
-        self.assert_partition(second.hit, [[(1, 2)], [], []])
-        self.assert_partition(second.miss, [[], [], []])
+        first.miss.buffer.fill(999)
+        second = self.run_prefetch(topk=[[-1, -1, 2, -1], [-1] * 4, [0, 1, 2, 3]])
+        self.assert_partition(second.hit, [{2: (1, 2)}, {}, {}])
+        self.assert_partition(second.miss, [{}, {}, {}])
         self.assertTrue(np.shares_memory(first.hit.buffer, second.hit.buffer))
         self.assertTrue(np.shares_memory(first.miss.buffer, second.miss.buffer))
+        self.manager.commit_graph_dual_refill(second)
+        self.assertEqual(self.manager.device_slot_map[0][1, 2], 2)
+        self.assertEqual(
+            np.count_nonzero(self.manager.device_slot_map[0][1, :8] >= 0), 1
+        )
+        np.testing.assert_array_equal(self.manager.device_slot_map[0][2, :8], -1)
+        np.testing.assert_array_equal(
+            self.manager.device_kv_buffer[0][1, 2], self.manager.host_kv_buffer[0][1, 2]
+        )
 
     def test_graph_batch_bucket_views_use_only_active_storage(self):
         state = self.manager._graph_dual_state
         ticket = self.run_prefetch(topk=[[2, 6, -1, -1]], req_ids=[1], seq_lens=[8])
-        self.assert_partition(ticket.hit, [[(1, 2)]])
-        self.assert_partition(ticket.miss, [[(1, 6)]])
+        self.assert_partition(ticket.hit, [{0: (1, 2)}])
+        self.assert_partition(ticket.miss, [{1: (1, 6)}])
         self.assertEqual(ticket.hit.buffer.numel(), 4 * 576)
+        self.assertEqual(ticket.hit_partition_indices.shape, (4,))
+        self.assertTrue(
+            np.shares_memory(ticket.hit_partition_indices, state.fia_dst_indices)
+        )
+        np.testing.assert_array_equal(ticket.hit_partition_indices, [0, 1, 2, 3])
         self.assertTrue(np.isnan(state.hit_fia_buffer[4 * 576 :]).all())
         self.assertTrue(np.isnan(state.miss_fia_buffer[4 * 576 :]).all())
 
     def test_alternating_graph_batch_buckets_reuses_buffer_without_layout_alias(self):
         wide = self.run_prefetch()
         narrow = self.run_prefetch(topk=[[2, 6, -1, -1]], req_ids=[1], seq_lens=[8])
-        self.assert_partition(narrow.hit, [[(1, 2)]])
-        self.assert_partition(narrow.miss, [[(1, 6)]])
+        self.assert_partition(narrow.hit, [{0: (1, 2)}])
+        self.assert_partition(narrow.miss, [{1: (1, 6)}])
         again = self.run_prefetch()
-        self.assert_partition(again.hit, [[(1, 2), (1, 5)], [(2, 1)], []])
-        self.assert_partition(again.miss, [[(1, 6)], [(2, 4), (2, 3)], []])
+        self.assert_partition(again.hit, [{1: (1, 2), 3: (1, 5)}, {0: (2, 1)}, {}])
+        self.assert_partition(again.miss, [{0: (1, 6)}, {1: (2, 4), 2: (2, 3)}, {}])
         self.assertTrue(np.shares_memory(wide.hit.buffer, narrow.hit.buffer))
         self.assertTrue(np.shares_memory(wide.hit.key_rope, again.hit.key_rope))
+        self.assertTrue(
+            np.shares_memory(wide.hit_partition_indices, narrow.hit_partition_indices)
+        )
+        self.assertEqual(self.runtime.cumsum_calls, 0)
+
+    def test_graph_all_hit_all_miss_and_empty_rows_preserve_original_columns(self):
+        ticket = self.run_prefetch(
+            topk=[[5, -1, 2, -1], [-1, 4, -1, 3], [-1] * 4],
+            req_ids=[1, 2, 3],
+            seq_lens=[8, 8, 8],
+        )
+        self.assert_partition(ticket.hit, [{0: (1, 5), 2: (1, 2)}, {}, {}])
+        self.assert_partition(ticket.miss, [{}, {1: (2, 4), 3: (2, 3)}, {}])
+        self.manager.commit_graph_dual_refill(ticket)
+        for req, slots in ((1, {5: 0, 2: 2}), (2, {4: 1, 3: 3})):
+            for token, slot in slots.items():
+                self.assertEqual(self.manager.device_slot_map[0][req, token], slot)
+                np.testing.assert_array_equal(
+                    self.manager.device_kv_buffer[0][req, slot],
+                    self.manager.host_kv_buffer[0][req, token],
+                )
+
+    def test_graph_padding_invalid_requests_and_zero_sequence_do_not_touch_cache(self):
+        for req_ids, seq_lens in (([0, -1, 4], [8, 8, 8]), ([1, 2, 3], [0, 0, 0])):
+            with self.subTest(req_ids=req_ids, seq_lens=seq_lens):
+                old_cache = self.manager.device_kv_buffer[0].copy()
+                old_map = self.manager.device_slot_map[0][:4].copy()
+                ticket = self.run_prefetch(
+                    topk=[[2, 5, 3, -1]] * 3, req_ids=req_ids, seq_lens=seq_lens
+                )
+                self.assert_partition(ticket.hit, [{}, {}, {}])
+                self.assert_partition(ticket.miss, [{}, {}, {}])
+                self.manager.commit_graph_dual_refill(ticket)
+                np.testing.assert_array_equal(
+                    self.manager.device_kv_buffer[0], old_cache
+                )
+                np.testing.assert_array_equal(
+                    self.manager.device_slot_map[0][:4], old_map
+                )
+
+    def test_manager_fia_merge_and_refill_match_direct_host_attention(self):
+        # Reuse the numerical FIA stand-in, but feed it actual manager outputs
+        # instead of reconstructing a partition in the attention tests.
+        spec = importlib.util.spec_from_file_location(
+            "fia_attention_reference",
+            Path(__file__).with_name("test_split_fia_attention.py"),
+        )
+        reference = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reference)
+        fia = reference.FIA(self.runtime)
+        helpers = reference.load_helpers(self.runtime, fia)
+        rng = np.random.default_rng(42)
+        manager = self.manager
+        manager.sparse_context_len = 16
+        manager._device_cache_slot_ids = tensor(np.arange(16), np.int64)
+        manager.host_kv_buffer[0][...] = rng.normal(
+            scale=0.1, size=manager.host_kv_buffer[0].shape
+        )
+        manager.device_kv_buffer = [
+            tensor(np.full((4, 16, 1, 576), np.nan, np.float16))
+        ]
+        manager.device_slot_map[0].fill(-1)
+        for req, slots in ((1, {2: 11, 5: 6}), (2, {1: 14})):
+            for token, slot in slots.items():
+                manager.device_slot_map[0][req, token] = slot
+                manager.device_kv_buffer[0][req, slot] = manager.host_kv_buffer[0][
+                    req, token
+                ]
+        manager._graph_dual_state = None
+        manager.prepare_graph_dual_state(3)
+        query = reference.tensor(rng.normal(scale=0.1, size=(3, 1, 2, 512)), np.float16)
+        query_rope = reference.tensor(
+            rng.normal(scale=0.1, size=(3, 1, 2, 64)), np.float16
+        )
+        scale = 576 ** -0.5
+        for selected in (
+            [[6, 2, -1, 5], [1, 4, 3, -1], [-1] * 4],
+            [[-1, 5, 6, -1], [-1, -1, 4, 7], [-1] * 4],
+        ):
+            topk = [row + [-1] * 12 for row in selected]
+            ticket = self.run_prefetch(topk=topk, req_ids=[1, 2, 3], seq_lens=[8] * 3)
+            old_hit_mask = ticket.hit.valid_mask.copy()
+            old_miss_mask = ticket.miss.valid_mask.copy()
+            states = [
+                helpers["_run_decode_fia_partition"](
+                    part,
+                    query=query,
+                    query_rope=query_rope,
+                    nope_head_dim=512,
+                    rope_head_dim=64,
+                    scale_value=scale,
+                    page_size=16,
+                    record_stream=False,
+                )
+                for part in (ticket.hit, ticket.miss)
+            ]
+            actual = helpers["_merge_decode_sfa_partitions_python"](*states)
+            expected = np.zeros(query.shape, dtype=np.float64)
+            for row, req in enumerate((1, 2, 3)):
+                tokens = [token for token in topk[row] if token >= 0]
+                if tokens:
+                    kv = np.asarray(
+                        manager.host_kv_buffer[0][req, tokens, 0], dtype=np.float64
+                    )
+                    scores = np.asarray(query[row, 0], dtype=np.float64) @ kv[:, :512].T
+                    scores += (
+                        np.asarray(query_rope[row, 0], dtype=np.float64) @ kv[:, 512:].T
+                    )
+                    scores *= scale
+                    weights = np.exp(scores - scores.max(axis=-1, keepdims=True))
+                    weights /= weights.sum(axis=-1, keepdims=True)
+                    expected[row, 0] = weights @ kv[:, :512]
+            np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-4)
+            # FIA's empty-row dummy must not mutate the masks reused by refill.
+            np.testing.assert_array_equal(ticket.hit.valid_mask, old_hit_mask)
+            np.testing.assert_array_equal(ticket.miss.valid_mask, old_miss_mask)
+            manager.commit_graph_dual_refill(ticket)
+            for row, req in enumerate((1, 2, 3)):
+                for col, token in enumerate(topk[row]):
+                    if token >= 0:
+                        self.assertEqual(manager.device_slot_map[0][req, token], col)
+                        np.testing.assert_array_equal(
+                            manager.device_kv_buffer[0][req, col],
+                            manager.host_kv_buffer[0][req, token],
+                        )
+                self.assertEqual(
+                    np.count_nonzero(manager.device_slot_map[0][req, :8] >= 0),
+                    sum(token >= 0 for token in topk[row]),
+                )
+        self.assertEqual(len(fia.calls), 4)
+        self.assertEqual(self.runtime.cumsum_calls, 0)
 
     def test_eager_prefetch_preserves_separate_producers_and_refill_waits(self):
         ticket = self.run_prefetch(graph=False)
@@ -524,6 +752,41 @@ class TestDualFiaPrefetch(unittest.TestCase):
         self.assertEqual(
             [entry[1] for entry in log if entry[0] == "zero"], ["hit", "miss"]
         )
+        self.assertEqual(self.runtime.cumsum_calls, 2)
+
+    def test_sfa_graph_state_and_prefetch_still_use_compact_partitions(self):
+        self.manager.attn_impl = "split_graph_dual"
+        self.manager._graph_dual_state = None
+        self.manager.prepare_graph_dual_state(3)
+        state = self.manager._graph_dual_state
+        self.assertIsNone(state.fia_dst_indices)
+        self.assertIsNone(state.hit_fia_buffer)
+        self.assertIsNone(state.miss_fia_buffer)
+        self.assertEqual(len(self.runtime.allocations), 2)
+        self.assertEqual(self.runtime.arange_calls, 0)
+        ticket = self.run_prefetch()
+        self.assertEqual(self.runtime.cumsum_calls, 2)
+        self.assertEqual(len(self.runtime.allocations), 2)
+        self.assertIsInstance(ticket.hit, self.namespace["SparseKVPartition"])
+        np.testing.assert_array_equal(
+            ticket.hit.kv[0, 0], self.manager.host_kv_buffer[0][1, 2]
+        )
+        np.testing.assert_array_equal(
+            ticket.hit.kv[0, 1], self.manager.host_kv_buffer[0][1, 5]
+        )
+        np.testing.assert_array_equal(
+            ticket.miss.kv[1, 0], self.manager.host_kv_buffer[0][2, 4]
+        )
+        np.testing.assert_array_equal(
+            ticket.miss.kv[1, 1], self.manager.host_kv_buffer[0][2, 3]
+        )
+        np.testing.assert_array_equal(
+            ticket.hit.sparse_indices.reshape(3, 4),
+            [[0, 1, -1, -1], [0, -1, -1, -1], [0, -1, -1, -1]],
+        )
+        self.assertEqual([name for name, _ in self.ops.calls], ["copy", "copy"])
+        self.manager.commit_graph_dual_refill(ticket)
+        self.assert_refill()
 
     def test_sfa_fallback_still_builds_dummy_metadata_and_uses_original_copy(self):
         self.manager.attn_impl = "split_graph_dual"

@@ -3,7 +3,7 @@
 ## Dual-stream FIA with hot-cache overlap
 
 Select `split_graph_dual_fia` to use FIA for both hit and miss attention while
-retaining the original compact dual-stream prefetch and hot-cache refill:
+retaining dual-stream prefetch and hot-cache refill:
 
 ```bash
 export SGLANG_NPU_DSA_FIA_NATIVE=0
@@ -42,29 +42,38 @@ The installed `sgl_kernel_npu` must also provide both the Python wrapper
 During graph decode, the main stream runs the HBM hit copy and hit FIA while
 the worker stream runs the host miss copy, miss FIA and refill. Merge waits
 for miss attention; the layer joins refill before reusing the shared workspace.
-The hit/miss KV buffers are independent. This reuses the compact
-`split_graph_dual` implementation, rather than the shared noncompact workspace
-of `split_graph_dual_v2`. Both graph and eager decode use the existing split-copy
-promotion kernel to read each valid source KV row once and write contiguous
-NoPE/RoPE plus a combined compact snapshot for refill. Here the promotion output
-is the snapshot, not the live hot cache: refill still waits for hit gathering
-before replacing cache slots.
+The hit/miss KV buffers are independent. Graph FIA preserves each selected KV
+at its original Top-K position `j`, using the same preallocated `b*K+j`
+destination indices for both partitions. There are no hit/miss `cumsum`, rank
+clamps, or batch-offset calculations on this path. The SFA `split_graph_dual`
+path and eager FIA prefetch still compact their partitions.
+Both graph and eager decode use the existing split-copy promotion kernel to
+read each valid source KV row once and write contiguous NoPE/RoPE plus a
+combined snapshot for refill. Here the promotion output is the snapshot, not
+the live hot cache: refill still waits for hit gathering before replacing
+cache slots. Graph FIA refills snapshot position `b*K+j` into hot-cache
+position `req_id*K+j`, retaining the existing `token -> j` slot-map mapping.
 
 Per-layer hit/miss counts stay on the device. Each partition passes fixed
 selected-buffer capacity as `actual_seq_kvlen` and uses a `[B,1,1,K]` device mask
-to exclude its unused rows. FIA partitions do not build SFA `sparse_indices` or
+to exclude its unused rows. Graph masks use the actual hit/miss validity at each
+Top-K position, including holes; only eager masks use a valid prefix defined by
+the count. Attention does not mutate the validity masks used by refill.
+FIA partitions do not build SFA `sparse_indices` or
 `actual_seq_lengths_kv`. Each producer stream clears one flat FIA buffer before
-the fused gather; its NoPE/RoPE views then contain zero tails even when counts
-shrink. The copy kernel skips invalid descriptors, so this one clear is needed
+the fused gather; its NoPE/RoPE views then contain zeros in unused positions,
+including when the selected positions change without changing their count.
+The copy kernel skips invalid descriptors, so this one clear is needed
 to prevent masked V from containing stale NaNs. The former combined-KV dummy
 clear, whole-KV `where` and two contiguous layout copies are removed. FIA only
 views the prepared storage as pages; concurrent refill reads the separate
 combined snapshot. Graph capture preallocates and shares these buffers across
 layers, joining refill before reuse.
-Empty partitions get one zero dummy token and are neutralized before merge.
+Empty partitions alone unmask the zero dummy at position zero and are
+neutralized before merge; nonempty partitions retain their exact validity mask.
 FIA v2 returns FP32 LSE; passing `max=LSE, sum=1` to the existing stable merge
 weights both outputs by their softmax mass. Eager decode uses the original
-parallel prefetch with these same FIA partitions; prefill remains SFA.
+parallel prefetch with compact FIA partitions; prefill remains SFA.
 
 Every graph replay retains the blocking nonempty graph-buffer read before
 update/replay. The update uses **`actual_seq_kvlen`**, broadcast to every layer's
@@ -73,7 +82,9 @@ two FIA tasks; padding and IDLE lengths are zero. Expected replay logs include
 `update.prepare input_keys=[['actual_seq_kvlen']]`. Capture should report two
 FIA update tasks per attention layer in the captured graph.
 
-The CPU checks cover partition masking/merge and stream dependency scheduling.
+The CPU checks cover original-position gathering/refill, mixed and empty
+partitions, mask changes at fixed counts, buffer reuse, the absence of graph
+FIA prefix scans, and stream dependency scheduling.
 Use the unchanged full-model benchmark below to validate device completion,
 accuracy and performance. The additional mask and partition work means an actual
 speedup must be measured; CPU tests cannot establish device overlap or throughput.

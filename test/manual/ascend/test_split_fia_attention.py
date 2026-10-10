@@ -381,6 +381,7 @@ class TestSplitFIA(unittest.TestCase):
                 key=buffer[:key_size].view(batch, capacity, 1, 512),
                 key_rope=buffer[key_size:].view(batch, capacity, 1, 64),
                 true_counts=tensor(counts, np.int32),
+                valid_mask=None,
                 stream=stream,
             )
             self.prepare_partition(partition)
@@ -395,14 +396,44 @@ class TestSplitFIA(unittest.TestCase):
             scale=0.37,
         )
 
+    def make_noncompact_case(
+        self, *, hit_positions, miss_positions, capacity=32, heads=4, seed=314
+    ):
+        case = self.make_case(
+            hit_counts=tuple(len(row) for row in hit_positions),
+            miss_counts=tuple(len(row) for row in miss_positions),
+            capacity=capacity,
+            heads=heads,
+            seed=seed,
+        )
+        for partition, positions in (
+            (case.hit, hit_positions),
+            (case.miss, miss_positions),
+        ):
+            compact_kv = partition.kv.copy()
+            partition.kv.fill(np.nan)
+            partition.valid_mask = tensor(
+                np.zeros((len(positions), capacity), dtype=np.bool_)
+            )
+            for row, selected in enumerate(positions):
+                partition.valid_mask[row, list(selected)] = True
+                partition.kv[row, list(selected)] = compact_kv[row, : len(selected)]
+            self.prepare_partition(partition)
+        return case
+
     @staticmethod
     def prepare_partition(partition):
         # Model the producer's zero + fused gather/split. The refill snapshot
-        # deliberately keeps NaN tails so attention must use prepared storage.
+        # keeps NaN holes/tails so attention must use prepared storage.
         partition.buffer.fill(0)
         for row, count in enumerate(partition.true_counts):
-            partition.key[row, :count] = partition.kv[row, :count, :, :512]
-            partition.key_rope[row, :count] = partition.kv[row, :count, :, 512:]
+            selected = (
+                slice(None, count)
+                if partition.valid_mask is None
+                else partition.valid_mask[row]
+            )
+            partition.key[row, selected] = partition.kv[row, selected, :, :512]
+            partition.key_rope[row, selected] = partition.kv[row, selected, :, 512:]
 
     def run_partition(self, case, partition, **kwargs):
         return self.helpers["_run_decode_fia_partition"](
@@ -418,12 +449,18 @@ class TestSplitFIA(unittest.TestCase):
 
     @staticmethod
     def reference(case):
+        def selected_kv(partition, row):
+            selected = (
+                slice(None, partition.true_counts[row])
+                if partition.valid_mask is None
+                else partition.valid_mask[row]
+            )
+            return partition.kv[row, selected, 0]
+
         output = np.zeros(case.query.shape, dtype=np.float64)
-        for row, (nhit, nmiss) in enumerate(
-            zip(case.hit.true_counts, case.miss.true_counts)
-        ):
+        for row in range(case.query.shape[0]):
             selected = np.concatenate(
-                (case.hit.kv[row, :nhit, 0], case.miss.kv[row, :nmiss, 0])
+                (selected_kv(case.hit, row), selected_kv(case.miss, row))
             )
             if len(selected) == 0:
                 continue
@@ -453,6 +490,105 @@ class TestSplitFIA(unittest.TestCase):
                 self.assertEqual(hit.softmax_max.shape, (4, 1, 1, heads))
                 self.assertEqual(hit.softmax_max.dtype, np.float32)
                 np.testing.assert_array_equal(hit.softmax_sum, 1)
+
+    def test_noncompact_holes_across_pages_and_empty_partitions_match_union(self):
+        case = self.make_noncompact_case(
+            hit_positions=((1, 5, 16, 31), (3, 18), (), ()),
+            miss_positions=((0, 8, 17, 30), (), (2, 15, 20, 29), ()),
+        )
+        hit = self.run_partition(case, case.hit)
+        miss = self.run_partition(case, case.miss)
+        merged = self.helpers["_merge_decode_sfa_partitions_python"](hit, miss)
+        np.testing.assert_allclose(merged, self.reference(case), atol=8e-5, rtol=2e-3)
+        self.assertTrue(np.isfinite(merged).all())
+        np.testing.assert_array_equal(merged[3], 0)
+        np.testing.assert_array_equal(hit.output[2:], 0)
+        np.testing.assert_array_equal(miss.output[[1, 3]], 0)
+        for partition, (_, key, value, kwargs) in zip(
+            (case.hit, case.miss), self.fia.calls
+        ):
+            expected_mask = ~np.asarray(partition.valid_mask).copy()
+            expected_mask[np.asarray(partition.true_counts) == 0, 0] = False
+            np.testing.assert_array_equal(kwargs["atten_mask"][:, 0, 0], expected_mask)
+            np.testing.assert_array_equal(
+                kwargs["block_table"], [[0, 1], [2, 3], [4, 5], [6, 7]]
+            )
+            self.assertEqual(kwargs["actual_seq_kvlen"], [32] * 4)
+            self.assertIs(key, value)
+            self.assertEqual(key.data_ptr(), partition.key.data_ptr())
+
+    def test_noncompact_mask_and_refill_snapshot_are_not_modified(self):
+        case = self.make_noncompact_case(
+            hit_positions=((4, 17), ()), miss_positions=((), (2, 31))
+        )
+        for partition in (case.hit, case.miss):
+            original_mask = partition.valid_mask.copy()
+            original_kv = partition.kv.copy()
+            self.run_partition(case, partition)
+            np.testing.assert_array_equal(partition.valid_mask, original_mask)
+            np.testing.assert_array_equal(partition.kv, original_kv)
+            self.assertFalse(
+                np.shares_memory(
+                    self.fia.calls[-1][3]["atten_mask"], partition.valid_mask
+                )
+            )
+
+    def test_noncompact_positions_change_with_unchanged_counts_and_host_lengths(self):
+        case = self.make_noncompact_case(
+            hit_positions=((1, 17), (4, 30)), miss_positions=((), ())
+        )
+        counts = case.hit.true_counts.copy()
+        first = self.run_partition(case, case.hit)
+        first_mask = self.fia.calls[-1][3]["atten_mask"].copy()
+        rng = np.random.default_rng(915)
+        case.hit.valid_mask.fill(False)
+        case.hit.kv.fill(np.nan)
+        for row, positions in enumerate(((3, 19), (8, 31))):
+            case.hit.valid_mask[row, list(positions)] = True
+            case.hit.kv[row, list(positions)] = rng.normal(0, 0.2, (2, 1, 576))
+        self.prepare_partition(case.hit)
+        second = self.run_partition(case, case.hit)
+        np.testing.assert_array_equal(case.hit.true_counts, counts)
+        np.testing.assert_array_equal(self.fia.calls[0][3]["atten_mask"], first_mask)
+        self.assertFalse(np.array_equal(first_mask, self.fia.calls[1][3]["atten_mask"]))
+        self.assertEqual(
+            self.fia.calls[0][3]["actual_seq_kvlen"],
+            self.fia.calls[1][3]["actual_seq_kvlen"],
+        )
+        self.assertFalse(np.allclose(first.output, second.output))
+        np.testing.assert_allclose(
+            second.output, self.reference(case), atol=8e-5, rtol=2e-3
+        )
+
+    def test_noncompact_mask_is_recorded_on_consumer_stream(self):
+        case = self.make_noncompact_case(hit_positions=((2, 17),), miss_positions=((),))
+        self.run_partition(case, case.hit)
+        self.assertIn(
+            (case.hit.valid_mask.data_ptr(), "hit"), self.runtime.recorded_tensors
+        )
+
+    def test_noncompact_mask_shape_dtype_stride_and_device_are_checked(self):
+        def bad_shape(partition):
+            partition.valid_mask = partition.valid_mask.view(1, 1, 32)
+
+        def bad_dtype(partition):
+            partition.valid_mask = partition.valid_mask.astype(np.int32)
+
+        def bad_stride(partition):
+            partition.valid_mask = partition.valid_mask[:, ::-1]
+
+        def bad_device(partition):
+            partition.valid_mask.device = "cpu"
+
+        for mutate in (bad_shape, bad_dtype, bad_stride, bad_device):
+            with self.subTest(mutate=mutate.__name__):
+                case = self.make_noncompact_case(
+                    hit_positions=((2, 17),), miss_positions=((),)
+                )
+                mutate(case.hit)
+                with self.assertRaises(ValueError):
+                    self.run_partition(case, case.hit)
+        self.assertEqual(self.fia.calls, [])
 
     def test_public_v2_contract_masks_and_out_buffers(self):
         case = self.make_case(hit_counts=(3, 0), miss_counts=(13, 16), heads=8)
