@@ -258,9 +258,6 @@ def load_helpers(runtime, fia):
         return namespace["_merge_decode_sfa_partitions_python"](hit, miss)
 
     namespace["_merge_decode_sfa_partitions"] = merge
-    namespace["_run_decode_sfa_partition"] = lambda *args, **kwargs: (
-        _ for _ in ()
-    ).throw(AssertionError("FIA mode dispatched SFA"))
     return namespace
 
 
@@ -848,7 +845,6 @@ class TestSplitFIA(unittest.TestCase):
             scale_value=case.scale,
             merge_impl="python",
             stream=self.runtime.main,
-            use_fia=True,
             page_size=16,
         )
         np.testing.assert_allclose(output, self.reference(case), atol=8e-5, rtol=2e-3)
@@ -894,7 +890,6 @@ class TestSplitFIA(unittest.TestCase):
             rope_head_dim=64,
             scale_value=case.scale,
             stream=self.runtime.main,
-            use_fia=True,
             page_size=16,
         )
         np.testing.assert_allclose(output, self.reference(case), atol=8e-5, rtol=2e-3)

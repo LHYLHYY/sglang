@@ -1,4 +1,4 @@
-"""CPU-only regression checks for the FIA graph-update smoke-test patch.
+"""CPU-only regression checks for FIA graph updates and DSA offload routing.
 
 Run with Python directly or pytest; no torch/torch_npu installation is needed.
 The backend class is loaded from its AST to avoid importing the NPU runtime.
@@ -48,29 +48,6 @@ def load_functions(path, names, namespace, *, constants=False):
     )
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace
-
-
-def load_combined_fia(torch_module, torch_npu_module):
-    """Load only the production FIA helper, without importing custom KV ops."""
-    path = NPU_ROOT / "sparsity_driven_kv_offload/attention.py"
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    helper = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_run_combined_decode_fia"
-    )
-    module = ast.Module(
-        body=[
-            ast.ImportFrom(
-                module="__future__", names=[ast.alias(name="annotations")], level=0,
-            ),
-            helper,
-        ],
-        type_ignores=[],
-    )
-    namespace = {"torch": torch_module, "torch_npu": torch_npu_module}
-    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
-    return namespace["_run_combined_decode_fia"]
 
 
 def load_method(path, class_name, method_name, namespace):
@@ -157,7 +134,7 @@ def load_sparse_kv_forward(torch_module, torch_npu_module):
     sources = (
         (
             NPU_ROOT / "sparsity_driven_kv_offload/config.py",
-            {"get_sparse_kv_fia_skip_kv_io"},
+            set(),
             "SPARSE_KV_",
         ),
         (
@@ -170,7 +147,6 @@ def load_sparse_kv_forward(torch_module, torch_npu_module):
             },
             "_SPLIT_MODE_",
         ),
-        (NPU_ROOT.parents[1] / "utils/common.py", {"get_bool_env_var"}, None),
     )
     for path, functions, prefix in sources:
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -491,9 +467,6 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             "is_deepseek_dsa": lambda config: is_dsa,
             "is_deepseek_v4": lambda config: False,
             "LogitsProcessorOutput": SimpleNamespace,
-            "SPARSE_KV_ATTN_IMPL_COMBINED": "combined",
-            "SPARSE_KV_ATTN_IMPL_NATIVE_FIA": "native_fia",
-            "SPARSE_KV_ATTN_IMPL_SPLIT_EAGER": "split_eager",
             "SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA": "split_graph_dual_fia",
         }
         exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
@@ -551,57 +524,6 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
         runner.load_batch.assert_called_once_with(batch, None)
         graph.update.assert_called_once_with(cpu_update_input=[{}])
 
-    def test_combined_runner_updates_selected_capacity_not_context_length(self):
-        for impl in ("combined", "split_eager"):
-            for raw_bs in (1, 2):
-                with self.subTest(impl=impl, raw_bs=raw_bs):
-                    graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
-                    execute, runner, batch = self.make_runner(
-                        manager=SimpleNamespace(
-                            attn_impl=impl, sparse_context_len=2048
-                        ),
-                        bs=2,
-                        raw_bs=raw_bs,
-                    )
-                    batch.seq_lens.cpu.side_effect = AssertionError(
-                        "Must not use full context lengths for selected KV"
-                    )
-                    graph_lens = runner.buffers.seq_lens.__getitem__.return_value
-                    graph_lens.cpu.return_value.tolist.return_value = [7, 10001]
-                    execute(runner, batch)
-                    graph_lens.cpu.assert_called_once_with()
-                    graph.update.assert_called_once_with(
-                        cpu_update_input=[
-                            {
-                                "actual_seq_lengths_kv": [2048] * raw_bs
-                                + [0] * (2 - raw_bs)
-                            }
-                        ]
-                    )
-                    graph.replay.assert_called_once_with()
-
-    def test_split_sfa_runner_does_not_get_fia_length_updates(self):
-        for impl in (
-            "split_graph",
-            "split_graph_dual",
-            "split_graph_dual_v2",
-            "pa_graph",
-        ):
-            for mode in ("DECODE", "IDLE"):
-                with self.subTest(impl=impl, mode=mode):
-                    graph, _ = self.capture(1, ["npu_sparse_flash_attention.default"])
-                    execute, runner, batch = self.make_runner(
-                        manager=SimpleNamespace(
-                            attn_impl=impl, sparse_context_len=2048
-                        ),
-                        mode=mode,
-                        raw_bs=1 if mode == "DECODE" else 0,
-                    )
-                    execute(runner, batch)
-                    runner.buffers.seq_lens.__getitem__.assert_not_called()
-                    batch.seq_lens.cpu.assert_not_called()
-                    graph.update.assert_not_called()
-                    graph.replay.assert_called_once_with()
 
     def test_dual_fia_updates_both_partitions_in_every_layer_and_masks_idle(self):
         # NPUGraph.update broadcasts a one-element input list to all captured
@@ -659,22 +581,6 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
                     batch.seq_lens.cpu.assert_not_called()
                     np.testing.assert_array_equal(batch.seq_lens_cpu.data, [1, 2, 3, 4])
 
-    def test_skip_kv_io_runner_keeps_fia_update_and_replay(self):
-        graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
-        execute, runner, batch = self.make_runner(
-            manager=SimpleNamespace(
-                attn_impl="combined", sparse_context_len=2048, fia_skip_kv_io=True
-            ),
-            bs=2,
-            raw_bs=1,
-        )
-        execute(runner, batch)
-        graph_lens = runner.buffers.seq_lens.__getitem__.return_value
-        graph_lens.cpu.assert_called_once_with()
-        graph.update.assert_called_once_with(
-            cpu_update_input=[{"actual_seq_lengths_kv": [2048, 0]}]
-        )
-        graph.replay.assert_called_once_with()
 
     def test_normal_mla_runner_still_updates_full_context_length(self):
         graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
@@ -722,273 +628,165 @@ class TestFIAGraphReplayUpdate(unittest.TestCase):
             execute(runner, batch)
         self.assertTrue(any("route=native_mla_fia" in line for line in logs.output))
 
-    def test_fia_offload_reads_loaded_graph_lengths_even_when_cpu_metadata_exists(
-        self,
-    ):
-        for impl in ("native_fia", "combined", "split_eager"):
-            with self.subTest(impl=impl):
-                graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
+    def test_fia_offload_reads_loaded_graph_lengths_even_when_cpu_metadata_exists(self):
+        graph, _ = self.capture(4, ["npu_fused_infer_attention_score_v2.out"] * 2)
+        execute, runner, batch = self.make_runner(
+            manager=SimpleNamespace(
+                attn_impl="split_graph_dual_fia", sparse_context_len=2048
+            ),
+            bs=4,
+            raw_bs=3,
+        )
+        # A cached host copy must not remove the device-to-host ordering point.
+        batch.seq_lens_cpu = FakeTensor(np.array([1, 2, 3, 4]))
+        batch.seq_lens.cpu.side_effect = AssertionError("Read the loaded graph buffer")
+        graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+        graph_lens.cpu.return_value.tolist.return_value = [7, 2048, 10001, 9999]
+        execute(runner, batch)
+        runner.buffers.seq_lens.__getitem__.assert_called_once_with(slice(None, 4))
+        graph_lens.cpu.assert_called_once_with()
+        graph.update.assert_called_once_with(
+            cpu_update_input=[{"actual_seq_kvlen": [2048, 2048, 2048, 0]}]
+        )
+        graph.replay.assert_called_once_with()
+        np.testing.assert_array_equal(batch.seq_lens_cpu.data, [1, 2, 3, 4])
+
+
+    def test_fia_offload_idle_reads_nonempty_graph_buffer_then_updates_zeros(self):
+        for raw_bs in (0, 2):
+            with self.subTest(raw_bs=raw_bs):
+                graph, _ = self.capture(
+                    4, ["npu_fused_infer_attention_score_v2.out"] * 2
+                )
                 execute, runner, batch = self.make_runner(
-                    manager=SimpleNamespace(attn_impl=impl, sparse_context_len=2048),
+                    manager=SimpleNamespace(
+                        attn_impl="split_graph_dual_fia", sparse_context_len=2048
+                    ),
+                    mode="IDLE",
                     bs=4,
-                    raw_bs=3,
+                    raw_bs=raw_bs,
                 )
-                # A cached host copy must not remove the device-to-host ordering
-                # point inherited from the working stock MLA replay sequence.
-                batch.seq_lens_cpu = FakeTensor(np.array([1, 2, 3, 4]))
-                batch.seq_lens.cpu.side_effect = AssertionError(
-                    "Read the loaded graph buffer"
+                batch.seq_lens_cpu = Mock(
+                    tolist=Mock(
+                        side_effect=AssertionError("IDLE must not read stale lengths")
+                    )
                 )
+                batch.seq_lens.cpu.return_value.tolist.return_value = []
                 graph_lens = runner.buffers.seq_lens.__getitem__.return_value
-                graph_lens.cpu.return_value.tolist.return_value = [7, 2048, 10001, 9999]
+                graph_lens.cpu.return_value.tolist.return_value = [10001, 2048, 99, 98]
                 execute(runner, batch)
                 runner.buffers.seq_lens.__getitem__.assert_called_once_with(
                     slice(None, 4)
                 )
                 graph_lens.cpu.assert_called_once_with()
+                batch.seq_lens.cpu.assert_not_called()
+                graph.update.assert_called_once_with(
+                    cpu_update_input=[{"actual_seq_kvlen": [0, 0, 0, 0]}]
+                )
+                graph.replay.assert_called_once_with()
+
+    def test_fia_offload_waits_for_device_snapshot_before_update_and_replay(self):
+        for mode in ("DECODE", "IDLE"):
+            with self.subTest(mode=mode):
+                graph, _ = self.capture(
+                    2,
+                    ["npu_fused_infer_attention_score_v2.out"] * 2,
+                )
+                self.backend._graph_debug = True
+                execute, runner, batch = self.make_runner(
+                    manager=SimpleNamespace(
+                        attn_impl="split_graph_dual_fia",
+                        sparse_context_len=2048,
+                    ),
+                    mode=mode,
+                    bs=2,
+                    raw_bs=1 if mode == "DECODE" else 0,
+                )
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+
+                def device_snapshot():
+                    entered.set()
+                    if not release.wait(timeout=2):
+                        raise RuntimeError(
+                            "Test did not release the device snapshot"
+                        )
+                    return FakeTensor(np.array([10001, 999]))
+
+                def run():
+                    try:
+                        execute(runner, batch)
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+                graph_lens.cpu.side_effect = device_snapshot
+                batch.seq_lens.cpu.side_effect = AssertionError(
+                    "Read the loaded graph buffer"
+                )
+                batch.seq_lens_cpu = FakeTensor(np.array([10001]))
+                worker = threading.Thread(target=run, daemon=True)
+                with self.assertLogs(self.namespace["logger"], level="INFO") as logs:
+                    worker.start()
+                    try:
+                        self.assertTrue(
+                            entered.wait(timeout=2), "Device snapshot was skipped"
+                        )
+                        graph.update.assert_not_called()
+                        graph.replay.assert_not_called()
+                    finally:
+                        release.set()
+                        worker.join(timeout=2)
+                    self.assertFalse(
+                        worker.is_alive(), "Replay did not finish after snapshot"
+                    )
+                self.assertEqual(errors, [])
                 graph.update.assert_called_once_with(
                     cpu_update_input=[
                         {
-                            "actual_seq_lengths_kv": [7, 2048, 2048, 0]
-                            if impl == "native_fia"
-                            else [2048, 2048, 2048, 0]
+                            "actual_seq_kvlen": [2048, 0]
+                            if mode == "DECODE"
+                            else [0, 0]
                         }
                     ]
                 )
                 graph.replay.assert_called_once_with()
-                np.testing.assert_array_equal(batch.seq_lens_cpu.data, [1, 2, 3, 4])
-
-    def test_native_offload_loaded_graph_lengths_are_clamped_before_replay(self):
-        graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
-        execute, runner, batch = self.make_runner(
-            manager=SimpleNamespace(attn_impl="native_fia", sparse_context_len=128),
-            bs=4,
-            raw_bs=3,
-        )
-        graph_lens = runner.buffers.seq_lens.__getitem__.return_value
-        graph_lens.cpu.return_value.tolist.return_value = [-1, 1, 10001, 9999]
-        execute(runner, batch)
-        graph_lens.cpu.assert_called_once_with()
-        graph.update.assert_called_once_with(
-            cpu_update_input=[{"actual_seq_lengths_kv": [0, 1, 128, 0]}]
-        )
-
-    def test_fia_offload_idle_reads_nonempty_graph_buffer_then_updates_zeros(self):
-        for impl in ("native_fia", "combined", "split_eager"):
-            for raw_bs in (0, 2):
-                with self.subTest(impl=impl, raw_bs=raw_bs):
-                    graph, _ = self.capture(4, ["npu_fused_infer_attention_score.out"])
-                    execute, runner, batch = self.make_runner(
-                        manager=SimpleNamespace(
-                            attn_impl=impl, sparse_context_len=2048
-                        ),
-                        mode="IDLE",
-                        bs=4,
-                        raw_bs=raw_bs,
-                    )
-                    batch.seq_lens_cpu = Mock(
-                        tolist=Mock(
-                            side_effect=AssertionError("IDLE must not read stale lengths")
-                        )
-                    )
-                    batch.seq_lens.cpu.return_value.tolist.return_value = []
-                    graph_lens = runner.buffers.seq_lens.__getitem__.return_value
-                    graph_lens.cpu.return_value.tolist.return_value = [
-                        10001, 2048, 99, 98
-                    ]
-                    execute(runner, batch)
-                    runner.buffers.seq_lens.__getitem__.assert_called_once_with(
-                        slice(None, 4)
-                    )
-                    graph_lens.cpu.assert_called_once_with()
-                    batch.seq_lens.cpu.assert_not_called()
-                    graph.update.assert_called_once_with(
-                        cpu_update_input=[{"actual_seq_lengths_kv": [0, 0, 0, 0]}]
-                    )
-                    graph.replay.assert_called_once_with()
-
-    def test_fia_offload_waits_for_device_snapshot_before_update_and_replay(self):
-        for impl, skip_kv_io in (
-            ("native_fia", False),
-            ("combined", False),
-            ("split_eager", False),
-            ("split_graph_dual_fia", False),
-            ("combined", True),
-        ):
-            for mode in ("DECODE", "IDLE"):
-                with self.subTest(impl=impl, mode=mode, skip_kv_io=skip_kv_io):
-                    dual_fia = impl == "split_graph_dual_fia"
-                    graph, _ = self.capture(
-                        2,
-                        ["npu_fused_infer_attention_score_v2.out"] * 2
-                        if dual_fia
-                        else ["npu_fused_infer_attention_score.out"],
-                    )
-                    self.backend._graph_debug = True
-                    execute, runner, batch = self.make_runner(
-                        manager=SimpleNamespace(
-                            attn_impl=impl,
-                            sparse_context_len=2048,
-                            fia_skip_kv_io=skip_kv_io,
-                        ),
-                        mode=mode,
-                        bs=2,
-                        raw_bs=1 if mode == "DECODE" else 0,
-                    )
-                    entered, release = threading.Event(), threading.Event()
-                    errors = []
-
-                    def device_snapshot():
-                        entered.set()
-                        if not release.wait(timeout=2):
-                            raise RuntimeError(
-                                "Test did not release the device snapshot"
-                            )
-                        return FakeTensor(np.array([10001, 999]))
-
-                    def run():
-                        try:
-                            execute(runner, batch)
-                        except BaseException as exc:
-                            errors.append(exc)
-
-                    graph_lens = runner.buffers.seq_lens.__getitem__.return_value
-                    graph_lens.cpu.side_effect = device_snapshot
-                    batch.seq_lens.cpu.side_effect = AssertionError(
-                        "Read the loaded graph buffer"
-                    )
-                    batch.seq_lens_cpu = FakeTensor(np.array([10001]))
-                    worker = threading.Thread(target=run, daemon=True)
-                    with self.assertLogs(self.namespace["logger"], level="INFO") as logs:
-                        worker.start()
-                        try:
-                            self.assertTrue(
-                                entered.wait(timeout=2), "Device snapshot was skipped"
-                            )
-                            graph.update.assert_not_called()
-                            graph.replay.assert_not_called()
-                        finally:
-                            release.set()
-                            worker.join(timeout=2)
-                        self.assertFalse(
-                            worker.is_alive(), "Replay did not finish after snapshot"
-                        )
-                    self.assertEqual(errors, [])
-                    attr_name = (
-                        "actual_seq_kvlen" if dual_fia else "actual_seq_lengths_kv"
-                    )
-                    graph.update.assert_called_once_with(
-                        cpu_update_input=[
-                            {
-                                attr_name: [2048, 0]
-                                if mode == "DECODE"
-                                else [0, 0]
-                            }
-                        ]
-                    )
-                    graph.replay.assert_called_once_with()
-                    stages = [
-                        message.split("stage=")[1].split()[0] for message in logs.output
-                    ]
+                stages = [
+                    message.split("stage=")[1].split()[0] for message in logs.output
+                ]
+                self.assertLess(
+                    stages.index("seq_lens.cpu.begin"),
+                    stages.index("seq_lens.cpu.returned"),
+                )
+                for stage in ("update.begin", "replay.begin"):
                     self.assertLess(
-                        stages.index("seq_lens.cpu.begin"),
-                        stages.index("seq_lens.cpu.returned"),
+                        stages.index("seq_lens.cpu.returned"), stages.index(stage)
                     )
-                    for stage in ("update.begin", "replay.begin"):
-                        self.assertLess(
-                            stages.index("seq_lens.cpu.returned"), stages.index(stage)
-                        )
 
     def test_fia_offload_takes_a_fresh_device_snapshot_on_every_replay(self):
-        for impl in ("native_fia", "combined", "split_eager"):
-            with self.subTest(impl=impl):
-                graph, _ = self.capture(2, ["npu_fused_infer_attention_score.out"])
-                execute, runner, batch = self.make_runner(
-                    manager=SimpleNamespace(attn_impl=impl, sparse_context_len=2048),
-                    bs=2,
-                    raw_bs=1,
-                )
-                batch.seq_lens_cpu = FakeTensor(np.array([99]))
-                graph_lens = runner.buffers.seq_lens.__getitem__.return_value
-                for index, length in enumerate((7, 8, 10001), start=1):
-                    graph_lens.cpu.return_value.tolist.return_value = [length, 999]
-                    execute(runner, batch)
-                    self.assertEqual(graph_lens.cpu.call_count, index)
-                    self.assertEqual(graph.update.call_count, index)
-                    self.assertEqual(graph.replay.call_count, index)
-                    selected = min(length, 2048) if impl == "native_fia" else 2048
-                    graph.update.assert_called_with(
-                        cpu_update_input=[{"actual_seq_lengths_kv": [selected, 0]}]
-                    )
-
-    def test_combined_fia_matches_mla_out_and_page_mapping(self):
-        torch_mock = SimpleNamespace(
-            int32=np.int32,
-            arange=lambda n, **kwargs: FakeTensor(np.arange(n, dtype=kwargs["dtype"])),
-            empty_like=lambda x, **kwargs: FakeTensor(np.empty_like(x.data)),
-            empty=lambda n, **kwargs: FakeTensor(np.empty(n, dtype=kwargs["dtype"])),
-        )
-        workspace = object()
-        fia = Mock(side_effect=AssertionError("Use the explicit .out overload"))
-        npu_mock = SimpleNamespace(
-            _npu_fused_infer_attention_score_get_max_workspace=Mock(
-                return_value=workspace
+        graph, _ = self.capture(2, ["npu_fused_infer_attention_score_v2.out"] * 2)
+        execute, runner, batch = self.make_runner(
+            manager=SimpleNamespace(
+                attn_impl="split_graph_dual_fia", sparse_context_len=2048
             ),
-            npu_fused_infer_attention_score=fia,
+            bs=2,
+            raw_bs=1,
         )
-        call = load_combined_fia(torch_mock, npu_mock)
-        query = FakeTensor(np.zeros((2, 1, 16, 512), dtype=np.float32))
-        query_rope = FakeTensor(np.zeros((2, 1, 16, 64), dtype=np.float32))
-        key = FakeTensor(np.zeros((2, 2048, 1, 512), dtype=np.float32))
-        key_rope = FakeTensor(np.zeros((2, 2048, 1, 64), dtype=np.float32))
-        output = call(
-            query, query_rope, key, key_rope, page_size=128, scale_value=0.125
-        )
-        fia.assert_not_called()
-        args, kwargs = fia.out.call_args
-        self.assertIs(args[0], query)
-        self.assertIs(args[1], args[2])
-        self.assertEqual(args[1].shape, (32, 128, 512))
-        self.assertEqual(kwargs["key_rope"].shape, (32, 128, 64))
-        self.assertTrue(np.shares_memory(args[1].data, key.data))
-        self.assertTrue(np.shares_memory(kwargs["key_rope"].data, key_rope.data))
-        np.testing.assert_array_equal(
-            kwargs["block_table"].data, np.arange(32, dtype=np.int32).reshape(2, 16)
-        )
-        self.assertEqual(kwargs["block_size"], 128)
-        self.assertEqual(kwargs["actual_seq_lengths_kv"], [2048, 2048])
-        self.assertEqual(kwargs["input_layout"], "BSND")
-        self.assertEqual(kwargs["sparse_mode"], 0)
-        self.assertEqual(kwargs["antiquant_mode"], 0)
-        self.assertIsNone(kwargs["antiquant_scale"])
-        self.assertIs(kwargs["workspace"], workspace)
-        self.assertIs(kwargs["out"][0], output)
-        self.assertEqual(output.shape, query.shape)
-        self.assertEqual(kwargs["out"][1].shape, (1,))
-        (
-            ws_args,
-            ws_kwargs,
-        ) = npu_mock._npu_fused_infer_attention_score_get_max_workspace.call_args
-        self.assertEqual(ws_args, args)
-        self.assertEqual(
-            ws_kwargs,
-            {k: v for k, v in kwargs.items() if k not in ("workspace", "out")},
-        )
-        for page_size in (0, 3, 4096):
-            with self.subTest(page_size=page_size):
-                with self.assertRaisesRegex(ValueError, "must be divisible"):
-                    call(
-                        query,
-                        query_rope,
-                        key,
-                        key_rope,
-                        page_size=page_size,
-                        scale_value=0.125,
-                    )
+        batch.seq_lens_cpu = FakeTensor(np.array([99]))
+        graph_lens = runner.buffers.seq_lens.__getitem__.return_value
+        for index, length in enumerate((7, 8, 10001), start=1):
+            graph_lens.cpu.return_value.tolist.return_value = [length, 999]
+            execute(runner, batch)
+            self.assertEqual(graph_lens.cpu.call_count, index)
+            self.assertEqual(graph.update.call_count, index)
+            self.assertEqual(graph.replay.call_count, index)
+            graph.update.assert_called_with(
+                cpu_update_input=[{"actual_seq_kvlen": [2048, 0]}]
+            )
 
 
 class TestSharedMLAFIA(unittest.TestCase):
-    def test_stock_and_offload_share_workspace_out_padding_and_crop(self):
+    def test_mla_fia_workspace_out_padding_and_crop(self):
         for heads, padded_heads, graph_padding in (
             (2, 2, False),
             (3, 4, False),
@@ -1258,7 +1056,7 @@ class TestDSAFIANativeConfig(unittest.TestCase):
                     self.namespace["is_dsa_fia_native_enabled"](**self.config_args())
 
 
-class TestNativeFIAOffloadConfig(unittest.TestCase):
+class TestDualFIAOffloadConfig(unittest.TestCase):
     def setUp(self):
         TestDSAFIANativeConfig.setUp(self)
         self.graph = SimpleNamespace(
@@ -1270,9 +1068,8 @@ class TestNativeFIAOffloadConfig(unittest.TestCase):
             NPU_ROOT / "sparsity_driven_kv_offload/config.py",
             {
                 "get_sparse_kv_attn_impl",
-                "_get_native_fia_offload_graph_config",
-                "get_native_fia_offload_max_batch_size",
-                "get_native_fia_offload_buffer_size",
+                "_get_sparse_kv_graph_config",
+                "is_sparse_kv_decode_graph_enabled",
                 "is_sparsity_driven_kv_offload_enabled",
                 "get_sparsity_driven_kv_offload_cell_size",
             },
@@ -1281,7 +1078,6 @@ class TestNativeFIAOffloadConfig(unittest.TestCase):
         os.environ.update(
             SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD="1",
             SGLANG_NPU_DSA_FIA_NATIVE="0",
-            SGLANG_NPU_SPARSE_KV_ATTN_IMPL="native_fia",
         )
 
     def config_args(self):
@@ -1290,6 +1086,7 @@ class TestNativeFIAOffloadConfig(unittest.TestCase):
             max_running_requests=32,
             cuda_graph_config=self.graph,
             tp_size=16,
+            page_size=128,
             enable_pdmux=False,
             enable_two_batch_overlap=False,
             disable_radix_cache=True,
@@ -1297,154 +1094,7 @@ class TestNativeFIAOffloadConfig(unittest.TestCase):
         )
         return args
 
-    def test_native_offload_keeps_only_index_pool_per_token_and_one_staging_buffer(
-        self,
-    ):
-        args = self.config_args()
-        args["model_config"].hf_config.index_topk = 2050
-        self.assertTrue(self.namespace["is_sparsity_driven_kv_offload_enabled"](**args))
-        self.assertEqual(
-            self.namespace["get_sparsity_driven_kv_offload_cell_size"](
-                **args, num_layers=61, element_size=2
-            ),
-            128 * 61 * 2,
-        )
-        # Cover the largest graph bucket, round K to complete pages, and do not
-        # multiply staging by layer count or by the full context length.
-        padded_topk, pages, batch_size = 2176, 17, 80
-        self.assertEqual(
-            self.namespace["get_native_fia_offload_buffer_size"](
-                model_config=args["model_config"],
-                server_args=args["server_args"],
-                page_size=128,
-                element_size=2,
-            ),
-            batch_size * padded_topk * 576 * 2
-            + batch_size * pages * 4
-            + padded_topk * 8,
-        )
-
-    def test_resolved_graph_capacity_overrides_server_args_and_covers_tp_padding(self):
-        args = self.config_args()["server_args"]
-        get_capacity = self.namespace["get_native_fia_offload_max_batch_size"]
-        self.assertEqual(get_capacity(args), 80)
-        published = SimpleNamespace(
-            decode=SimpleNamespace(backend="full", max_bs=97, bs=[128]),
-            prefill=SimpleNamespace(backend="disabled"),
-        )
-        self.namespace["get_exec"].side_effect = None
-        self.namespace["get_exec"].return_value = SimpleNamespace(
-            graph=SimpleNamespace(cuda_graph_config=published)
-        )
-        self.assertEqual(get_capacity(args), 128)
-        published.decode.backend = "disabled"
-        args.max_running_requests = 33
-        self.assertEqual(get_capacity(args), 48)
-
-    def test_native_only_and_legacy_modes_do_not_reserve_offload_staging(self):
-        args = self.config_args()
-        reserve = self.namespace["get_native_fia_offload_buffer_size"]
-        for environment in (
-            {"SGLANG_NPU_DSA_FIA_NATIVE": "1"},
-            {"SGLANG_NPU_SPARSE_KV_ATTN_IMPL": "combined"},
-            {"SGLANG_ENABLE_SPARSITY_DRIVEN_KV_OFFLOAD": "0"},
-        ):
-            with self.subTest(environment=environment), patch.dict(
-                os.environ, environment
-            ):
-                self.assertEqual(
-                    reserve(
-                        model_config=args["model_config"],
-                        server_args=args["server_args"],
-                        page_size=128,
-                        element_size=2,
-                    ),
-                    0,
-                )
-
-    def test_unsupported_ownership_graph_and_execution_modes_fail_at_startup(self):
-        enabled = self.namespace["is_sparsity_driven_kv_offload_enabled"]
-        for field, value in (
-            ("disable_radix_cache", False),
-            ("enable_pdmux", True),
-            ("enable_two_batch_overlap", True),
-            ("disaggregation_mode", "decode"),
-            ("max_running_requests", None),
-            ("max_running_requests", 0),
-            ("enable_prefill_cp", True),
-            ("attn_cp_size", 2),
-            ("dcp_size", 2),
-            ("speculative_algorithm", "EAGLE"),
-            ("enable_torch_compile", True),
-            ("kv_cache_dtype", "fp8_e4m3"),
-        ):
-            with self.subTest(field=field, value=value):
-                args = self.config_args()
-                setattr(args["server_args"], field, value)
-                with self.assertRaises(ValueError):
-                    enabled(**args)
-        for value in (True, 0, -1, 2.5):
-            with self.subTest(index_topk=value):
-                args = self.config_args()
-                args["model_config"].hf_config.index_topk = value
-                with self.assertRaisesRegex(ValueError, "positive integer index_topk"):
-                    enabled(**args)
-        self.graph.prefill.backend = "full"
-        with self.assertRaisesRegex(ValueError, "prefill graph"):
-            enabled(**self.config_args())
-
-    def test_native_offload_requires_real_io_and_nd_fia(self):
-        for env_name in (
-            "SGLANG_NPU_USE_MLAPO",
-            "SGLANG_USE_FIA_NZ",
-            "SGLANG_NPU_SPARSE_KV_FIA_SKIP_KV_IO",
-        ):
-            with self.subTest(env=env_name), patch.dict(os.environ, {env_name: "1"}):
-                with self.assertRaises(ValueError):
-                    self.namespace["is_sparsity_driven_kv_offload_enabled"](
-                        **self.config_args()
-                    )
-
-    def test_pool_capacity_subtracts_fixed_staging_before_token_page_alignment(self):
-        calculate = load_method(
-            NPU_ROOT.parents[1] / "model_executor/pool_configurator.py",
-            "DefaultPoolConfigurator",
-            "calculate_pool_sizes",
-            {"MemoryPoolConfig": SimpleNamespace},
-        )
-        pool = SimpleNamespace(
-            _native_fia_offload_buffer_bytes=123456, _cell_size=128 * 61 * 2,
-        )
-        available = pool._native_fia_offload_buffer_bytes + pool._cell_size * 1001
-        result = calculate(pool, available, 128)
-        self.assertEqual(result.max_total_num_tokens, 896)
-        for available in (123456, 123455):
-            with self.subTest(available=available), self.assertRaisesRegex(
-                ValueError, "staging"
-            ):
-                calculate(pool, available, 128)
-        pool._native_fia_offload_buffer_bytes = 0
-        self.assertEqual(
-            calculate(pool, pool._cell_size * 1001, 128).max_total_num_tokens, 896
-        )
-
-
-class TestDualFIAOffloadConfig(unittest.TestCase):
-    def setUp(self):
-        TestNativeFIAOffloadConfig.setUp(self)
-        os.environ["SGLANG_NPU_SPARSE_KV_ATTN_IMPL"] = "split_graph_dual_fia"
-        load_functions(
-            NPU_ROOT / "sparsity_driven_kv_offload/config.py",
-            {"is_sparse_kv_decode_graph_enabled"},
-            self.namespace,
-        )
-
-    def config_args(self):
-        args = TestNativeFIAOffloadConfig.config_args(self)
-        args["server_args"].page_size = 128
-        return args
-
-    def test_dual_fia_opt_in_keeps_hot_cache_pool_accounting(self):
+    def test_dual_fia_default_keeps_hot_cache_pool_accounting(self):
         self.assertEqual(
             self.namespace["get_sparse_kv_attn_impl"](), "split_graph_dual_fia"
         )
@@ -1467,15 +1117,21 @@ class TestDualFIAOffloadConfig(unittest.TestCase):
                             ),
                             128 * 61 * 2,
                         )
-                        self.assertEqual(
-                            self.namespace["get_native_fia_offload_buffer_size"](
-                                model_config=args["model_config"],
-                                server_args=args["server_args"],
-                                page_size=page_size,
-                                element_size=2,
-                            ),
-                            0,
-                        )
+
+    def test_retired_modes_are_rejected_before_offload_is_enabled(self):
+        for value in (
+            "combined", "native_fia", "split_eager", "split_graph",
+            "split_graph_dual", "split_graph_dual_v2", "pa_graph",
+        ):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {"SGLANG_NPU_SPARSE_KV_ATTN_IMPL": value}
+            ):
+                with self.assertRaisesRegex(ValueError, "SGLANG_NPU_SPARSE_KV_ATTN_IMPL"):
+                    self.namespace["get_sparse_kv_attn_impl"]()
+                with self.assertRaisesRegex(ValueError, "SGLANG_NPU_SPARSE_KV_ATTN_IMPL"):
+                    self.namespace["is_sparsity_driven_kv_offload_enabled"](
+                        **self.config_args()
+                    )
 
     def test_dual_fia_rejects_unsupported_partition_dimensions_and_pages(self):
         enabled = self.namespace["is_sparsity_driven_kv_offload_enabled"]
@@ -1660,21 +1316,18 @@ class TestDSAFIANativeAttentionRouting(unittest.TestCase):
                     self.assertFalse(model.indexer.call_args.kwargs["return_indices"])
 
 
-class TestFIASkipKVIO(unittest.TestCase):
+class TestDualFIAOffloadAttentionRouting(unittest.TestCase):
     def setUp(self):
         self.torch_mock = SimpleNamespace(
             int32=np.int32,
-            zeros=lambda shape, **kw: FakeTensor(np.zeros(shape, dtype=kw["dtype"])),
             cumsum=lambda tensor, dim: FakeTensor(np.cumsum(tensor.data, axis=dim)),
             npu=SimpleNamespace(current_stream=Mock(return_value="main_stream")),
         )
         self.npu_mock = SimpleNamespace(npu_sparse_flash_attention=Mock())
         self.namespace = load_sparse_kv_forward(self.torch_mock, self.npu_mock)
-        self.call_fia = Mock(side_effect=lambda query, *args, **kwargs: query)
-        self.namespace["_run_combined_decode_fia"] = self.call_fia
         self.forward = self.namespace["forward_sparsity_driven_kv_offload"]
 
-    def make_case(self, *, skip=False, prefill=False, graph_mode=True):
+    def make_case(self, *, prefill=False, graph_mode=True):
         def tensor(shape):
             return FakeTensor(np.ones(shape, dtype=np.float32))
 
@@ -1684,17 +1337,13 @@ class TestFIASkipKVIO(unittest.TestCase):
         q_rope = tensor((batch_size, heads, rope_dim))
         k_rope = tensor((batch_size, 1, rope_dim))
         self.manager = SimpleNamespace(
-            fia_skip_kv_io=skip,
-            attn_impl="combined",
-            sparse_context_len=128,
+            attn_impl="split_graph_dual_fia",
+            merge_impl="python",
+            _split_graph_dual_logged=True,
             offload_v2=Mock(),
-            prefetch=Mock(),
+            prefetch_partitions_graph_dual=Mock(return_value=object()),
+            prefetch_partitions=Mock(return_value=object()),
             get_forward_kv=Mock(return_value=(k, k_rope)),
-        )
-        # A recognizable value verifies that the normal path still consumes
-        # prefetch output, whereas the diagnostic consumes the initialized zeros.
-        self.manager.prefetch.side_effect = lambda layer, batch, topk, selected, stream: selected.data.fill(
-            7
         )
         backend = SimpleNamespace(
             sparse_kv_manager=self.manager,
@@ -1718,6 +1367,10 @@ class TestFIASkipKVIO(unittest.TestCase):
             ),
         )
         layer = SimpleNamespace(tp_k_head_num=1, tp_q_head_num=heads, scaling=0.125)
+        self.graph_attention = Mock(return_value=q.view(2, 1, 2, 512))
+        self.eager_attention = Mock(return_value=q.view(2, 1, 2, 512))
+        self.namespace["_run_split_decode_attention_graph_dual"] = self.graph_attention
+        self.namespace["_run_split_decode_attention"] = self.eager_attention
         return dict(
             backend=backend,
             q=q,
@@ -1727,155 +1380,71 @@ class TestFIASkipKVIO(unittest.TestCase):
             forward_batch=batch,
             q_rope=q_rope,
             k_rope=k_rope,
-            topk_indices=tensor((batch_size, 128)),
+            topk_indices=tensor((batch_size, 2048)),
         )
 
-    def test_diagnostic_defaults_off_and_rejects_other_attention_modes(self):
-        get_flag = self.namespace["get_sparse_kv_fia_skip_kv_io"]
-        env_name = self.namespace["SPARSE_KV_FIA_SKIP_KV_IO_ENV_VAR"]
-        with patch.dict(os.environ, {}, clear=True):
-            for impl in self.namespace["SPARSE_KV_ATTN_IMPL_CHOICES"]:
-                self.assertFalse(get_flag(impl))
-            for value in ("1", "true"):
-                os.environ[env_name] = value
-                self.assertTrue(get_flag("combined"))
-                for impl in self.namespace["SPARSE_KV_ATTN_IMPL_CHOICES"]:
-                    if impl != "combined":
-                        with self.assertRaisesRegex(ValueError, "requires"):
-                            get_flag(impl)
-            os.environ[env_name] = "0"
-            self.assertFalse(get_flag("combined"))
-
-    def test_decode_skips_both_io_calls_but_keeps_zero_kv_fia(self):
-        for graph_mode in (False, True):
-            with self.subTest(graph_mode=graph_mode):
-                case = self.make_case(skip=True, graph_mode=graph_mode)
-                self.call_fia.reset_mock()
-                output = self.forward(**case)
-                self.manager.offload_v2.assert_not_called()
-                self.manager.prefetch.assert_not_called()
-                self.call_fia.assert_called_once()
-                args, kwargs = self.call_fia.call_args
-                self.assertEqual(args[0].shape, (2, 1, 2, 512))
-                self.assertEqual(args[2].shape, (2, 128, 1, 512))
-                self.assertEqual(args[3].shape, (2, 128, 1, 64))
-                self.assertTrue(np.all(args[2].data == 0))
-                self.assertTrue(np.all(args[3].data == 0))
-                self.assertEqual(kwargs, {"page_size": 128, "scale_value": 0.125})
-                self.assertEqual(output.shape, (2, 1024))
-        self.npu_mock.npu_sparse_flash_attention.assert_not_called()
-
-    def test_switch_off_preserves_decode_io_and_uses_prefetched_kv(self):
-        self.forward(**self.make_case())
-        self.manager.offload_v2.assert_called_once()
-        self.manager.prefetch.assert_called_once()
-        self.call_fia.assert_called_once()
-        self.assertTrue(np.all(self.call_fia.call_args.args[2].data == 7))
-        self.assertTrue(np.all(self.call_fia.call_args.args[3].data == 7))
-
-    def test_switch_does_not_bypass_prefill_offload_or_attention(self):
-        self.forward(**self.make_case(skip=True, prefill=True))
-        self.manager.offload_v2.assert_called_once()
-        self.manager.get_forward_kv.assert_called_once()
-        self.manager.prefetch.assert_not_called()
-        self.call_fia.assert_not_called()
-        self.npu_mock.npu_sparse_flash_attention.assert_called_once()
-
-    def test_save_kv_cache_false_still_prefetches_when_diagnostic_is_off(self):
-        self.forward(**self.make_case(), save_kv_cache=False)
-        self.manager.offload_v2.assert_not_called()
-        self.manager.prefetch.assert_called_once()
-        self.call_fia.assert_called_once()
-
-
-class TestDualFIAOffloadAttentionRouting(unittest.TestCase):
-    def setUp(self):
-        TestFIASkipKVIO.setUp(self)
-
-    def make_case(self, *, impl="split_graph_dual_fia", graph_mode=True, prefill=False):
-        case = TestFIASkipKVIO.make_case(self, graph_mode=graph_mode, prefill=prefill)
-        self.manager.attn_impl = impl
-        self.manager.merge_impl = "python"
-        self.manager._split_graph_dual_logged = True
-        self.manager.prefetch_partitions_graph_dual = Mock(return_value=object())
-        self.manager.prefetch_partitions = Mock(return_value=object())
-        self.graph_attention = Mock(return_value=case["q"].view(2, 1, 2, 512))
-        self.eager_attention = Mock(return_value=case["q"].view(2, 1, 2, 512))
-        self.namespace["_run_split_decode_attention_graph_dual"] = self.graph_attention
-        self.namespace["_run_split_decode_attention"] = self.eager_attention
-        return case
-
-    def test_selector_adds_dual_fia_without_rerouting_existing_modes(self):
+    def test_selector_keeps_dual_fia_graph_and_eager_and_rejects_retired_modes(self):
         select = self.namespace["_select_split_decode_mode"]
-        expected = {
-            "combined": (None, None),
-            "native_fia": (None, None),
-            "split_eager": (None, "parallel"),
-            "split_graph": ("single_stream", "parallel"),
-            "split_graph_dual": ("dual_stream", "parallel"),
-            "split_graph_dual_fia": ("dual_stream", "parallel"),
-            "split_graph_dual_v2": ("dual_stream_v2", "parallel"),
-            "pa_graph": ("pa_hot_cache", "pa_hot_cache"),
-        }
         self.assertEqual(
-            set(expected), set(self.namespace["SPARSE_KV_ATTN_IMPL_CHOICES"])
+            self.namespace["SPARSE_KV_ATTN_IMPL_CHOICES"], ("split_graph_dual_fia",)
         )
-        for impl, (graph, eager) in expected.items():
-            with self.subTest(impl=impl):
-                self.assertEqual(select(impl, True), graph)
-                self.assertEqual(select(impl, False), eager)
-
-    def test_dual_fia_keeps_prefetch_tickets_and_both_stream_execution_routes(self):
-        for impl in ("split_graph_dual_fia", "split_graph_dual"):
+        self.assertEqual(select("split_graph_dual_fia", True), "dual_stream")
+        self.assertEqual(select("split_graph_dual_fia", False), "parallel")
+        for impl in (
+            "combined", "native_fia", "split_eager", "split_graph",
+            "split_graph_dual", "split_graph_dual_v2", "pa_graph",
+        ):
             for graph_mode in (False, True):
                 with self.subTest(impl=impl, graph_mode=graph_mode):
-                    case = self.make_case(impl=impl, graph_mode=graph_mode)
-                    self.call_fia.reset_mock()
-                    self.npu_mock.npu_sparse_flash_attention.reset_mock()
-                    ordered = Mock()
-                    ordered.attach_mock(self.manager.offload_v2, "offload")
-                    prefetch = (
-                        self.manager.prefetch_partitions_graph_dual
-                        if graph_mode
-                        else self.manager.prefetch_partitions
-                    )
-                    other_prefetch = (
-                        self.manager.prefetch_partitions
-                        if graph_mode
-                        else self.manager.prefetch_partitions_graph_dual
-                    )
-                    attention = (
-                        self.graph_attention if graph_mode else self.eager_attention
-                    )
-                    other_attention = (
-                        self.eager_attention if graph_mode else self.graph_attention
-                    )
-                    ordered.attach_mock(prefetch, "prefetch")
-                    ordered.attach_mock(attention, "attention")
-                    output = self.forward(**case)
-                    self.assertEqual(output.shape, (2, 1024))
-                    self.assertEqual(
-                        [call[0] for call in ordered.mock_calls],
-                        ["offload", "prefetch", "attention"],
-                    )
-                    prefetch.assert_called_once_with(
-                        case["layer"], case["forward_batch"], case["topk_indices"],
-                        "main_stream", dtype=case["k"].dtype,
-                    )
-                    self.assertIs(attention.call_args.args[0], prefetch.return_value)
-                    if graph_mode:
-                        self.assertIs(attention.call_args.args[1], self.manager)
-                    kwargs = attention.call_args.kwargs
-                    self.assertEqual(kwargs["use_fia"], impl == "split_graph_dual_fia")
-                    self.assertEqual(kwargs["page_size"], case["backend"].page_size)
-                    self.assertEqual(kwargs["stream"], "main_stream")
-                    self.assertEqual(kwargs["query"].shape, (2, 1, 2, 512))
-                    self.assertEqual(kwargs["query_rope"].shape, (2, 1, 2, 64))
-                    other_prefetch.assert_not_called()
-                    other_attention.assert_not_called()
-                    self.manager.prefetch.assert_not_called()
-                    self.call_fia.assert_not_called()
-                    self.npu_mock.npu_sparse_flash_attention.assert_not_called()
+                    with self.assertRaisesRegex(ValueError, "Unsupported sparse KV"):
+                        select(impl, graph_mode)
+
+    def test_dual_fia_keeps_prefetch_tickets_and_both_stream_execution_routes(self):
+        for graph_mode in (False, True):
+            with self.subTest(graph_mode=graph_mode):
+                case = self.make_case(graph_mode=graph_mode)
+                self.npu_mock.npu_sparse_flash_attention.reset_mock()
+                ordered = Mock()
+                ordered.attach_mock(self.manager.offload_v2, "offload")
+                prefetch = (
+                    self.manager.prefetch_partitions_graph_dual
+                    if graph_mode
+                    else self.manager.prefetch_partitions
+                )
+                other_prefetch = (
+                    self.manager.prefetch_partitions
+                    if graph_mode
+                    else self.manager.prefetch_partitions_graph_dual
+                )
+                attention = (
+                    self.graph_attention if graph_mode else self.eager_attention
+                )
+                other_attention = (
+                    self.eager_attention if graph_mode else self.graph_attention
+                )
+                ordered.attach_mock(prefetch, "prefetch")
+                ordered.attach_mock(attention, "attention")
+                output = self.forward(**case)
+                self.assertEqual(output.shape, (2, 1024))
+                self.assertEqual(
+                    [call[0] for call in ordered.mock_calls],
+                    ["offload", "prefetch", "attention"],
+                )
+                prefetch.assert_called_once_with(
+                    case["layer"], case["forward_batch"], case["topk_indices"],
+                    "main_stream", dtype=case["k"].dtype,
+                )
+                self.assertIs(attention.call_args.args[0], prefetch.return_value)
+                if graph_mode:
+                    self.assertIs(attention.call_args.args[1], self.manager)
+                kwargs = attention.call_args.kwargs
+                self.assertEqual(kwargs["page_size"], case["backend"].page_size)
+                self.assertEqual(kwargs["stream"], "main_stream")
+                self.assertEqual(kwargs["query"].shape, (2, 1, 2, 512))
+                self.assertEqual(kwargs["query_rope"].shape, (2, 1, 2, 64))
+                other_prefetch.assert_not_called()
+                other_attention.assert_not_called()
+                self.npu_mock.npu_sparse_flash_attention.assert_not_called()
 
     def test_dual_fia_prefill_keeps_original_offload_and_sfa(self):
         case = self.make_case(prefill=True, graph_mode=False)
@@ -1889,120 +1458,20 @@ class TestDualFIAOffloadAttentionRouting(unittest.TestCase):
         self.npu_mock.npu_sparse_flash_attention.assert_called_once()
 
 
-class TestNativeFIAOffloadAttention(unittest.TestCase):
-    def setUp(self):
-        TestFIASkipKVIO.setUp(self)
-
-    def make_case(self, *, prefill=False, graph_mode=True, cpu_tensor=False):
-        case = TestFIASkipKVIO.make_case(self, prefill=prefill, graph_mode=graph_mode)
-        self.manager.attn_impl = "native_fia"
-        self.manager.sparse_context_len = 2048
-        tensor = lambda shape: FakeTensor(np.ones(shape, dtype=np.float32))
-        self.pages = tensor((32, 128, 512))
-        self.rope_pages = tensor((32, 128, 64))
-        self.selected_table = FakeTensor(np.arange(32, dtype=np.int32).reshape(2, 16))
-        self.manager.prefetch_native_fia = Mock(
-            return_value=(self.pages, self.rope_pages, self.selected_table)
-        )
-        metadata = case["backend"].forward_metadata
-        metadata.seq_lens_cpu_int = (
-            FakeTensor(np.array([7, 10001])) if cpu_tensor else None
-        )
-        metadata.seq_lens_cpu_list = [7, 10001]
-        metadata.block_tables = object()
-        case["backend"].forward_mla_fia = Mock(return_value="native_attention_output")
-        return case
-
-    def test_decode_orders_real_io_then_shared_fia_and_preserves_full_metadata(self):
+    def test_save_kv_cache_false_still_prefetches_and_runs_fia(self):
         for graph_mode in (False, True):
-            for cpu_tensor in (False, True):
-                with self.subTest(graph_mode=graph_mode, cpu_tensor=cpu_tensor):
-                    case = self.make_case(graph_mode=graph_mode, cpu_tensor=cpu_tensor)
-                    metadata = case["backend"].forward_metadata
-                    metadata_before = vars(metadata).copy()
-                    ordered = Mock()
-                    ordered.attach_mock(self.manager.offload_v2, "offload")
-                    ordered.attach_mock(self.manager.prefetch_native_fia, "gather")
-                    ordered.attach_mock(case["backend"].forward_mla_fia, "fia")
-                    output = self.forward(**case)
-                    self.assertEqual(output, "native_attention_output")
-                    self.assertEqual(
-                        [call[0] for call in ordered.mock_calls],
-                        ["offload", "gather", "fia"],
-                    )
-                    self.manager.offload_v2.assert_called_once()
-                    self.assertEqual(
-                        self.manager.offload_v2.call_args.args[-1], "main_stream"
-                    )
-                    self.manager.prefetch_native_fia.assert_called_once_with(
-                        case["layer"], case["forward_batch"], case["topk_indices"]
-                    )
-                    args = case["backend"].forward_mla_fia.call_args.args
-                    self.assertIs(args[0], case["q"])
-                    self.assertIs(args[1], case["q_rope"])
-                    self.assertIs(args[2], case["layer"])
-                    self.assertIs(args[3], self.pages)
-                    self.assertIs(args[4], self.rope_pages)
-                    self.assertIs(args[5], self.selected_table)
-                    self.assertEqual(args[6], [7, 2048])
-                    for name, value in metadata_before.items():
-                        self.assertIs(getattr(metadata, name), value)
-                    self.assertEqual(metadata.seq_lens_cpu_list, [7, 10001])
-                    if cpu_tensor:
-                        np.testing.assert_array_equal(
-                            metadata.seq_lens_cpu_int.data, [7, 10001]
-                        )
-                    self.manager.prefetch.assert_not_called()
-                    self.manager.get_forward_kv.assert_not_called()
-                    self.call_fia.assert_not_called()
-                    self.npu_mock.npu_sparse_flash_attention.assert_not_called()
-
-    def test_decode_without_new_kv_still_gathers_selected_host_pages(self):
-        case = self.make_case()
-        self.forward(**case, save_kv_cache=False)
-        self.manager.offload_v2.assert_not_called()
-        self.manager.prefetch_native_fia.assert_called_once()
-        case["backend"].forward_mla_fia.assert_called_once()
-
-    def test_eager_dp_padding_extends_local_cpu_lengths_with_zero(self):
-        for length in (7, 10001):
-            with self.subTest(length=length):
-                case = self.make_case(graph_mode=False, cpu_tensor=True)
-                metadata = case["backend"].forward_metadata
-                metadata.seq_lens_cpu_int = FakeTensor(np.array([length]))
-                metadata.seq_lens_cpu_list = [length]
-                original_cpu_lengths = metadata.seq_lens_cpu_int
-                original_block_tables = metadata.block_tables
-                # Eager attention DP pads Q and device metadata to another
-                # rank's batch size after creating the local CPU metadata.
-                batch = case["forward_batch"]
-                batch.seq_lens = FakeTensor(np.array([length, 0]))
-                batch.req_pool_indices = FakeTensor(np.array([1, 0]))
-                self.assertEqual(case["q"].shape[0], 2)
-                self.assertEqual(self.selected_table.shape[0], 2)
-                self.forward(**case)
-                fia_args = case["backend"].forward_mla_fia.call_args.args
-                self.assertEqual(fia_args[-1], [min(length, 2048), 0])
-                self.assertIs(metadata.seq_lens_cpu_int, original_cpu_lengths)
-                self.assertEqual(metadata.seq_lens_cpu_int.tolist(), [length])
-                self.assertEqual(metadata.seq_lens_cpu_list, [length])
-                self.assertIs(metadata.block_tables, original_block_tables)
-
-    def test_metadata_longer_than_selected_batch_is_rejected_before_fia(self):
-        case = self.make_case(graph_mode=False)
-        case["backend"].forward_metadata.seq_lens_cpu_list = [7, 10001, 99]
-        with self.assertRaises(ValueError):
-            self.forward(**case)
-        case["backend"].forward_mla_fia.assert_not_called()
-
-    def test_prefill_keeps_real_offload_and_original_dsa_sfa(self):
-        case = self.make_case(prefill=True, graph_mode=False)
-        self.forward(**case)
-        self.manager.offload_v2.assert_called_once()
-        self.manager.get_forward_kv.assert_called_once()
-        self.manager.prefetch_native_fia.assert_not_called()
-        case["backend"].forward_mla_fia.assert_not_called()
-        self.npu_mock.npu_sparse_flash_attention.assert_called_once()
+            with self.subTest(graph_mode=graph_mode):
+                case = self.make_case(graph_mode=graph_mode)
+                self.forward(**case, save_kv_cache=False)
+                self.manager.offload_v2.assert_not_called()
+                prefetch = (
+                    self.manager.prefetch_partitions_graph_dual
+                    if graph_mode else self.manager.prefetch_partitions
+                )
+                attention = self.graph_attention if graph_mode else self.eager_attention
+                prefetch.assert_called_once()
+                attention.assert_called_once()
+                self.assertIs(attention.call_args.args[0], prefetch.return_value)
 
 
 if __name__ == "__main__":

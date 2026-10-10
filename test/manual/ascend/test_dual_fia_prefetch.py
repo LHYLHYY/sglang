@@ -263,12 +263,10 @@ def load_manager(runtime):
     }
     function_names = {
         "_normalize_topk_indices_2d",
-        "_build_partition_sparse_indices",
         "_record_stream_event",
         "_wait_stream_event",
     }
     class_names = {
-        "SparseKVPartition",
         "SparseKVFiaPartition",
         "SparseKVGraphDualPrefetch",
         "SparseKVPrefetchTicket",
@@ -314,7 +312,6 @@ def load_manager(runtime):
         "sparse_kv_ops": ops,
         "unidex_copy_inplace": ops.unidex_copy_inplace,
         "slot_map_lookup": slot_map_lookup,
-        "SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA": FIA_MODE,
         "_profile_push": lambda name: None,
         "_profile_pop": lambda token: None,
         "GB": 1024 ** 3,
@@ -403,19 +400,9 @@ class TestDualFiaPrefetch(unittest.TestCase):
             if graph
             else self.manager.prefetch_partitions
         )
-        overrides = (
-            {
-                "_build_partition_sparse_indices": lambda *args: self.fail(
-                    "FIA built SFA metadata"
-                )
-            }
-            if self.manager.attn_impl == FIA_MODE
-            else {}
+        return fn(
+            self.layer, batch, tensor(topk, np.int32), self.runtime.main, np.float16
         )
-        with patch.dict(self.namespace, overrides):
-            return fn(
-                self.layer, batch, tensor(topk, np.int32), self.runtime.main, np.float16
-            )
 
     def assert_partition(self, part, selected):
         self.assertIsInstance(part, self.namespace["SparseKVFiaPartition"])
@@ -464,17 +451,9 @@ class TestDualFiaPrefetch(unittest.TestCase):
     def test_make_fia_partition_has_views_but_no_metadata_or_clear(self):
         kv = tensor(np.full((2, 4, 1, 576), np.nan, np.float16))
         buffer = tensor(np.full(3 * kv.numel(), np.nan, np.float16))
-        with patch.dict(
-            self.namespace,
-            {
-                "_build_partition_sparse_indices": lambda *args: self.fail(
-                    "FIA built SFA metadata"
-                )
-            },
-        ):
-            part = self.manager._make_attention_partition(
-                kv, tensor([2, 0], np.int32), self.runtime.main, buffer
-            )
+        part = self.manager._make_attention_partition(
+            kv, tensor([2, 0], np.int32), self.runtime.main, buffer
+        )
         self.assertEqual(part.buffer.numel(), kv.numel())
         self.assertTrue(np.shares_memory(part.key, buffer))
         self.assertTrue(np.shares_memory(part.key_rope, buffer))
@@ -753,70 +732,6 @@ class TestDualFiaPrefetch(unittest.TestCase):
             [entry[1] for entry in log if entry[0] == "zero"], ["hit", "miss"]
         )
         self.assertEqual(self.runtime.cumsum_calls, 2)
-
-    def test_sfa_graph_state_and_prefetch_still_use_compact_partitions(self):
-        self.manager.attn_impl = "split_graph_dual"
-        self.manager._graph_dual_state = None
-        self.manager.prepare_graph_dual_state(3)
-        state = self.manager._graph_dual_state
-        self.assertIsNone(state.fia_dst_indices)
-        self.assertIsNone(state.hit_fia_buffer)
-        self.assertIsNone(state.miss_fia_buffer)
-        self.assertEqual(len(self.runtime.allocations), 2)
-        self.assertEqual(self.runtime.arange_calls, 0)
-        ticket = self.run_prefetch()
-        self.assertEqual(self.runtime.cumsum_calls, 2)
-        self.assertEqual(len(self.runtime.allocations), 2)
-        self.assertIsInstance(ticket.hit, self.namespace["SparseKVPartition"])
-        np.testing.assert_array_equal(
-            ticket.hit.kv[0, 0], self.manager.host_kv_buffer[0][1, 2]
-        )
-        np.testing.assert_array_equal(
-            ticket.hit.kv[0, 1], self.manager.host_kv_buffer[0][1, 5]
-        )
-        np.testing.assert_array_equal(
-            ticket.miss.kv[1, 0], self.manager.host_kv_buffer[0][2, 4]
-        )
-        np.testing.assert_array_equal(
-            ticket.miss.kv[1, 1], self.manager.host_kv_buffer[0][2, 3]
-        )
-        np.testing.assert_array_equal(
-            ticket.hit.sparse_indices.reshape(3, 4),
-            [[0, 1, -1, -1], [0, -1, -1, -1], [0, -1, -1, -1]],
-        )
-        self.assertEqual([name for name, _ in self.ops.calls], ["copy", "copy"])
-        self.manager.commit_graph_dual_refill(ticket)
-        self.assert_refill()
-
-    def test_sfa_fallback_still_builds_dummy_metadata_and_uses_original_copy(self):
-        self.manager.attn_impl = "split_graph_dual"
-        kv = tensor(np.full((2, 4, 1, 576), np.nan, np.float16))
-        part = self.manager._make_attention_partition(
-            kv, tensor([1, 0], np.int32), self.runtime.main
-        )
-        self.assertIsInstance(part, self.namespace["SparseKVPartition"])
-        np.testing.assert_array_equal(part.kv[:, 0], 0)
-        self.assertTrue(np.isnan(part.kv[:, 1:]).all())
-        np.testing.assert_array_equal(part.actual_seq_lengths_kv, [1, 1])
-        np.testing.assert_array_equal(
-            part.sparse_indices.reshape(2, 4), [[0, -1, -1, -1]] * 2
-        )
-        self.manager._copy_attention_partition(
-            self.manager.host_kv_buffer[0],
-            part,
-            tensor([8, -1], np.int64),
-            tensor([0, 4], np.int64),
-            tensor([True, False]),
-            src_ptr=123456,
-        )
-        np.testing.assert_array_equal(
-            part.kv[0, 0], self.manager.host_kv_buffer[0][1, 0]
-        )
-        self.assertEqual([name for name, _ in self.ops.calls], ["copy"])
-        self.assertEqual(
-            len([entry for entry in self.runtime.log if entry[0] == "zero"]), 1
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

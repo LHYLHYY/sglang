@@ -24,13 +24,7 @@ else:
     )
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
-    SPARSE_KV_ATTN_IMPL_PA_GRAPH,
-    SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
-    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
-    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
     SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
-    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
     SPARSE_KV_MERGE_IMPL_AUTO,
     SPARSE_KV_MERGE_IMPL_FUSED,
     SPARSE_KV_MERGE_IMPL_PYTHON,
@@ -45,13 +39,7 @@ if TYPE_CHECKING:
         SparseKVCacheManager,
         SparseKVFiaPartition,
         SparseKVGraphDualPrefetch,
-        SparseKVGraphDualV2Prefetch,
-        SparseKVIndexedPartition,
-        SparseKVPAHotCachePrefetch,
-        SparseKVPAPartition,
-        SparseKVPartition,
         SparseKVPrefetchTicket,
-        SparseKVSingleStreamPrefetch,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -60,10 +48,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _SPLIT_MODE_PARALLEL = "parallel"
-_SPLIT_MODE_SINGLE_STREAM = "single_stream"
 _SPLIT_MODE_DUAL_STREAM = "dual_stream"
-_SPLIT_MODE_DUAL_STREAM_V2 = "dual_stream_v2"
-_SPLIT_MODE_PA_HOT_CACHE = "pa_hot_cache"
 _FUSED_MERGE_FALLBACK_LOGGED = False
 _FUSED_MERGE_SELECTION_LOGGED = False
 
@@ -76,29 +61,10 @@ def _is_fused_sfa_state_merge_available() -> bool:
     )
 
 
-def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> Optional[str]:
-    if attn_impl == SPARSE_KV_ATTN_IMPL_PA_GRAPH:
-        return _SPLIT_MODE_PA_HOT_CACHE
-    if graph_mode:
-        if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH:
-            return _SPLIT_MODE_SINGLE_STREAM
-        if attn_impl in (
-            SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
-            SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
-        ):
-            return _SPLIT_MODE_DUAL_STREAM
-        if attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2:
-            return _SPLIT_MODE_DUAL_STREAM_V2
-        return None
-    if attn_impl in (
-        SPARSE_KV_ATTN_IMPL_SPLIT_EAGER,
-        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH,
-        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
-        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
-        SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
-    ):
-        return _SPLIT_MODE_PARALLEL
-    return None
+def _select_split_decode_mode(attn_impl: str, graph_mode: bool) -> str:
+    if attn_impl != SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA:
+        raise ValueError(f"Unsupported sparse KV attention implementation: {attn_impl!r}")
+    return _SPLIT_MODE_DUAL_STREAM if graph_mode else _SPLIT_MODE_PARALLEL
 
 
 @dataclass
@@ -326,67 +292,6 @@ def _run_decode_fia_partition(
     )
 
 
-def _run_combined_decode_fia(
-    query: torch.Tensor,
-    query_rope: torch.Tensor,
-    key: torch.Tensor,
-    key_rope: torch.Tensor,
-    *,
-    page_size: int,
-    scale_value: float,
-) -> torch.Tensor:
-    """FIA smoke test matching AscendAttnBackend.forward_decode_graph's MLA ABI.
-
-    The selected KV comes from sparse prefetch, or is zero-filled in diagnostic
-    experiment A. Treat its entire capacity (including padding) as valid;
-    this is NOT accuracy-preserving DSA.
-    Only reinterpret its contiguous storage as pages -- no additional KV copy.
-    """
-    batch_size, _, num_heads, _ = query.shape
-    _, capacity, num_kv_heads, value_dim = key.shape
-    if page_size <= 0 or capacity % page_size:
-        raise ValueError(
-            f"Combined FIA KV capacity {capacity} must be divisible by "
-            f"the positive page size {page_size}."
-        )
-    blocks_per_req = capacity // page_size
-    block_table = torch.arange(
-        batch_size * blocks_per_req, dtype=torch.int32, device=query.device
-    ).view(batch_size, blocks_per_req)
-    kv_cache = key.view(-1, page_size, num_kv_heads * value_dim)
-    rope_cache = key_rope.view(-1, page_size, num_kv_heads * key_rope.shape[-1])
-    # Like ordinary MLA, pass CPU lengths, not a device Tensor or None.
-    # These lengths describe the selected buffer, NOT the full host KV context.
-    fia_kwargs = dict(
-        query_rope=query_rope,
-        key_rope=rope_cache,
-        num_heads=num_heads,
-        num_key_value_heads=num_kv_heads,
-        block_table=block_table,
-        block_size=page_size,
-        input_layout="BSND",
-        scale=scale_value,
-        actual_seq_lengths_kv=[capacity] * batch_size,
-        antiquant_mode=0,
-        antiquant_scale=None,
-        sparse_mode=0,
-    )
-    workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-        query, kv_cache, kv_cache, **fia_kwargs
-    )
-    output = torch.empty_like(query, dtype=query.dtype, device=query.device)
-    softmax_lse = torch.empty(1, dtype=query.dtype, device=query.device)
-    torch_npu.npu_fused_infer_attention_score.out(
-        query,
-        kv_cache,
-        kv_cache,
-        **fia_kwargs,
-        workspace=workspace,
-        out=[output, softmax_lse],
-    )
-    return output
-
-
 def _record_stream_event(stream, event) -> None:
     if hasattr(stream, "record_event"):
         stream.record_event(event)
@@ -399,136 +304,6 @@ def _wait_stream_event(stream, event) -> None:
         stream.wait_event(event)
     else:
         event.wait(stream)
-
-
-def _run_decode_sfa_partition(
-    partition: SparseKVPartition,
-    *,
-    query: torch.Tensor,
-    query_rope: torch.Tensor,
-    nope_head_dim: int,
-    rope_head_dim: int,
-    scale_value: float,
-    record_stream: bool = True,
-) -> _SfaPartitionState:
-    if record_stream:
-        for tensor in (
-            partition.kv,
-            partition.sparse_indices,
-            partition.actual_seq_lengths_kv,
-            partition.true_counts,
-            query,
-            query_rope,
-        ):
-            tensor.record_stream(partition.stream)
-    key, key_rope = partition.kv.split([nope_head_dim, rope_head_dim], dim=-1)
-    key = key.contiguous()
-    key_rope = key_rope.contiguous()
-    batch_size, query_length, padded_heads, value_dim = query.shape
-    actual_query_lengths = torch.ones(
-        batch_size, dtype=torch.int32, device=query.device
-    ).contiguous()
-
-    output, softmax_max, softmax_sum = torch_npu.npu_sparse_flash_attention(
-        query=query,
-        key=key,
-        value=key,
-        sparse_indices=partition.sparse_indices,
-        scale_value=scale_value,
-        actual_seq_lengths_query=actual_query_lengths,
-        actual_seq_lengths_kv=partition.actual_seq_lengths_kv,
-        query_rope=query_rope,
-        key_rope=key_rope,
-        sparse_block_size=1,
-        layout_query="BSND",
-        layout_kv="BSND",
-        sparse_mode=0,
-        attention_mode=2,
-        return_softmax_lse=True,
-    )
-
-    expected_output_shape = (
-        batch_size,
-        query_length,
-        padded_heads,
-        value_dim,
-    )
-    expected_stats_shape = (batch_size, 1, query_length, padded_heads)
-    if tuple(output.shape) != expected_output_shape or output.dtype != query.dtype:
-        raise RuntimeError(
-            "Unexpected split SFA output contract: "
-            f"got shape={tuple(output.shape)}, dtype={output.dtype}; "
-            f"expected shape={expected_output_shape}, dtype={query.dtype}."
-        )
-    for name, value in (("softmax_max", softmax_max), ("softmax_sum", softmax_sum)):
-        if tuple(value.shape) != expected_stats_shape or value.dtype != torch.float32:
-            raise RuntimeError(
-                f"Unexpected split SFA {name} contract: "
-                f"got shape={tuple(value.shape)}, dtype={value.dtype}; "
-                f"expected shape={expected_stats_shape}, dtype=torch.float32."
-            )
-
-    return _SfaPartitionState(
-        output=output,
-        softmax_max=softmax_max,
-        softmax_sum=softmax_sum,
-        true_counts=partition.true_counts,
-    )
-
-
-def _run_decode_sfa_indexed_partition(
-    partition: SparseKVIndexedPartition,
-    *,
-    query: torch.Tensor,
-    query_rope: torch.Tensor,
-    scale_value: float,
-) -> _SfaPartitionState:
-    """Run SFA over scattered indices in an already split KV workspace."""
-
-    batch_size, query_length, padded_heads, value_dim = query.shape
-    actual_query_lengths = torch.ones(
-        batch_size, dtype=torch.int32, device=query.device
-    ).contiguous()
-    output, softmax_max, softmax_sum = torch_npu.npu_sparse_flash_attention(
-        query=query,
-        key=partition.key,
-        value=partition.key,
-        sparse_indices=partition.sparse_indices,
-        scale_value=scale_value,
-        actual_seq_lengths_query=actual_query_lengths,
-        actual_seq_lengths_kv=partition.actual_seq_lengths_kv,
-        query_rope=query_rope,
-        key_rope=partition.key_rope,
-        sparse_block_size=1,
-        layout_query="BSND",
-        layout_kv="BSND",
-        sparse_mode=0,
-        attention_mode=2,
-        return_softmax_lse=True,
-    )
-
-    expected_output_shape = (batch_size, query_length, padded_heads, value_dim)
-    expected_stats_shape = (batch_size, 1, query_length, padded_heads)
-    if tuple(output.shape) != expected_output_shape or output.dtype != query.dtype:
-        raise RuntimeError(
-            "Unexpected indexed split SFA output contract: "
-            f"got shape={tuple(output.shape)}, dtype={output.dtype}; "
-            f"expected shape={expected_output_shape}, dtype={query.dtype}."
-        )
-    for name, value in (("softmax_max", softmax_max), ("softmax_sum", softmax_sum)):
-        if tuple(value.shape) != expected_stats_shape or value.dtype != torch.float32:
-            raise RuntimeError(
-                f"Unexpected indexed split SFA {name} contract: "
-                f"got shape={tuple(value.shape)}, dtype={value.dtype}; "
-                f"expected shape={expected_stats_shape}, dtype=torch.float32."
-            )
-
-    return _SfaPartitionState(
-        output=output,
-        softmax_max=softmax_max,
-        softmax_sum=softmax_sum,
-        true_counts=partition.true_counts,
-    )
 
 
 def _merge_decode_sfa_partitions_python(
@@ -659,39 +434,34 @@ def _run_split_decode_attention(
     scale_value: float,
     merge_impl: str,
     stream,
-    use_fia: bool = False,
     page_size: int = 128,
 ) -> torch.Tensor:
-    partition_attention = (
-        _run_decode_fia_partition if use_fia else _run_decode_sfa_partition
-    )
-    extra_kwargs = {"page_size": page_size} if use_fia else {}
     hit_attention_done = torch.npu.Event()
     miss_attention_done = torch.npu.Event()
 
     with torch.profiler.record_function("sparse_kv_split.hit_attention"):
         with torch.npu.stream(ticket.hit.stream):
-            hit_state = partition_attention(
+            hit_state = _run_decode_fia_partition(
                 ticket.hit,
                 query=query,
                 query_rope=query_rope,
                 nope_head_dim=nope_head_dim,
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
-                **extra_kwargs,
+                page_size=page_size,
             )
             _record_stream_event(ticket.hit.stream, hit_attention_done)
 
     with torch.profiler.record_function("sparse_kv_split.miss_attention"):
         with torch.npu.stream(ticket.miss.stream):
-            miss_state = partition_attention(
+            miss_state = _run_decode_fia_partition(
                 ticket.miss,
                 query=query,
                 query_rope=query_rope,
                 nope_head_dim=nope_head_dim,
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
-                **extra_kwargs,
+                page_size=page_size,
             )
             _record_stream_event(ticket.miss.stream, miss_attention_done)
 
@@ -714,42 +484,6 @@ def _run_split_decode_attention(
             return _merge_decode_sfa_partitions(hit_state, miss_state, merge_impl)
 
 
-def _run_split_decode_attention_single_stream(
-    partitions: SparseKVSingleStreamPrefetch,
-    *,
-    query: torch.Tensor,
-    query_rope: torch.Tensor,
-    nope_head_dim: int,
-    rope_head_dim: int,
-    scale_value: float,
-    merge_impl: str,
-) -> torch.Tensor:
-    """Run both partition attentions and merge on the current graph stream."""
-
-    with torch.profiler.record_function("sparse_kv_split_graph.hit_attention"):
-        hit_state = _run_decode_sfa_partition(
-            partitions.hit,
-            query=query,
-            query_rope=query_rope,
-            nope_head_dim=nope_head_dim,
-            rope_head_dim=rope_head_dim,
-            scale_value=scale_value,
-            record_stream=False,
-        )
-    with torch.profiler.record_function("sparse_kv_split_graph.miss_attention"):
-        miss_state = _run_decode_sfa_partition(
-            partitions.miss,
-            query=query,
-            query_rope=query_rope,
-            nope_head_dim=nope_head_dim,
-            rope_head_dim=rope_head_dim,
-            scale_value=scale_value,
-            record_stream=False,
-        )
-    with torch.profiler.record_function("sparse_kv_split_graph.merge"):
-        return _merge_decode_sfa_partitions(hit_state, miss_state, merge_impl)
-
-
 def _run_split_decode_attention_graph_dual(
     ticket: SparseKVGraphDualPrefetch,
     manager: SparseKVCacheManager,
@@ -760,18 +494,13 @@ def _run_split_decode_attention_graph_dual(
     rope_head_dim: int,
     scale_value: float,
     stream,
-    use_fia: bool = False,
     page_size: int = 128,
 ) -> torch.Tensor:
     """Run hit attention on the graph stream and miss attention/refill in parallel."""
 
-    partition_attention = (
-        _run_decode_fia_partition if use_fia else _run_decode_sfa_partition
-    )
-    extra_kwargs = {"page_size": page_size} if use_fia else {}
     with torch.profiler.record_function("sparse_kv_split_graph_dual.hit_attention"):
         with torch.npu.stream(stream):
-            hit_state = partition_attention(
+            hit_state = _run_decode_fia_partition(
                 ticket.hit,
                 query=query,
                 query_rope=query_rope,
@@ -779,12 +508,12 @@ def _run_split_decode_attention_graph_dual(
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
                 record_stream=False,
-                **extra_kwargs,
+                page_size=page_size,
             )
 
     with torch.profiler.record_function("sparse_kv_split_graph_dual.miss_attention"):
         with torch.npu.stream(ticket.miss.stream):
-            miss_state = partition_attention(
+            miss_state = _run_decode_fia_partition(
                 ticket.miss,
                 query=query,
                 query_rope=query_rope,
@@ -792,7 +521,7 @@ def _run_split_decode_attention_graph_dual(
                 rope_head_dim=rope_head_dim,
                 scale_value=scale_value,
                 record_stream=False,
-                **extra_kwargs,
+                page_size=page_size,
             )
             _record_stream_event(ticket.miss.stream, ticket.events.miss_attention_done)
             # Refill runs after miss attention on the same worker stream.  The
@@ -815,151 +544,6 @@ def _run_split_decode_attention_graph_dual(
             )
         _wait_stream_event(stream, ticket.events.refill_done)
         return merged
-
-
-def _run_split_decode_attention_graph_dual_v2(
-    ticket: SparseKVGraphDualV2Prefetch,
-    manager: SparseKVCacheManager,
-    *,
-    query: torch.Tensor,
-    query_rope: torch.Tensor,
-    scale_value: float,
-    stream,
-) -> torch.Tensor:
-    """Overlap hit SFA with Host miss copy/SFA and avoid a refill copy."""
-
-    with torch.profiler.record_function("sparse_kv_split_graph_dual_v2.hit_attention"):
-        with torch.npu.stream(stream):
-            hit_state = _run_decode_sfa_indexed_partition(
-                ticket.hit,
-                query=query,
-                query_rope=query_rope,
-                scale_value=scale_value,
-            )
-
-    with torch.profiler.record_function(
-        "sparse_kv_split_graph_dual_v2.miss_attention"
-    ):
-        with torch.npu.stream(ticket.miss.stream):
-            miss_state = _run_decode_sfa_indexed_partition(
-                ticket.miss,
-                query=query,
-                query_rope=query_rope,
-                scale_value=scale_value,
-            )
-            _record_stream_event(ticket.miss.stream, ticket.events.miss_attention_done)
-
-    with torch.npu.stream(stream):
-        # The miss copy has already promoted every missing row into a free hot
-        # slot. Publish the new map only after those writes are complete.
-        manager.publish_graph_dual_v2_slot_map(ticket, stream)
-        _wait_stream_event(stream, ticket.events.miss_attention_done)
-        for tensor in (
-            miss_state.output,
-            miss_state.softmax_max,
-            miss_state.softmax_sum,
-            miss_state.true_counts,
-        ):
-            tensor.record_stream(stream)
-        with torch.profiler.record_function("sparse_kv_split_graph_dual_v2.merge"):
-            return _merge_decode_sfa_partitions(
-                hit_state, miss_state, manager.merge_impl
-            )
-
-
-def _run_decode_sfa_pa_partition(
-    partition: SparseKVPAPartition,
-    *,
-    query: torch.Tensor,
-    query_rope: torch.Tensor,
-    scale_value: float,
-) -> _SfaPartitionState:
-    """Run one online-softmax partition directly over the PA hot cache."""
-
-    batch_size, query_length, padded_heads, value_dim = query.shape
-    output, softmax_max, softmax_sum = torch_npu.npu_sparse_flash_attention(
-        query=query,
-        key=partition.key,
-        value=partition.key,
-        sparse_indices=partition.sparse_indices,
-        scale_value=scale_value,
-        actual_seq_lengths_query=partition.actual_seq_lengths_query,
-        actual_seq_lengths_kv=partition.actual_seq_lengths_kv,
-        query_rope=query_rope,
-        key_rope=partition.key_rope,
-        block_table=partition.block_table,
-        sparse_block_size=1,
-        layout_query="BSND",
-        layout_kv="PA_BSND",
-        sparse_mode=0,
-        attention_mode=2,
-        return_softmax_lse=True,
-    )
-
-    expected_output_shape = (batch_size, query_length, padded_heads, value_dim)
-    expected_stats_shape = (batch_size, 1, query_length, padded_heads)
-    if tuple(output.shape) != expected_output_shape or output.dtype != query.dtype:
-        raise RuntimeError(
-            "Unexpected PA partition SFA output contract: "
-            f"got shape={tuple(output.shape)}, dtype={output.dtype}; "
-            f"expected shape={expected_output_shape}, dtype={query.dtype}."
-        )
-    for name, value in (("softmax_max", softmax_max), ("softmax_sum", softmax_sum)):
-        if tuple(value.shape) != expected_stats_shape or value.dtype != torch.float32:
-            raise RuntimeError(
-                f"Unexpected PA partition SFA {name} contract: "
-                f"got shape={tuple(value.shape)}, dtype={value.dtype}; "
-                f"expected shape={expected_stats_shape}, dtype=torch.float32."
-            )
-
-    return _SfaPartitionState(
-        output=output,
-        softmax_max=softmax_max,
-        softmax_sum=softmax_sum,
-        true_counts=partition.true_counts,
-    )
-
-
-def _run_split_decode_attention_pa_hot_cache(
-    ticket: SparseKVPAHotCachePrefetch,
-    manager: SparseKVCacheManager,
-    *,
-    query: torch.Tensor,
-    query_rope: torch.Tensor,
-    scale_value: float,
-    stream,
-) -> torch.Tensor:
-    """Overlap hit PA-SFA with H2D, then run miss PA-SFA and merge."""
-
-    with torch.npu.stream(stream):
-        with torch.profiler.record_function(
-            "sparse_kv_pa_hot_cache.hit_attention"
-        ):
-            hit_state = _run_decode_sfa_pa_partition(
-                ticket.hit,
-                query=query,
-                query_rope=query_rope,
-                scale_value=scale_value,
-            )
-
-        # The wait is sequenced after hit attention on this same stream. The
-        # auxiliary stream only writes slots not referenced by hit indices.
-        manager.publish_pa_slot_map(ticket, stream)
-
-        with torch.profiler.record_function(
-            "sparse_kv_pa_hot_cache.miss_attention"
-        ):
-            miss_state = _run_decode_sfa_pa_partition(
-                ticket.miss,
-                query=query,
-                query_rope=query_rope,
-                scale_value=scale_value,
-            )
-
-        with torch.profiler.record_function("sparse_kv_pa_hot_cache.merge"):
-            return _merge_decode_sfa_partitions(
-                hit_state, miss_state, manager.merge_impl
-            )
 
 
 def forward_sparsity_driven_kv_offload(
@@ -989,50 +573,8 @@ def forward_sparsity_driven_kv_offload(
     sparse_kv_manager = _get_sparse_kv_manager(backend)
     stream = torch.npu.current_stream(backend.device)
 
-    # The startup-only diagnostic must cover both warmup and capture. Never
-    # bypass prefill: it still needs the authoritative host KV for attention.
-    skip_decode_kv_io = (
-        forward_batch.forward_mode.is_decode() and sparse_kv_manager.fia_skip_kv_io
-    )
-    if save_kv_cache and not skip_decode_kv_io:
+    if save_kv_cache:
         sparse_kv_manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
-
-    if (
-        sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_NATIVE_FIA
-        and forward_batch.forward_mode.is_decode()
-    ):
-        if layer.tp_k_head_num != 1:
-            raise ValueError("Native FIA offload requires one MLA KV head.")
-        c_kv_cache, k_rope_cache, block_table = (
-            sparse_kv_manager.prefetch_native_fia(layer, forward_batch, topk_indices)
-        )
-        # Capture uses the already prepared CPU list; replay updates this FIA
-        # input explicitly. The indexer keeps its original full-context lengths.
-        metadata = backend.forward_metadata
-        seq_lens = (
-            metadata.seq_lens_cpu_list
-            if metadata.seq_lens_cpu_int is None
-            else metadata.seq_lens_cpu_int.tolist()
-        )
-        selected_lengths = [
-            min(max(int(length), 0), sparse_kv_manager.sparse_context_len)
-            for length in seq_lens
-        ]
-        # Eager metadata is prepared before DP pads the query/request rows.
-        # Preserve local lengths and explicitly mask the extra FIA batch rows.
-        batch_size = block_table.shape[0]
-        if len(selected_lengths) > batch_size:
-            raise ValueError("Native FIA CPU lengths exceed the selected-KV batch.")
-        selected_lengths += [0] * (batch_size - len(selected_lengths))
-        return backend.forward_mla_fia(
-            q_nope,
-            q_pe,
-            layer,
-            c_kv_cache,
-            k_rope_cache,
-            block_table,
-            selected_lengths,
-        )
 
     if is_prefill:
         if backend.forward_metadata.actual_seq_lengths_q is not None:
@@ -1085,7 +627,6 @@ def forward_sparsity_driven_kv_offload(
         )
     elif forward_batch.forward_mode.is_decode():
         batch_size = forward_batch.batch_size
-        selected_kv_length = sparse_kv_manager.sparse_context_len
         num_kv_heads = layer.tp_k_head_num
         num_query_heads = layer.tp_q_head_num
         nope_head_dim = backend.kv_lora_rank
@@ -1106,226 +647,63 @@ def forward_sparsity_driven_kv_offload(
         split_mode = _select_split_decode_mode(
             sparse_kv_manager.attn_impl, backend.graph_mode
         )
-        use_split_fia = (
-            sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA
-        )
-        if (
-            sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_SPLIT_EAGER
-            and backend.graph_mode
-            and not sparse_kv_manager._split_graph_fallback_logged
-        ):
-            logger.warning(
-                "Sparse KV split attention is eager-only; using combined "
-                "attention for NPU graph capture and replay."
-            )
-            sparse_kv_manager._split_graph_fallback_logged = True
-        if (
-            split_mode == _SPLIT_MODE_SINGLE_STREAM
-            and not sparse_kv_manager._split_graph_phase_one_logged
-        ):
-            logger.warning(
-                "Sparse KV split_graph phase 1 uses the graph-safe single-stream "
-                "read path without hot-cache refill; outputs remain correct from "
-                "the authoritative host cache, but graph-mode hit rate may be low."
-            )
-            sparse_kv_manager._split_graph_phase_one_logged = True
         if (
             split_mode == _SPLIT_MODE_DUAL_STREAM
             and not sparse_kv_manager._split_graph_dual_logged
         ):
             logger.warning(
-                "Sparse KV %s is experimental: hit attention runs "
-                "on the graph stream while host misses, miss attention, and "
-                "hot-cache refill run on a persistent worker stream. "
-                "Partition attention: %s.",
+                "Sparse KV %s: hit FIA runs on the graph stream while host misses, "
+                "miss FIA, and hot-cache refill run on a persistent worker stream; "
+                "FIA v2 uses device masks and LSE merge.",
                 sparse_kv_manager.attn_impl,
-                "FIA v2 with device masks and LSE merge" if use_split_fia else "SFA",
             )
             sparse_kv_manager._split_graph_dual_logged = True
-        if (
-            split_mode == _SPLIT_MODE_DUAL_STREAM_V2
-            and not sparse_kv_manager._split_graph_dual_v2_logged
-        ):
-            logger.warning(
-                "Sparse KV split_graph_dual_v2 is experimental: KV remains "
-                "noncompact, hit rows keep their HBM slots, and each miss is "
-                "copied once into the SFA workspace and hot cache."
-            )
-            sparse_kv_manager._split_graph_dual_v2_logged = True
-        if (
-            split_mode == _SPLIT_MODE_PA_HOT_CACHE
-            and not sparse_kv_manager._pa_hot_cache_logged
-        ):
-            logger.warning(
-                "Sparse KV pa_graph is experimental: hit PA-SFA overlaps one "
-                "Host miss promotion, then miss PA-SFA and state merge run on "
-                "the graph stream without a hit-KV D2D gather."
-            )
-            sparse_kv_manager._pa_hot_cache_logged = True
 
-        if split_mode is not None:
-            q_nope_sfa = q_nope.view(
-                batch_size, 1, padded_query_heads, nope_head_dim
-            ).contiguous()
-            q_rope_sfa = q_pe.view(
-                batch_size, 1, padded_query_heads, rope_head_dim
-            ).contiguous()
-            if split_mode == _SPLIT_MODE_SINGLE_STREAM:
-                partitions = sparse_kv_manager.prefetch_partitions_single_stream(
-                    layer,
-                    forward_batch,
-                    topk_indices,
-                    stream,
-                    dtype=k.dtype,
-                )
-                decode_output = _run_split_decode_attention_single_stream(
-                    partitions,
-                    query=q_nope_sfa,
-                    query_rope=q_rope_sfa,
-                    nope_head_dim=nope_head_dim,
-                    rope_head_dim=rope_head_dim,
-                    scale_value=layer.scaling,
-                    merge_impl=sparse_kv_manager.merge_impl,
-                )
-            elif split_mode == _SPLIT_MODE_DUAL_STREAM:
-                ticket = sparse_kv_manager.prefetch_partitions_graph_dual(
-                    layer,
-                    forward_batch,
-                    topk_indices,
-                    stream,
-                    dtype=k.dtype,
-                )
-                decode_output = _run_split_decode_attention_graph_dual(
-                    ticket,
-                    sparse_kv_manager,
-                    query=q_nope_sfa,
-                    query_rope=q_rope_sfa,
-                    nope_head_dim=nope_head_dim,
-                    rope_head_dim=rope_head_dim,
-                    scale_value=layer.scaling,
-                    stream=stream,
-                    use_fia=use_split_fia,
-                    page_size=backend.page_size,
-                )
-            elif split_mode == _SPLIT_MODE_DUAL_STREAM_V2:
-                ticket = sparse_kv_manager.prefetch_partitions_graph_dual_v2(
-                    layer,
-                    forward_batch,
-                    topk_indices,
-                    stream,
-                    dtype=k.dtype,
-                )
-                decode_output = _run_split_decode_attention_graph_dual_v2(
-                    ticket,
-                    sparse_kv_manager,
-                    query=q_nope_sfa,
-                    query_rope=q_rope_sfa,
-                    scale_value=layer.scaling,
-                    stream=stream,
-                )
-            elif split_mode == _SPLIT_MODE_PA_HOT_CACHE:
-                ticket = sparse_kv_manager.prefetch_pa_hot_cache(
-                    layer,
-                    forward_batch,
-                    topk_indices,
-                    stream,
-                    dtype=k.dtype,
-                )
-                decode_output = _run_split_decode_attention_pa_hot_cache(
-                    ticket,
-                    sparse_kv_manager,
-                    query=q_nope_sfa,
-                    query_rope=q_rope_sfa,
-                    scale_value=layer.scaling,
-                    stream=stream,
-                )
-            else:
-                ticket = sparse_kv_manager.prefetch_partitions(
-                    layer,
-                    forward_batch,
-                    topk_indices,
-                    stream,
-                    dtype=k.dtype,
-                )
-                decode_output = _run_split_decode_attention(
-                    ticket,
-                    query=q_nope_sfa,
-                    query_rope=q_rope_sfa,
-                    nope_head_dim=nope_head_dim,
-                    rope_head_dim=rope_head_dim,
-                    scale_value=layer.scaling,
-                    merge_impl=sparse_kv_manager.merge_impl,
-                    stream=stream,
-                    use_fia=use_split_fia,
-                    page_size=backend.page_size,
-                )
-            return decode_output[:, :, :num_query_heads, :].reshape(
-                batch_size, num_query_heads * nope_head_dim
-            )
-
-        selected_kv = torch.zeros(
-            (
-                batch_size,
-                selected_kv_length,
-                num_kv_heads,
-                nope_head_dim + rope_head_dim,
-            ),
-            dtype=k.dtype,
-            device=backend.device,
-        )
-        # Experiment A keeps the same initialized buffer, splits, contiguous
-        # conversions and FIA call, but removes real KV traffic and its events.
-        if not skip_decode_kv_io:
-            sparse_kv_manager.prefetch(
-                layer, forward_batch, topk_indices, selected_kv, stream
-            )
-        selected_k_nope, selected_k_rope = selected_kv.split(
-            [nope_head_dim, rope_head_dim], dim=-1
-        )
-
-        q_nope_sfa = q_nope.view(
+        q_nope_fia = q_nope.view(
             batch_size, 1, padded_query_heads, nope_head_dim
         ).contiguous()
-        q_rope_sfa = q_pe.view(
+        q_rope_fia = q_pe.view(
             batch_size, 1, padded_query_heads, rope_head_dim
         ).contiguous()
-        k_nope_sfa = selected_k_nope.contiguous()
-        k_rope_sfa = selected_k_rope.contiguous()
-
-        assert q_nope_sfa.shape == (
-            batch_size,
-            1,
-            padded_query_heads,
-            nope_head_dim,
-        )
-        assert q_rope_sfa.shape == (
-            batch_size,
-            1,
-            padded_query_heads,
-            rope_head_dim,
-        )
-        assert k_nope_sfa.shape == (
-            batch_size,
-            selected_kv_length,
-            num_kv_heads,
-            nope_head_dim,
-        )
-        assert k_rope_sfa.shape == (
-            batch_size,
-            selected_kv_length,
-            num_kv_heads,
-            rope_head_dim,
-        )
-
-        attn_out = _run_combined_decode_fia(
-            q_nope_sfa,
-            q_rope_sfa,
-            k_nope_sfa,
-            k_rope_sfa,
-            page_size=backend.page_size,
-            scale_value=layer.scaling,
-        )
-        attn_out = attn_out[:, :, :num_query_heads, :].reshape(
+        if split_mode == _SPLIT_MODE_DUAL_STREAM:
+            ticket = sparse_kv_manager.prefetch_partitions_graph_dual(
+                layer,
+                forward_batch,
+                topk_indices,
+                stream,
+                dtype=k.dtype,
+            )
+            decode_output = _run_split_decode_attention_graph_dual(
+                ticket,
+                sparse_kv_manager,
+                query=q_nope_fia,
+                query_rope=q_rope_fia,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                scale_value=layer.scaling,
+                stream=stream,
+                page_size=backend.page_size,
+            )
+        else:
+            ticket = sparse_kv_manager.prefetch_partitions(
+                layer,
+                forward_batch,
+                topk_indices,
+                stream,
+                dtype=k.dtype,
+            )
+            decode_output = _run_split_decode_attention(
+                ticket,
+                query=q_nope_fia,
+                query_rope=q_rope_fia,
+                nope_head_dim=nope_head_dim,
+                rope_head_dim=rope_head_dim,
+                scale_value=layer.scaling,
+                merge_impl=sparse_kv_manager.merge_impl,
+                stream=stream,
+                page_size=backend.page_size,
+            )
+        return decode_output[:, :, :num_query_heads, :].reshape(
             batch_size, num_query_heads * nope_head_dim
         )
     else:

@@ -20,13 +20,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
-    SPARSE_KV_ATTN_IMPL_NATIVE_FIA,
-    SPARSE_KV_ATTN_IMPL_PA_GRAPH,
-    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
-    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
-    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
-    get_native_fia_offload_max_batch_size,
-    get_sparse_kv_attn_impl,
     is_dsa_fia_native_enabled,
     is_sparse_kv_decode_graph_enabled,
     is_sparsity_driven_kv_offload_enabled,
@@ -359,82 +352,42 @@ class AscendAttnBackend(AttentionBackend):
             server_args=model_runner.server_args,
             use_mla_backend=model_runner.use_mla_backend,
         )
-        if (
-            self.enable_sparsity_driven_kv_offload
-            and self.enable_pdmux
-            and get_sparse_kv_attn_impl()
-            in (
-                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
-                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
-                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
-                SPARSE_KV_ATTN_IMPL_PA_GRAPH,
-            )
-        ):
+        if self.enable_sparsity_driven_kv_offload and self.enable_pdmux:
             raise RuntimeError(
-                "Sparse KV split/PA graph modes do not support PDMux: their "
+                "Sparse KV dual-stream FIA does not support PDMux: its "
                 "fixed workspace requires serialized graph replay."
             )
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
-            if get_sparse_kv_attn_impl() == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA:
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
-                    validate_split_fia_support,
-                )
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.attention import (
+                validate_split_fia_support,
+            )
 
-                # Fail before allocating host KV or graph workspaces if this
-                # torch_npu build cannot return MLA LSE or capture FIA v2.
-                validate_split_fia_support(
-                    graph_enabled=is_sparse_kv_decode_graph_enabled(
-                        model_runner.server_args
-                    )
+            # Fail before allocating host KV or graph workspaces if this
+            # torch_npu build cannot return MLA LSE or capture FIA v2.
+            validate_split_fia_support(
+                graph_enabled=is_sparse_kv_decode_graph_enabled(
+                    model_runner.server_args
                 )
+            )
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
                 SparseKVCacheManager,
                 register_sparse_kv_manager,
             )
 
-            if get_sparse_kv_attn_impl() == SPARSE_KV_ATTN_IMPL_NATIVE_FIA:
-                from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.native_fia_manager import (
-                    NativeFIAOffloadManager,
-                )
-
-                self.sparse_kv_manager = NativeFIAOffloadManager(
-                    model_runner.req_to_token_pool,
-                    model_runner.token_to_kv_pool_allocator,
-                    topk=model_runner.model_config.hf_config.index_topk,
-                    max_batch_size=get_native_fia_offload_max_batch_size(
-                        model_runner.server_args
-                    ),
-                    page_size=self.page_size,
-                )
-            else:
-                self.sparse_kv_manager = SparseKVCacheManager(
-                    model_runner.req_to_token_pool,
-                    model_runner.token_to_kv_pool_allocator,
-                )
+            self.sparse_kv_manager = SparseKVCacheManager(
+                model_runner.req_to_token_pool,
+                model_runner.token_to_kv_pool_allocator,
+            )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",
                 self.sparse_kv_manager,
             )
-        self.native_fia_offload = (
-            self.sparse_kv_manager is not None
-            and self.sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_NATIVE_FIA
-        )
         self.use_fia = (
             self.dsa_fia_native
-            or self.native_fia_offload
             or get_bool_env_var("ASCEND_USE_FIA", "False")
         )
-        if self.native_fia_offload:
-            self.use_fa = False
-            logger.info(
-                "NPU DSA native FIA offload: indexer enabled, full KV on host; "
-                "selected KV gather + stock MLA FIA on the current stream. "
-                "topk=%s, page_size=%s; no hot-cache or host callbacks.",
-                self.sparse_kv_manager.sparse_context_len,
-                self.page_size,
-            )
         if self.dsa_fia_native:
             logger.warning(
                 "NPU DSA native FIA diagnostic: stock MHA prefill + MLA decode, "
@@ -661,30 +614,13 @@ class AscendAttnBackend(AttentionBackend):
         if (
             self.enable_sparsity_driven_kv_offload
             and self.sparse_kv_manager is not None
-            and self.sparse_kv_manager.attn_impl
-            in (
-                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
-                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
-                SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
-                SPARSE_KV_ATTN_IMPL_PA_GRAPH,
-            )
         ):
             if self.enable_pdmux:
                 raise RuntimeError(
-                    "Sparse KV split/PA graph modes do not support PDMux: their "
+                    "Sparse KV dual-stream FIA does not support PDMux: its "
                     "fixed workspace requires serialized graph replay."
                 )
-            if (
-                self.sparse_kv_manager.attn_impl
-                == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2
-            ):
-                self.sparse_kv_manager.prepare_graph_dual_v2_state(max_bs)
-            elif (
-                self.sparse_kv_manager.attn_impl == SPARSE_KV_ATTN_IMPL_PA_GRAPH
-            ):
-                self.sparse_kv_manager.prepare_pa_state(max_bs)
-            else:
-                self.sparse_kv_manager.prepare_graph_dual_state(max_bs)
+            self.sparse_kv_manager.prepare_graph_dual_state(max_bs)
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
@@ -741,7 +677,7 @@ class AscendAttnBackend(AttentionBackend):
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
-        if self.enable_sparsity_driven_kv_offload and not self.native_fia_offload:
+        if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
             )
@@ -749,28 +685,8 @@ class AscendAttnBackend(AttentionBackend):
             register_npu_host_callback_stream(
                 torch.npu.current_stream(self.device), self.device
             )
-            if (
-                self.sparse_kv_manager is not None
-                and self.sparse_kv_manager.attn_impl
-                in (
-                    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL,
-                    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_FIA,
-                    SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2,
-                    SPARSE_KV_ATTN_IMPL_PA_GRAPH,
-                )
-            ):
-                if (
-                    self.sparse_kv_manager.attn_impl
-                    == SPARSE_KV_ATTN_IMPL_SPLIT_GRAPH_DUAL_V2
-                ):
-                    graph_state = self.sparse_kv_manager._graph_dual_v2_state
-                elif (
-                    self.sparse_kv_manager.attn_impl
-                    == SPARSE_KV_ATTN_IMPL_PA_GRAPH
-                ):
-                    graph_state = self.sparse_kv_manager._pa_state
-                else:
-                    graph_state = self.sparse_kv_manager._graph_dual_state
+            if self.sparse_kv_manager is not None:
+                graph_state = self.sparse_kv_manager._graph_dual_state
                 if graph_state is not None:
                     register_npu_host_callback_stream(
                         graph_state.miss_stream,

@@ -115,7 +115,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
-    bias = fixed native-FIA offload staging, otherwise 0
+    bias = 0
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
@@ -131,7 +131,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = kvc.layer_info.num_effective_layers
 
-        self._native_fia_offload_buffer_bytes = 0
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
@@ -200,7 +199,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if kvc.use_mla_backend:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
                 get_dsa_fia_native_cell_size,
-                get_native_fia_offload_buffer_size,
                 get_sparsity_driven_kv_offload_cell_size,
             )
 
@@ -227,22 +225,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size=kv_size,
             )
             if offload_cell_size is not None:
-                self._native_fia_offload_buffer_bytes = get_native_fia_offload_buffer_size(
-                    model_config=model_config,
-                    server_args=kvc.server_args,
-                    page_size=kvc.page_size,
-                    element_size=kv_size,
-                )
-                if self._native_fia_offload_buffer_bytes:
-                    if kv_cache_dtype not in (torch.float16, torch.bfloat16):
-                        raise ValueError(
-                            "native_fia offload requires FP16 or BF16 KV, "
-                            f"got {kv_cache_dtype}."
-                        )
-                    logger.info(
-                        "Reserve %.2f MiB for persistent native_fia offload staging.",
-                        self._native_fia_offload_buffer_bytes / (1 << 20),
-                    )
                 return offload_cell_size
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -365,15 +347,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        if self._native_fia_offload_buffer_bytes:
-            if available_bytes <= self._native_fia_offload_buffer_bytes:
-                raise ValueError(
-                    "Not enough memory for native_fia offload staging: "
-                    f"requires {self._native_fia_offload_buffer_bytes} bytes, "
-                    f"available {available_bytes} bytes. Reduce max-running-requests "
-                    "or decode graph capture batch sizes."
-                )
-            available_bytes -= self._native_fia_offload_buffer_bytes
         max_total_num_tokens = (
             available_bytes // self._cell_size
             if self._cell_size
